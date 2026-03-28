@@ -2,14 +2,11 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::utils::round4;
 use clap::Args;
 use indicatif::{ProgressBar, ProgressStyle};
 use larql_core::walker::weight_walker::{LayerResult, WalkCallbacks, WalkConfig, WeightWalker};
 use larql_core::*;
-
-fn round4(v: f64) -> f64 {
-    (v * 10000.0).round() / 10000.0
-}
 
 #[derive(Args)]
 pub struct WeightWalkArgs {

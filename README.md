@@ -16,7 +16,7 @@ The extraction pipeline produces edges. Edges flow into the runtime graph. No ve
 make release
 
 # Extract lexical graph from weights (zero forward passes)
-larql weight-walk google/gemma-3-4b-it -o knowledge.larql.json
+larql weight-extract google/gemma-3-4b-it -o knowledge.larql.json
 
 # Extract vectors for SurrealDB workshop
 larql vector-extract google/gemma-3-4b-it -o vectors/ --resume
@@ -38,6 +38,7 @@ larql stats knowledge.larql.json
 
 | Doc | Description |
 |---|---|
+| [docs/weight-extraction.md](docs/weight-extraction.md) | Weight extraction pipeline — weights to vectors to SurrealDB to graph |
 | [docs/cli.md](docs/cli.md) | Full CLI reference — all commands, flags, examples |
 | [docs/format.md](docs/format.md) | Graph file format specification — JSON and MessagePack |
 | [docs/confidence.md](docs/confidence.md) | Confidence and selectivity scoring |
@@ -45,7 +46,7 @@ larql stats knowledge.larql.json
 ## The extraction pipeline
 
 ```
-weight-walk        → lexical edges (8.2M, zero forward passes)
+weight-extract        → lexical edges (8.2M, zero forward passes)
 vector-extract     → weight vectors to NDJSON (for SurrealDB)
 vector-load        → vectors into SurrealDB with HNSW indexes
 residuals capture  → L25 residuals for seed entities (targeted forward passes)
@@ -66,8 +67,8 @@ The vectors are the microscope. The edges are the photograph. You ship the photo
 Reads safetensors directly. Zero forward passes. BLAS-accelerated.
 
 ```bash
-larql weight-walk google/gemma-3-4b-it -o knowledge.larql.json
-larql weight-walk google/gemma-3-4b-it --layer 26 -o L26.larql.json --stats stats.json
+larql weight-extract google/gemma-3-4b-it -o knowledge.larql.json
+larql weight-extract google/gemma-3-4b-it --layer 26 -o L26.larql.json --stats stats.json
 ```
 
 ### Attention walking
@@ -75,7 +76,7 @@ larql weight-walk google/gemma-3-4b-it --layer 26 -o L26.larql.json --stats stat
 Extracts routing edges from attention OV circuits.
 
 ```bash
-larql attention-walk google/gemma-3-4b-it -o attention.larql.json
+larql attention-extract google/gemma-3-4b-it -o attention.larql.json
 ```
 
 ### Vector extraction
@@ -207,8 +208,8 @@ make python-build   # build Python extension (requires virtualenv)
 - **Core graph engine** — full indexed graph with select, walk, search, subgraph, merge, shortest path.
 - **BFS extraction** — template-based probing with multi-token chaining.
 - **Serialization** — JSON and MessagePack with format auto-detection.
-- **CLI** — 10 commands: weight-walk, attention-walk, vector-extract, vector-load, residuals, bfs, stats, query, describe, validate.
-- **PyO3 binding** — full Python API parity. 79 Python tests + 102 Rust tests.
+- **CLI** — 12 commands: weight-extract, attention-extract, vector-extract, vector-import, vector-load, vector-export-surql, residuals, bfs, stats, query, describe, validate.
+- **PyO3 binding** — full Python API parity. 79 Python tests + 134 Rust tests.
 
 ### What's next
 

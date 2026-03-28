@@ -170,6 +170,7 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gqa_attention(
     q: &Array2<f32>,
     k: &Array2<f32>,

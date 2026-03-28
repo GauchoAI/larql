@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::utils::base64_encode;
 use clap::Args;
 use indicatif::{ProgressBar, ProgressStyle};
 use larql_core::loader::vector_loader::{
@@ -41,8 +42,8 @@ pub struct VectorLoadArgs {
     #[arg(long, value_delimiter = ',')]
     layers: Option<Vec<usize>>,
 
-    /// Batch size for INSERT transactions.
-    #[arg(long, default_value = "500")]
+    /// Batch size for INSERT transactions. Lower for large vectors.
+    #[arg(long, default_value = "50")]
     batch_size: usize,
 
     /// Resume interrupted load (skips completed layers).
@@ -94,7 +95,7 @@ impl SurrealClient {
     fn query(&self, sql: &str) -> Result<serde_json::Value, LoaderError> {
         let resp = self
             .client
-            .post(&format!("{}/sql", self.url))
+            .post(format!("{}/sql", self.url))
             .header("surreal-ns", &self.ns)
             .header("surreal-db", &self.db)
             .header("Accept", "application/json")
@@ -221,7 +222,7 @@ pub fn run(args: VectorLoadArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  namespace/database ready");
 
     // Create progress tracking table
-    client.exec(vector_loader::progress_table_sql())?;
+    client.exec(&vector_loader::progress_table_sql())?;
 
     // Create schemas for each table
     for (component, path) in &files {
@@ -270,62 +271,64 @@ pub fn run(args: VectorLoadArgs) -> Result<(), Box<dyn std::error::Error>> {
             HashSet::new()
         };
 
-        // Read records from NDJSON file
+        // Stream records one at a time from NDJSON.
+        // Each record is a single HTTP request (~30KB for 2560-dim vectors).
+        // No batching needed — avoids HTTP body size limits entirely.
         let mut reader = VectorReader::open(path)?;
-        let all_records = reader.read_all(layer_filter.as_ref())?;
 
-        // Group by layer for progress tracking and resume
-        let mut layers_map: std::collections::BTreeMap<usize, Vec<_>> =
-            std::collections::BTreeMap::new();
-        for record in all_records {
-            layers_map.entry(record.layer).or_default().push(record);
-        }
+        // Quick line count for progress bar
+        let total_estimate = {
+            let f = std::fs::File::open(path)?;
+            let r = std::io::BufReader::new(f);
+            use std::io::BufRead;
+            r.lines().count().saturating_sub(1)
+        };
+        callbacks.on_table_start(component, total_estimate);
 
-        // Filter out completed layers
-        let pending_layers: Vec<usize> = layers_map
-            .keys()
-            .filter(|l| !completed.contains(l))
-            .copied()
-            .collect();
-
-        let total_pending: usize = pending_layers
-            .iter()
-            .map(|l| layers_map.get(l).map_or(0, |v| v.len()))
-            .sum();
-
-        if total_pending == 0 {
-            eprintln!("  {component}: all layers already loaded, skipping");
-            summaries.push(TableSummary {
-                table: component.clone(),
-                records_loaded: 0,
-                elapsed_secs: 0.0,
-            });
-            continue;
-        }
-
-        callbacks.on_table_start(component, total_pending);
         let mut total_loaded = 0;
+        let mut current_layer: Option<usize> = None;
+        let mut layer_count = 0;
+        let progress_interval = (total_estimate / 100).max(1);
 
-        for layer in &pending_layers {
-            let records = match layers_map.remove(layer) {
-                Some(r) => r,
-                None => continue,
-            };
-
-            // Batch insert
-            let mut batch_num = 0;
-            for chunk in records.chunks(args.batch_size) {
-                let sql = vector_loader::batch_insert_sql(component, chunk);
-                client.exec(&sql)?;
-                total_loaded += chunk.len();
-                batch_num += 1;
-                callbacks.on_batch_done(component, batch_num, total_loaded);
+        while let Some(record) = reader.next_record()? {
+            // Skip completed layers
+            if completed.contains(&record.layer) {
+                continue;
+            }
+            // Skip filtered layers
+            if let Some(ref filter) = layer_filter {
+                if !filter.contains(&record.layer) {
+                    continue;
+                }
             }
 
-            // Mark layer done in progress table
-            let progress_sql =
-                vector_loader::mark_layer_done_sql(component, *layer, records.len());
-            client.exec(&progress_sql)?;
+            // Layer transition — mark previous layer done
+            if current_layer.is_some() && current_layer != Some(record.layer) {
+                if let Some(prev) = current_layer {
+                    let sql = vector_loader::mark_layer_done_sql(component, prev, layer_count);
+                    client.exec(&sql)?;
+                    layer_count = 0;
+                }
+            }
+            current_layer = Some(record.layer);
+
+            // Insert single record
+            let sql = vector_loader::single_insert_sql(component, &record);
+            client.exec(&sql)?;
+            total_loaded += 1;
+            layer_count += 1;
+
+            if total_loaded % progress_interval == 0 {
+                callbacks.on_batch_done(component, 0, total_loaded);
+            }
+        }
+
+        // Mark final layer done
+        if let Some(last_layer) = current_layer {
+            if layer_count > 0 {
+                let sql = vector_loader::mark_layer_done_sql(component, last_layer, layer_count);
+                client.exec(&sql)?;
+            }
         }
 
         let elapsed_ms = table_start.elapsed().as_secs_f64() * 1000.0;
@@ -357,35 +360,4 @@ pub fn run(args: VectorLoadArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-/// Simple base64 encoder for Basic auth (avoids adding a base64 crate).
-fn base64_encode(input: &str) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes = input.as_bytes();
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-
-        out.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-
-        if chunk.len() > 1 {
-            out.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-
-        if chunk.len() > 2 {
-            out.push(CHARS[(triple & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-
-    out
 }

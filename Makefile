@@ -35,11 +35,11 @@ python-check:
 
 # Extraction examples
 extract-test:
-	cargo run --release -p larql-cli -- weight-walk google/gemma-3-4b-it \
+	cargo run --release -p larql-cli -- weight-extract google/gemma-3-4b-it \
 		--layer 26 -o output/test-L26.larql.json \
 		--stats output/test-L26-stats.json
 
 extract-full:
-	cargo run --release -p larql-cli -- weight-walk google/gemma-3-4b-it \
+	cargo run --release -p larql-cli -- weight-extract google/gemma-3-4b-it \
 		-o output/gemma-3-4b-knowledge.larql.json \
 		--stats output/gemma-3-4b-stats.json

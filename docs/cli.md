@@ -6,12 +6,12 @@ larql <COMMAND> [OPTIONS]
 
 ## Extraction commands
 
-### `larql weight-walk`
+### `larql weight-extract`
 
 Extract edges from FFN weight matrices. Zero forward passes. Pure matrix multiplication.
 
 ```
-larql weight-walk <MODEL> --output <OUTPUT> [OPTIONS]
+larql weight-extract <MODEL> --output <OUTPUT> [OPTIONS]
 ```
 
 | Argument/Flag | Description |
@@ -34,27 +34,27 @@ larql weight-walk <MODEL> --output <OUTPUT> [OPTIONS]
 
 ```bash
 # Full extraction
-larql weight-walk google/gemma-3-4b-it -o knowledge.larql.json
+larql weight-extract google/gemma-3-4b-it -o knowledge.larql.json
 
 # Single layer test
-larql weight-walk google/gemma-3-4b-it --layer 26 -o L26.larql.json
+larql weight-extract google/gemma-3-4b-it --layer 26 -o L26.larql.json
 
 # Filtered extraction with stats
-larql weight-walk google/gemma-3-4b-it \
+larql weight-extract google/gemma-3-4b-it \
     -o knowledge.larql.json \
     --min-confidence 0.1 \
     --stats stats.json
 
 # MessagePack output (smaller, faster)
-larql weight-walk google/gemma-3-4b-it -o knowledge.larql.bin
+larql weight-extract google/gemma-3-4b-it -o knowledge.larql.bin
 ```
 
-### `larql attention-walk`
+### `larql attention-extract`
 
 Extract routing edges from attention OV circuits. Zero forward passes.
 
 ```
-larql attention-walk <MODEL> --output <OUTPUT> [OPTIONS]
+larql attention-extract <MODEL> --output <OUTPUT> [OPTIONS]
 ```
 
 | Argument/Flag | Description |
@@ -67,13 +67,13 @@ larql attention-walk <MODEL> --output <OUTPUT> [OPTIONS]
 
 **How it works:** For each attention head, computes the OV circuit (`O_h @ V_h`), projects all vocab tokens through it, finds the most amplified inputs, and decodes what output tokens each produces.
 
-**Resume:** Same as `weight-walk` — detects completed layers and skips them.
+**Resume:** Same as `weight-extract` — detects completed layers and skips them.
 
 **Examples:**
 
 ```bash
-larql attention-walk google/gemma-3-4b-it -o attention.larql.json
-larql attention-walk google/gemma-3-4b-it --layer 12 -o attention-L12.larql.json
+larql attention-extract google/gemma-3-4b-it -o attention.larql.json
+larql attention-extract google/gemma-3-4b-it --layer 12 -o attention-L12.larql.json
 ```
 
 ### `larql vector-extract`
@@ -131,6 +131,73 @@ larql vector-load <INPUT> --ns <NS> --db <DB> [OPTIONS]
 ```bash
 larql vector-load vectors/ --ns larql --db gemma3_4b
 larql vector-load vectors/ --ns larql --db gemma3_4b --layers 25,26,33 --batch-size 1000
+```
+
+### `larql vector-import`
+
+Import vectors into SurrealDB via batched `surreal import` CLI. Handles large tables (embeddings, FFN) that exceed HTTP body limits by writing temporary `.surql` batch files and importing each one.
+
+```
+larql vector-import <INPUT> --ns <NS> --db <DB> [OPTIONS]
+```
+
+| Flag | Description |
+|---|---|
+| `<INPUT>` | Directory containing `.vectors.jsonl` files |
+| `--ns <NS>` | SurrealDB namespace |
+| `--db <DB>` | SurrealDB database |
+| `--tables <TABLES>` | Tables to import (comma-separated). Default: all |
+| `--layers <LAYERS>` | Layers to import (comma-separated). Default: all |
+| `--endpoint <URL>` | SurrealDB endpoint [default: `http://localhost:8000`] |
+| `--user <USER>` | Username [default: `root`] |
+| `--pass <PASS>` | Password [default: `root`] |
+| `--batch-size <N>` | Records per batch file [default: 5000] |
+| `--resume` | Skip completed layers (tracks progress in `load_progress` table) |
+
+**Requires:** `surreal` CLI installed and SurrealDB running.
+
+**Examples:**
+
+```bash
+# Import embeddings with progress bar
+larql vector-import output/vectors --tables embeddings --ns larql --db gemma3_4b --resume
+
+# Import FFN factual layers
+larql vector-import output/vectors --tables ffn_gate,ffn_down \
+    --layers 25,26,27,28,29,30,31,32,33 --ns larql --db gemma3_4b --resume
+
+# Import everything
+larql vector-import output/vectors --tables ffn_gate,ffn_down,ffn_up \
+    --ns larql --db gemma3_4b --resume
+```
+
+### `larql vector-export-surql`
+
+Export vectors to `.surql` files for manual `surreal import`. Useful if you want to inspect the SQL or import on a different machine.
+
+```
+larql vector-export-surql <INPUT> --output <OUTPUT> [OPTIONS]
+```
+
+| Flag | Description |
+|---|---|
+| `<INPUT>` | Directory containing `.vectors.jsonl` files |
+| `-o, --output <OUTPUT>` | Output directory for `.surql` files |
+| `--tables <TABLES>` | Tables to export (comma-separated). Default: all |
+| `--layers <LAYERS>` | Layers to export (comma-separated). Default: all |
+| `--ns <NS>` | Namespace for `USE` statement [default: `larql`] |
+| `--db <DB>` | Database for `USE` statement [default: `gemma3_4b`] |
+
+**Examples:**
+
+```bash
+larql vector-export-surql output/vectors -o output/surql --tables embeddings
+
+# Then import manually
+surreal import --endpoint http://localhost:8000 \
+    --namespace larql --database gemma3_4b \
+    --username root --password root \
+    output/surql/embeddings.surql
 ```
 
 ### `larql residuals capture`

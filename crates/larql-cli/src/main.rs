@@ -1,16 +1,12 @@
 use clap::{Parser, Subcommand};
 
-mod attention_walk_cmd;
-mod bfs_cmd;
-mod describe_cmd;
+mod commands;
 mod formatting;
-mod query_cmd;
-mod stats_cmd;
-mod validate_cmd;
-mod residuals_cmd;
-mod vector_extract_cmd;
-mod vector_load_cmd;
-mod weight_walk_cmd;
+mod utils;
+
+use commands::extraction::*;
+use commands::query::*;
+use commands::surreal::*;
 
 #[derive(Parser)]
 #[command(
@@ -25,51 +21,68 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    // ── Extraction ──
+
+    /// Extract edges from FFN weights. Zero forward passes.
+    WeightExtract(weight_walk_cmd::WeightWalkArgs),
+
+    /// Extract routing edges from attention OV circuits. Zero forward passes.
+    AttentionExtract(attention_walk_cmd::AttentionWalkArgs),
+
+    /// Extract full vectors from model weights to NDJSON files.
+    VectorExtract(vector_extract_cmd::VectorExtractArgs),
+
+    /// Capture residual stream vectors for entities via forward passes.
+    Residuals(residuals_cmd::ResidualsArgs),
+
     /// BFS extraction from a model endpoint.
     Bfs(bfs_cmd::BfsArgs),
 
-    /// Show graph statistics.
-    Stats(stats_cmd::StatsArgs),
+    // ── SurrealDB ──
 
-    /// Validate a .larql.json file.
-    Validate(validate_cmd::ValidateArgs),
+    /// Load vectors into SurrealDB with HNSW indexes (small tables, HTTP).
+    VectorLoad(vector_load_cmd::VectorLoadArgs),
+
+    /// Import vectors into SurrealDB via batched `surreal import` (large tables).
+    VectorImport(vector_import_cmd::VectorImportArgs),
+
+    /// Export vectors to .surql files for manual import.
+    VectorExportSurql(vector_export_surql_cmd::VectorExportSurqlArgs),
+
+    // ── Query ──
 
     /// Query a graph for facts.
     Query(query_cmd::QueryArgs),
 
-    /// Describe an entity.
+    /// Describe an entity (all edges).
     Describe(describe_cmd::DescribeArgs),
 
-    /// Walk FFN weights and extract edges. Zero forward passes.
-    WeightWalk(weight_walk_cmd::WeightWalkArgs),
+    /// Show graph statistics.
+    Stats(stats_cmd::StatsArgs),
 
-    /// Walk attention OV circuits and extract routing edges.
-    AttentionWalk(attention_walk_cmd::AttentionWalkArgs),
-
-    /// Extract full vectors from model weights to intermediate NDJSON files.
-    VectorExtract(vector_extract_cmd::VectorExtractArgs),
-
-    /// Load extracted vectors into SurrealDB with HNSW indexes.
-    VectorLoad(vector_load_cmd::VectorLoadArgs),
-
-    /// Capture residual stream vectors for entities.
-    Residuals(residuals_cmd::ResidualsArgs),
+    /// Validate a graph file.
+    Validate(validate_cmd::ValidateArgs),
 }
 
 fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
+        // Extraction
+        Commands::WeightExtract(args) => weight_walk_cmd::run(args),
+        Commands::AttentionExtract(args) => attention_walk_cmd::run(args),
+        Commands::VectorExtract(args) => vector_extract_cmd::run(args),
+        Commands::Residuals(args) => residuals_cmd::run(args),
         Commands::Bfs(args) => bfs_cmd::run(args),
-        Commands::Stats(args) => stats_cmd::run(args),
-        Commands::Validate(args) => validate_cmd::run(args),
+        // SurrealDB
+        Commands::VectorLoad(args) => vector_load_cmd::run(args),
+        Commands::VectorImport(args) => vector_import_cmd::run(args),
+        Commands::VectorExportSurql(args) => vector_export_surql_cmd::run(args),
+        // Query
         Commands::Query(args) => query_cmd::run(args),
         Commands::Describe(args) => describe_cmd::run(args),
-        Commands::WeightWalk(args) => weight_walk_cmd::run(args),
-        Commands::AttentionWalk(args) => attention_walk_cmd::run(args),
-        Commands::VectorExtract(args) => vector_extract_cmd::run(args),
-        Commands::VectorLoad(args) => vector_load_cmd::run(args),
-        Commands::Residuals(args) => residuals_cmd::run(args),
+        Commands::Stats(args) => stats_cmd::run(args),
+        Commands::Validate(args) => validate_cmd::run(args),
     };
 
     if let Err(e) = result {

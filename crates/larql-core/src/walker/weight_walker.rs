@@ -14,6 +14,7 @@ use crate::core::enums::SourceType;
 use crate::core::graph::Graph;
 
 use super::safetensors_loader::{load_model_dir, ModelWeights, WalkerError};
+use super::utils::{count_threshold, decode_token, partial_top_k_column, top_entities};
 
 /// Result of walking a single layer.
 #[derive(Debug, Clone)]
@@ -324,15 +325,15 @@ impl WeightWalker {
                 .with_metadata("feature", serde_json::Value::from(raw.feature as u64))
                 .with_metadata(
                     "c_in",
-                    serde_json::Value::from(round4(raw.c_in as f64)),
+                    serde_json::Value::from(raw.c_in as f64),
                 )
                 .with_metadata(
                     "c_out",
-                    serde_json::Value::from(round4(raw.c_out as f64)),
+                    serde_json::Value::from(raw.c_out as f64),
                 )
                 .with_metadata(
                     "selectivity",
-                    serde_json::Value::from(round4(selectivity)),
+                    serde_json::Value::from(selectivity),
                 );
             graph.add_edge(edge);
         }
@@ -381,58 +382,6 @@ impl WeightWalker {
     }
 }
 
-fn count_threshold(t: &mut ThresholdCounts, v: f64) {
-    if v >= 0.01 { t.t_01 += 1; }
-    if v >= 0.05 { t.t_05 += 1; }
-    if v >= 0.10 { t.t_10 += 1; }
-    if v >= 0.25 { t.t_25 += 1; }
-    if v >= 0.50 { t.t_50 += 1; }
-    if v >= 0.75 { t.t_75 += 1; }
-    if v >= 0.90 { t.t_90 += 1; }
-}
-
-fn top_entities(
-    counts: &std::collections::HashMap<String, (usize, f64)>,
-    n: usize,
-) -> Vec<(String, usize, f64)> {
-    let mut sorted: Vec<_> = counts
-        .iter()
-        .map(|(name, (count, sum_conf))| {
-            (name.clone(), *count, sum_conf / *count as f64)
-        })
-        .collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
-    sorted.truncate(n);
-    sorted
-}
-
-fn round4(v: f64) -> f64 {
-    (v * 10000.0).round() / 10000.0
-}
-
-/// Extract top-k (index, value) pairs from a column using partial sort.
-fn partial_top_k_column(
-    matrix: &ndarray::Array2<f32>,
-    col: usize,
-    k: usize,
-) -> Vec<(usize, f32)> {
-    let nrows = matrix.shape()[0];
-    let mut indexed: Vec<(usize, f32)> = Vec::with_capacity(nrows);
-    for i in 0..nrows {
-        indexed.push((i, matrix[[i, col]]));
-    }
-
-    if k >= indexed.len() {
-        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        return indexed;
-    }
-
-    indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
-    indexed.truncate(k);
-    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    indexed
-}
-
 /// Convenience: load model and walk all (or selected) layers.
 pub fn walk_model(
     model: &str,
@@ -457,9 +406,3 @@ pub fn walk_model(
     Ok(results)
 }
 
-fn decode_token(tokenizer: &tokenizers::Tokenizer, id: u32) -> Option<String> {
-    tokenizer
-        .decode(&[id], true)
-        .ok()
-        .map(|s| s.trim().to_string())
-}

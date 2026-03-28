@@ -26,7 +26,7 @@ Free-form object. Stores extraction provenance.
 ```json
 {
   "model": "google/gemma-3-4b-it",
-  "method": "weight-walk",
+  "method": "weight-extract",
   "extraction_date": "2026-03-27"
 }
 ```
@@ -92,7 +92,7 @@ Array of compact edge objects.
 
 #### Weight walk edges
 
-Edges from `weight-walk` include confidence scoring metadata:
+Edges from `weight-extract` include confidence scoring metadata:
 
 ```json
 {
@@ -127,7 +127,7 @@ Edges from `weight-walk` include confidence scoring metadata:
 
 #### Attention walk edges
 
-Edges from `attention-walk` include OV circuit metadata:
+Edges from `attention-extract` include OV circuit metadata:
 
 ```json
 {

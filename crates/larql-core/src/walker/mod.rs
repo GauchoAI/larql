@@ -7,6 +7,8 @@ pub mod residuals;
 #[cfg(feature = "walker")]
 pub mod safetensors_loader;
 #[cfg(feature = "walker")]
+pub mod utils;
+#[cfg(feature = "walker")]
 pub mod vector_extractor;
 #[cfg(feature = "walker")]
 pub mod weight_walker;

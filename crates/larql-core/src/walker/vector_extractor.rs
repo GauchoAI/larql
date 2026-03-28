@@ -15,6 +15,7 @@ use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use super::safetensors_loader::{load_model_dir, ModelWeights, WalkerError};
+use super::utils::{decode_token, current_date, partial_top_k_column, partial_top_k};
 use super::weight_walker::resolve_model_path;
 
 // Component name constants — strings, not enums.
@@ -527,7 +528,7 @@ impl VectorExtractor {
                 })
                 .collect();
 
-            let top_k_pairs = partial_top_k_slice(&norms, config.top_k);
+            let top_k_pairs = partial_top_k(&norms, config.top_k);
             let top_k: Vec<TopKEntry> = top_k_pairs
                 .iter()
                 .filter_map(|&(idx, logit)| {
@@ -563,7 +564,11 @@ impl VectorExtractor {
         Ok(count)
     }
 
-    /// Extract attention Q/K projection vectors per head for a single layer.
+    /// Extract attention Q/K mean direction vectors per head for a single layer.
+    ///
+    /// Each Q/K head's projection is (head_dim, hidden). We store the mean row
+    /// as a hidden-dim vector — the average direction this head queries/keys in
+    /// hidden space. Same dimensionality as FFN vectors for uniform HNSW indexing.
     pub fn extract_attn_qk(
         &self,
         layer: usize,
@@ -584,6 +589,7 @@ impl VectorExtractor {
             .ok_or_else(|| WalkerError::MissingTensor(format!("{prefix}k_proj.weight")))?;
 
         let head_dim = self.weights.head_dim;
+        let hidden = self.weights.hidden_size;
         let num_q_heads = w_q.shape()[0] / head_dim;
         let num_kv_heads = w_k.shape()[0] / head_dim;
         let total = num_q_heads + num_kv_heads;
@@ -591,14 +597,18 @@ impl VectorExtractor {
 
         let mut count = 0;
 
-        // Q heads
+        // Q heads — mean row of each head's (head_dim, hidden) slice → (hidden,)
         for h in 0..num_q_heads {
             callbacks.on_progress(COMPONENT_ATTN_QK, layer, h, total);
-            let vector: Vec<f32> = w_q
-                .slice(ndarray::s![h * head_dim..(h + 1) * head_dim, ..])
-                .iter()
-                .copied()
-                .collect();
+            let head_slice = w_q.slice(ndarray::s![h * head_dim..(h + 1) * head_dim, ..]);
+            let mut vector = vec![0.0f32; hidden];
+            for col in 0..hidden {
+                let mut sum = 0.0f32;
+                for row in 0..head_dim {
+                    sum += head_slice[[row, col]];
+                }
+                vector[col] = sum / head_dim as f32;
+            }
 
             writer.write_record(&VectorRecord {
                 id: format!("L{layer}_Q{h}"),
@@ -614,14 +624,18 @@ impl VectorExtractor {
             count += 1;
         }
 
-        // K heads
+        // K heads — same approach
         for h in 0..num_kv_heads {
             callbacks.on_progress(COMPONENT_ATTN_QK, layer, num_q_heads + h, total);
-            let vector: Vec<f32> = w_k
-                .slice(ndarray::s![h * head_dim..(h + 1) * head_dim, ..])
-                .iter()
-                .copied()
-                .collect();
+            let head_slice = w_k.slice(ndarray::s![h * head_dim..(h + 1) * head_dim, ..]);
+            let mut vector = vec![0.0f32; hidden];
+            for col in 0..hidden {
+                let mut sum = 0.0f32;
+                for row in 0..head_dim {
+                    sum += head_slice[[row, col]];
+                }
+                vector[col] = sum / head_dim as f32;
+            }
 
             writer.write_record(&VectorRecord {
                 id: format!("L{layer}_K{h}"),
@@ -726,7 +740,7 @@ impl VectorExtractor {
                     dimension: self.weights.hidden_size,
                     extraction_date: current_date(),
                 })?;
-                let count = self.extract_embeddings(&config, &mut w, callbacks)?;
+                let count = self.extract_embeddings(config, &mut w, callbacks)?;
                 let elapsed_ms = comp_start.elapsed().as_secs_f64() * 1000.0;
                 callbacks.on_layer_done(component, 0, count, elapsed_ms);
                 callbacks.on_component_done(component, count);
@@ -830,61 +844,3 @@ impl VectorExtractor {
     }
 }
 
-fn current_date() -> String {
-    // Simple date without chrono dependency
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let days = now / 86400;
-    // Approximate — good enough for a metadata field
-    let year = 1970 + (days / 365);
-    let remaining = days % 365;
-    let month = remaining / 30 + 1;
-    let day = remaining % 30 + 1;
-    format!("{year}-{month:02}-{day:02}")
-}
-
-/// Extract top-k (index, value) pairs from a column using partial sort.
-fn partial_top_k_column(
-    matrix: &ndarray::Array2<f32>,
-    col: usize,
-    k: usize,
-) -> Vec<(usize, f32)> {
-    let nrows = matrix.shape()[0];
-    let mut indexed: Vec<(usize, f32)> = Vec::with_capacity(nrows);
-    for i in 0..nrows {
-        indexed.push((i, matrix[[i, col]]));
-    }
-
-    if k >= indexed.len() {
-        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        return indexed;
-    }
-
-    indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
-    indexed.truncate(k);
-    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    indexed
-}
-
-/// Top-k from a flat slice (for attn_ov norms).
-fn partial_top_k_slice(data: &[f32], k: usize) -> Vec<(usize, f32)> {
-    let mut indexed: Vec<(usize, f32)> = data.iter().copied().enumerate().collect();
-    let k = k.min(indexed.len());
-    if k == 0 {
-        return vec![];
-    }
-    indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
-    indexed.truncate(k);
-    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    indexed
-}
-
-fn decode_token(tokenizer: &tokenizers::Tokenizer, id: u32) -> Option<String> {
-    tokenizer
-        .decode(&[id], true)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}

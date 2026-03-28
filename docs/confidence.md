@@ -2,7 +2,7 @@
 
 ## Overview
 
-Every edge extracted by `weight-walk` carries a confidence score derived from the raw logit magnitudes of the FFN feature that produced it. Confidence separates `(France, L26-F9298, Paris)` at 0.89 from `(France, L3-F2041, crawl)` at 0.002.
+Every edge extracted by `weight-extract` carries a confidence score derived from the raw logit magnitudes of the FFN feature that produced it. Confidence separates `(France, L26-F9298, Paris)` at 0.89 from `(France, L3-F2041, crawl)` at 0.002.
 
 Extraction is always complete — all edges are stored regardless of confidence. Filtering by confidence happens at query time or as a post-processing step.
 
@@ -103,7 +103,7 @@ let factual: Vec<&Edge> = graph.edges()
 The `--stats` flag writes per-layer statistics for validation:
 
 ```bash
-larql weight-walk google/gemma-3-4b-it \
+larql weight-extract google/gemma-3-4b-it \
     -o knowledge.larql.json \
     --stats stats.json
 ```

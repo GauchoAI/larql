@@ -8,6 +8,7 @@ use std::path::Path;
 
 use super::forward::capture_residuals;
 use super::safetensors_loader::{load_model_dir, WalkerError};
+use super::utils::current_date;
 use super::vector_extractor::{TopKEntry, VectorFileHeader, VectorRecord, VectorWriter};
 use super::weight_walker::resolve_model_path;
 
@@ -189,15 +190,3 @@ fn project_to_vocab(
         .collect()
 }
 
-fn current_date() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let days = now / 86400;
-    let year = 1970 + (days / 365);
-    let remaining = days % 365;
-    let month = remaining / 30 + 1;
-    let day = remaining % 30 + 1;
-    format!("{year}-{month:02}-{day:02}")
-}

@@ -16,6 +16,7 @@ use crate::core::enums::SourceType;
 use crate::core::graph::Graph;
 
 use super::safetensors_loader::{ModelWeights, WalkerError};
+use super::utils::{count_threshold, decode_token, partial_top_k, top_entities};
 use super::weight_walker::{resolve_model_path, LayerResult, LayerStats, WalkCallbacks, WalkConfig};
 
 /// Result of walking attention heads at a single layer.
@@ -60,21 +61,7 @@ impl AttentionWalker {
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| WalkerError::Parse(e.to_string()))?;
 
-        let v_key = "layers.0.self_attn.v_proj.weight";
-        let head_dim = if let Some(v) = weights.tensors.get(v_key) {
-            let v_rows = v.shape()[0];
-            if v_rows % 256 == 0 {
-                256
-            } else if v_rows % 128 == 0 {
-                128
-            } else if v_rows % 64 == 0 {
-                64
-            } else {
-                128
-            }
-        } else {
-            256
-        };
+        let head_dim = weights.head_dim;
 
         Ok(Self {
             weights,
@@ -245,9 +232,9 @@ impl AttentionWalker {
                 .with_metadata("layer", serde_json::Value::from(raw.layer as u64))
                 .with_metadata("head", serde_json::Value::from(raw.head as u64))
                 .with_metadata("circuit", serde_json::Value::String("OV".to_string()))
-                .with_metadata("c_in", serde_json::Value::from(round4(raw.c_in as f64)))
-                .with_metadata("c_out", serde_json::Value::from(round4(raw.c_out as f64)))
-                .with_metadata("selectivity", serde_json::Value::from(round4(selectivity)));
+                .with_metadata("c_in", serde_json::Value::from(raw.c_in as f64))
+                .with_metadata("c_out", serde_json::Value::from(raw.c_out as f64))
+                .with_metadata("selectivity", serde_json::Value::from(selectivity));
             graph.add_edge(edge);
         }
 
@@ -296,48 +283,3 @@ impl AttentionWalker {
     }
 }
 
-fn count_threshold(t: &mut super::weight_walker::ThresholdCounts, v: f64) {
-    if v >= 0.01 { t.t_01 += 1; }
-    if v >= 0.05 { t.t_05 += 1; }
-    if v >= 0.10 { t.t_10 += 1; }
-    if v >= 0.25 { t.t_25 += 1; }
-    if v >= 0.50 { t.t_50 += 1; }
-    if v >= 0.75 { t.t_75 += 1; }
-    if v >= 0.90 { t.t_90 += 1; }
-}
-
-fn top_entities(
-    counts: &std::collections::HashMap<String, (usize, f64)>,
-    n: usize,
-) -> Vec<(String, usize, f64)> {
-    let mut sorted: Vec<_> = counts
-        .iter()
-        .map(|(name, (count, sum_conf))| (name.clone(), *count, sum_conf / *count as f64))
-        .collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
-    sorted.truncate(n);
-    sorted
-}
-
-fn round4(v: f64) -> f64 {
-    (v * 10000.0).round() / 10000.0
-}
-
-fn partial_top_k(data: &[f32], k: usize) -> Vec<(usize, f32)> {
-    let mut indexed: Vec<(usize, f32)> = data.iter().copied().enumerate().collect();
-    let k = k.min(indexed.len());
-    if k == 0 {
-        return vec![];
-    }
-    indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
-    indexed.truncate(k);
-    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    indexed
-}
-
-fn decode_token(tokenizer: &tokenizers::Tokenizer, id: u32) -> Option<String> {
-    tokenizer
-        .decode(&[id], true)
-        .ok()
-        .map(|s| s.trim().to_string())
-}

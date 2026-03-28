@@ -10,10 +10,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use crate::walker::vector_extractor::{
-    VectorFileHeader, VectorRecord, ALL_COMPONENTS, COMPONENT_ATTN_OV, COMPONENT_ATTN_QK,
-    COMPONENT_EMBEDDINGS, COMPONENT_FFN_DOWN, COMPONENT_FFN_GATE, COMPONENT_FFN_UP,
-};
+use crate::walker::vector_extractor::{VectorFileHeader, VectorRecord, ALL_COMPONENTS};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderError {
@@ -168,108 +165,32 @@ pub fn discover_vector_files(dir: &Path) -> Result<Vec<(String, PathBuf)>, Loade
 // Schema DDL Generation
 // ═══════════════════════════════════════════════════
 
+// SurQL templates embedded from surql/ directory at compile time.
+const SETUP_TEMPLATE: &str = include_str!("../../../../surql/setup.surql");
+const SCHEMA_TEMPLATE: &str = include_str!("../../../../surql/component_schema.surql");
+const PROGRESS_TEMPLATE: &str = include_str!("../../../../surql/load_progress.surql");
+
 /// Generate the full schema DDL for a namespace + database setup.
 pub fn setup_sql(ns: &str, db: &str) -> String {
-    format!(
-        "DEFINE NAMESPACE IF NOT EXISTS {ns};\n\
-         USE NS {ns};\n\
-         DEFINE DATABASE IF NOT EXISTS {db};\n\
-         USE DB {db};\n"
-    )
+    SETUP_TEMPLATE
+        .replace("{ns}", ns)
+        .replace("{db}", db)
 }
 
 /// Generate schema DDL for a single component table.
 pub fn schema_sql(component: &str, dimension: usize) -> Result<String, LoaderError> {
-    let sql = match component {
-        COMPONENT_FFN_DOWN => format!(
-            "DEFINE TABLE {COMPONENT_FFN_DOWN} SCHEMAFULL;\n\
-             DEFINE FIELD layer ON {COMPONENT_FFN_DOWN} TYPE int;\n\
-             DEFINE FIELD feature ON {COMPONENT_FFN_DOWN} TYPE int;\n\
-             DEFINE FIELD vector ON {COMPONENT_FFN_DOWN} TYPE array<float>;\n\
-             DEFINE FIELD top_token ON {COMPONENT_FFN_DOWN} TYPE string;\n\
-             DEFINE FIELD top_token_id ON {COMPONENT_FFN_DOWN} TYPE int;\n\
-             DEFINE FIELD c_score ON {COMPONENT_FFN_DOWN} TYPE float;\n\
-             DEFINE FIELD top_k ON {COMPONENT_FFN_DOWN} TYPE array<object>;\n\
-             DEFINE INDEX idx_layer ON {COMPONENT_FFN_DOWN} FIELDS layer;\n\
-             DEFINE INDEX idx_top_token ON {COMPONENT_FFN_DOWN} FIELDS top_token;\n\
-             DEFINE INDEX idx_c_score ON {COMPONENT_FFN_DOWN} FIELDS c_score;\n\
-             DEFINE INDEX idx_vec ON {COMPONENT_FFN_DOWN} FIELDS vector \
-               HNSW DIMENSION {dimension} DIST COSINE;\n"
-        ),
-        COMPONENT_FFN_GATE => format!(
-            "DEFINE TABLE {COMPONENT_FFN_GATE} SCHEMAFULL;\n\
-             DEFINE FIELD layer ON {COMPONENT_FFN_GATE} TYPE int;\n\
-             DEFINE FIELD feature ON {COMPONENT_FFN_GATE} TYPE int;\n\
-             DEFINE FIELD vector ON {COMPONENT_FFN_GATE} TYPE array<float>;\n\
-             DEFINE FIELD top_token ON {COMPONENT_FFN_GATE} TYPE string;\n\
-             DEFINE FIELD top_token_id ON {COMPONENT_FFN_GATE} TYPE int;\n\
-             DEFINE FIELD c_score ON {COMPONENT_FFN_GATE} TYPE float;\n\
-             DEFINE FIELD top_k ON {COMPONENT_FFN_GATE} TYPE array<object>;\n\
-             DEFINE INDEX idx_layer ON {COMPONENT_FFN_GATE} FIELDS layer;\n\
-             DEFINE INDEX idx_top_token ON {COMPONENT_FFN_GATE} FIELDS top_token;\n\
-             DEFINE INDEX idx_c_score ON {COMPONENT_FFN_GATE} FIELDS c_score;\n\
-             DEFINE INDEX idx_vec ON {COMPONENT_FFN_GATE} FIELDS vector \
-               HNSW DIMENSION {dimension} DIST COSINE;\n"
-        ),
-        COMPONENT_FFN_UP => format!(
-            "DEFINE TABLE {COMPONENT_FFN_UP} SCHEMAFULL;\n\
-             DEFINE FIELD layer ON {COMPONENT_FFN_UP} TYPE int;\n\
-             DEFINE FIELD feature ON {COMPONENT_FFN_UP} TYPE int;\n\
-             DEFINE FIELD vector ON {COMPONENT_FFN_UP} TYPE array<float>;\n\
-             DEFINE INDEX idx_layer ON {COMPONENT_FFN_UP} FIELDS layer;\n\
-             DEFINE INDEX idx_vec ON {COMPONENT_FFN_UP} FIELDS vector \
-               HNSW DIMENSION {dimension} DIST COSINE;\n"
-        ),
-        COMPONENT_ATTN_OV => format!(
-            "DEFINE TABLE {COMPONENT_ATTN_OV} SCHEMAFULL;\n\
-             DEFINE FIELD layer ON {COMPONENT_ATTN_OV} TYPE int;\n\
-             DEFINE FIELD head ON {COMPONENT_ATTN_OV} TYPE int;\n\
-             DEFINE FIELD kv_head ON {COMPONENT_ATTN_OV} TYPE int;\n\
-             DEFINE FIELD vector ON {COMPONENT_ATTN_OV} TYPE array<float>;\n\
-             DEFINE FIELD top_token ON {COMPONENT_ATTN_OV} TYPE string;\n\
-             DEFINE FIELD top_token_id ON {COMPONENT_ATTN_OV} TYPE int;\n\
-             DEFINE INDEX idx_layer ON {COMPONENT_ATTN_OV} FIELDS layer;\n\
-             DEFINE INDEX idx_vec ON {COMPONENT_ATTN_OV} FIELDS vector \
-               HNSW DIMENSION {dimension} DIST COSINE;\n"
-        ),
-        COMPONENT_ATTN_QK => {
-            // QK vectors have head_dim, not hidden_size
-            // Caller should pass the correct dimension
-            format!(
-                "DEFINE TABLE {COMPONENT_ATTN_QK} SCHEMAFULL;\n\
-                 DEFINE FIELD layer ON {COMPONENT_ATTN_QK} TYPE int;\n\
-                 DEFINE FIELD head ON {COMPONENT_ATTN_QK} TYPE int;\n\
-                 DEFINE FIELD qk_type ON {COMPONENT_ATTN_QK} TYPE string;\n\
-                 DEFINE FIELD vector ON {COMPONENT_ATTN_QK} TYPE array<float>;\n\
-                 DEFINE INDEX idx_layer_head ON {COMPONENT_ATTN_QK} FIELDS layer, head;\n\
-                 DEFINE INDEX idx_vec ON {COMPONENT_ATTN_QK} FIELDS vector \
-                   HNSW DIMENSION {dimension} DIST COSINE;\n"
-            )
-        }
-        COMPONENT_EMBEDDINGS => format!(
-            "DEFINE TABLE {COMPONENT_EMBEDDINGS} SCHEMAFULL;\n\
-             DEFINE FIELD token_id ON {COMPONENT_EMBEDDINGS} TYPE int;\n\
-             DEFINE FIELD token ON {COMPONENT_EMBEDDINGS} TYPE string;\n\
-             DEFINE FIELD vector ON {COMPONENT_EMBEDDINGS} TYPE array<float>;\n\
-             DEFINE FIELD norm ON {COMPONENT_EMBEDDINGS} TYPE float;\n\
-             DEFINE INDEX idx_token ON {COMPONENT_EMBEDDINGS} FIELDS token;\n\
-             DEFINE INDEX idx_token_id ON {COMPONENT_EMBEDDINGS} FIELDS token_id;\n\
-             DEFINE INDEX idx_vec ON {COMPONENT_EMBEDDINGS} FIELDS vector \
-               HNSW DIMENSION {dimension} DIST COSINE;\n"
-        ),
-        other => return Err(LoaderError::UnknownComponent(other.to_string())),
-    };
-    Ok(sql)
+    if !ALL_COMPONENTS.contains(&component) {
+        return Err(LoaderError::UnknownComponent(component.to_string()));
+    }
+
+    Ok(SCHEMA_TEMPLATE
+        .replace("{table}", component)
+        .replace("{dimension}", &dimension.to_string()))
 }
 
 /// Generate load_progress table schema.
-pub fn progress_table_sql() -> &'static str {
-    "DEFINE TABLE load_progress SCHEMAFULL;\n\
-     DEFINE FIELD table_name ON load_progress TYPE string;\n\
-     DEFINE FIELD layer ON load_progress TYPE int;\n\
-     DEFINE FIELD vectors_loaded ON load_progress TYPE int;\n\
-     DEFINE FIELD completed ON load_progress TYPE bool;\n\
-     DEFINE FIELD timestamp ON load_progress TYPE string;\n"
+pub fn progress_table_sql() -> String {
+    PROGRESS_TEMPLATE.to_string()
 }
 
 // ═══════════════════════════════════════════════════
@@ -305,6 +226,26 @@ pub fn batch_insert_sql(table: &str, records: &[VectorRecord]) -> String {
 
     sql.push_str("COMMIT TRANSACTION;");
     sql
+}
+
+/// Generate a single-record INSERT SQL. One record per request avoids
+/// HTTP body size limits for large vectors (2560-dim = ~30KB per record).
+pub fn single_insert_sql(table: &str, record: &VectorRecord) -> String {
+    let content = serde_json::json!({
+        "layer": record.layer,
+        "feature": record.feature,
+        "vector": record.vector,
+        "top_token": record.top_token,
+        "top_token_id": record.top_token_id,
+        "c_score": record.c_score,
+        "top_k": record.top_k,
+    });
+
+    format!(
+        "CREATE {table}:{id} CONTENT {json};",
+        id = record.id,
+        json = content,
+    )
 }
 
 /// Generate SQL to mark a layer as completed in load_progress.

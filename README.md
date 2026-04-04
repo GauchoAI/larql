@@ -251,15 +251,16 @@ Dense and full-precision MoE models support all operations (DESCRIBE, WALK, INFE
 | INFER dense (with attention, all matmul) | 535ms |
 | DESCRIBE (knowledge browse) | 33ms |
 
-| Component | Latency |
-|---|---|
-| BLAS-fused attention (seq=6, hd=256, 10 heads) | 42 us |
-| Q/K/V/O projection (Accelerate AMX) | ~1 ms each |
-| FFN walk (gate+up from weights, down from mmap) | 6.0 ms/layer |
-| FFN dense (gate+up+down from weights) | 6.4 ms/layer |
-| Final logits (BLAS gemv, 262K vocab) | ~221 ms |
+| Component | Time | % of total |
+|---|---|---|
+| Logits (262K vocab gemv) | 221ms | 41% |
+| FFN × 34 layers (walk) | 194ms | 36% |
+| Attention × 34 layers | 84ms | 16% |
+| Walk FFN per layer (mmap down) | 5.7ms | — |
+| Dense FFN per layer | 6.7ms | — |
+| BLAS-fused attention per head | 42us | — |
 
-Hardware acceleration: Apple Accelerate (AMX) for CPU matmuls, optional Metal GPU (`--features metal`) with auto-calibrated dispatch and buffer cache. FFN graph layer with mmap'd down vectors is **faster than dense matmul** (517ms vs 535ms) at full precision across all 34 layers. See [docs/inference-engine.md](docs/inference-engine.md) and [docs/ffn-graph-layer.md](docs/ffn-graph-layer.md).
+Walk is **faster than dense** (517ms vs 535ms). FFN down projection reads from mmap'd vindex (zero-copy BLAS). Walk only needs ~3.5GB of model weights (attention + embeddings), not 16.6GB. No quantization. See [docs/ffn-graph-layer.md](docs/ffn-graph-layer.md) for architecture and [docs/inference-engine.md](docs/inference-engine.md) for engine details.
 
 ## Residual Stream Trace
 

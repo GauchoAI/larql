@@ -78,6 +78,22 @@ impl InferenceModel {
         })
     }
 
+    /// Load in walk-only mode: drops FFN weights after loading.
+    /// Requires vindex with down_features.bin + up_features.bin for FFN.
+    /// Saves ~13GB RAM for a 4B model.
+    pub fn load_walk_only(model: &str) -> Result<Self, InferenceError> {
+        let model_path = resolve_model_path(model)?;
+        let mut weights = load_model_dir(&model_path)?;
+        let freed = weights.drop_ffn_weights();
+        eprintln!("[walk-only] Dropped FFN weights: {:.1} GB freed", freed as f64 / 1e9);
+        let tokenizer = load_tokenizer(&model_path)?;
+        Ok(Self {
+            weights,
+            tokenizer,
+            model_name: model.to_string(),
+        })
+    }
+
     pub fn num_layers(&self) -> usize {
         self.weights.num_layers
     }

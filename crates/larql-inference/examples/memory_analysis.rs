@@ -186,6 +186,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  NOTE: {growth:+.0} MB change (likely page cache warm-up, not a leak)");
     }
 
+    // ── Walk-only mode: measure FFN weight drop ──
+    println!("\n--- Walk-Only Mode ---\n");
+
+    // Drop FFN weights from the already-loaded model to measure savings
+    let tensors_before = weights.tensors.len();
+    // We can't mutate the borrowed weights, so report what drop_ffn_weights would save
+    let ffn_patterns = ["gate_proj", "up_proj", "down_proj", "ffn_gate", "ffn_up", "ffn_down", "mlp.experts"];
+    let ffn_tensor_bytes: usize = weights.tensors.iter()
+        .filter(|(k, _)| ffn_patterns.iter().any(|p| k.contains(p)))
+        .map(|(_, v)| v.len() * 4)
+        .sum();
+    let ffn_tensor_count = weights.tensors.keys()
+        .filter(|k| ffn_patterns.iter().any(|p| k.contains(p)))
+        .count();
+    let attn_tensor_count = tensors_before - ffn_tensor_count;
+
+    println!("  Total tensors:  {tensors_before}");
+    println!("  FFN tensors:    {ffn_tensor_count} ({:.1} GB)", ffn_tensor_bytes as f64 / 1e9);
+    println!("  Attn+other:     {attn_tensor_count} ({:.1} GB)", (weights.tensors.iter().map(|(_, v)| v.len() * 4).sum::<usize>() - ffn_tensor_bytes) as f64 / 1e9);
+    println!();
+    println!("  drop_ffn_weights() would free: {:.1} GB", ffn_tensor_bytes as f64 / 1e9);
+    println!("  Walk-only model size: {:.1} GB (attention + embeddings + norms)",
+        (rss_model - rss_start) as f64 / 1024.0 - ffn_tensor_bytes as f64 / 1e9);
+    println!();
+    println!("  Use InferenceModel::load_walk_only() to load without FFN weights.");
+    println!("  Requires down_features.bin + up_features.bin in the vindex.");
+
     println!("\n=== Done ===");
     Ok(())
 }

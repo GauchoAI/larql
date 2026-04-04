@@ -151,11 +151,23 @@ Build time: ~700ms one-time (34 layers, 10,240 vectors, dim=64 projected).
 
 ### FFN quantization is unnecessary
 
-The entire FFN across all 34 layers is served by vindex gate KNN + model weight sparse compute. No FFN weight matrices need to be loaded separately for inference — the gate vectors in the vindex ARE the gate weights, and the up/down weights are accessed sparsely.
+The walk serves all 34 FFN layers with exact results. No approximation, no quantization. The vindex IS the FFN.
+
+### Bottleneck analysis (profiled)
+
+```
+Component              Time      % of 541ms    Bottleneck
+─────────────────────────────────────────────────────────
+Logits projection      221ms     41%           #1 — 262K vocab gemv
+FFN × 34 layers        206ms     38%           Solved by walk
+Attention × 34 layers   84ms     16%           Next target
+Softmax + top-k          2ms      0%
+Framework overhead       7ms      1%           Clean — no hidden cost
+```
+
+The walk eliminates FFN as a bottleneck. Logits (221ms) is now the single largest cost — one gemv against a 2.7GB vocabulary matrix.
 
 ### Remaining matmuls
-
-With the FFN graph layer active, the forward pass matmuls are:
 
 | Operation | Per layer | Source | Notes |
 |-----------|-----------|--------|-------|
@@ -163,34 +175,48 @@ With the FFN graph layer active, the forward pass matmuls are:
 | K projection | ~1ms | safetensors | Accelerate AMX |
 | V projection | ~1ms | safetensors | Accelerate AMX |
 | O projection | ~1ms | safetensors | Accelerate AMX |
-| FFN gate | ~2ms | safetensors | Accelerate AMX |
-| FFN up | ~2ms | safetensors | Accelerate AMX |
+| FFN gate | ~2ms | safetensors | Exact gate projection |
+| FFN up | ~2ms | safetensors | Exact up projection |
 | FFN down | ~2ms | **mmap vindex** | Zero-copy, feature-major |
-| Final logits | ~221ms (once) | safetensors | Not per-layer |
+| Final logits | ~221ms (once) | safetensors | #1 bottleneck |
 
-The down projection is the only matmul that reads from the vindex mmap. Everything else reads from the model's safetensors. The mmap path is faster because the feature-major layout has better cache behavior.
+### Memory profile
+
+```
+Component                        RSS        Notes
+──────────────────────────────────────────────────────
+Baseline                           3 MB
+Model safetensors (mmap)      16,613 MB     Includes FFN weights (not needed by walk)
+Vindex gate vectors (mmap)       +84 MB     Demand-paged
+Feature mmaps (mapped)            +0 MB     No pages until accessed
+Dense forward pass               +48 MB     Temporary ndarray buffers
+Walk forward pass             +3,404 MB     down_features.bin pages faulted in
+Growth over 10 runs              +19 MB     Stable — no leaks
+```
+
+Walk only needs ~3.5GB of model weights (attention + embeddings). A `--walk-only` flag could skip FFN safetensors entirely: 16.6GB → 3.5GB.
 
 ### Path forward
 
 ```
 Current:     517ms walk (faster than 535ms dense)
-+ KNN as activations:   eliminates gate+up matmuls → ~300ms
-+ Q4_K_M attention:     attention 4× cheaper → ~200ms
-+ logits from vindex:   down_meta lookup → ~50ms
++ logits from vindex:   down_meta token lookup → ~300ms (saves 221ms)
++ --walk-only mode:     skip FFN weights → 3.5GB RAM (saves 13GB)
++ Q4_K_M attention:     4× less bandwidth → ~200ms
 + template cache:       attention eliminated → ~40ms
++ precompiled routes:   graph walk only → ~5ms
 ```
 
 ## Walk Path Selection
 
-The WalkFfn selects the optimal path based on available data:
-
 | Path | When | Down source | Speed |
 |------|------|------------|-------|
-| **Mmap walk** (primary) | `down_features.bin` available | Zero-copy mmap | 6.0ms/layer |
-| **Sparse fallback** | No mmap, has model weights | Sparse gather from safetensors | 6.3-10ms/layer |
-| **Dense fallback** | No vindex data for layer | Full dense FFN | 6.4ms/layer |
+| **Exact walk** (primary) | `down_features.bin` available | gate+up from safetensors, down from mmap | 5.7ms/layer |
+| **Full mmap walk** | `up_features.bin` also available | All from mmap (available, slower due to 3-file TLB) | 6.8ms/layer |
+| **Sparse fallback** | No mmap, has model weights | Gate KNN + sparse gather | 6.3-10ms/layer |
+| **Dense fallback** | No vindex data for layer | Full dense FFN | 6.7ms/layer |
 
-The mmap walk is the default when `down_features.bin` is present. It does exact gate+up+GEGLU from model weights and reads the down matrix from the vindex mmap.
+The exact walk is the default — gate+up from safetensors (sequential in one file) + down from feature-major mmap (zero-copy BLAS).
 
 ## Feature-Major Down Vectors
 

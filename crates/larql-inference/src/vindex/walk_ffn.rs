@@ -159,7 +159,18 @@ impl<'a> WalkFfn<'a> {
         x: &Array2<f32>,
     ) -> (Array2<f32>, Array2<f32>) {
         let arch = &*self.weights.arch;
-        let w_up = self.weights.tensors.get(&arch.ffn_up_key(layer)).unwrap();
+
+        // If FFN weights were dropped (walk-only mode), fall through to full mmap
+        let w_up = match self.weights.tensors.get(&arch.ffn_up_key(layer)) {
+            Some(w) => w,
+            None => {
+                // No model FFN weights — use full mmap path
+                if let Some(result) = self.walk_ffn_full_mmap(layer, x) {
+                    return result;
+                }
+                panic!("walk_ffn_exact: no FFN weights and no mmap data for layer {layer}");
+            }
+        };
 
         let is_gated = arch.ffn_type() == larql_models::FfnType::Gated;
         let use_gelu = matches!(

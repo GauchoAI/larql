@@ -4,6 +4,7 @@ pub mod describe;
 pub mod explain;
 pub mod health;
 pub mod infer;
+pub mod insert;
 pub mod models;
 pub mod patches;
 pub mod relations;
@@ -34,6 +35,7 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/patches/{name}", delete(patches::handle_remove_patch))
         .route("/v1/walk-ffn", post(walk_ffn::handle_walk_ffn))
         .route("/v1/explain-infer", post(explain::handle_explain))
+        .route("/v1/insert", post(insert::handle_insert))
         .route("/v1/stream", get(stream::handle_stream))
         .route("/v1/health", get(health::handle_health))
         .route("/v1/models", get(models::handle_models))
@@ -55,5 +57,6 @@ pub fn multi_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/{model_id}/patches", get(patches::handle_list_patches_multi))
         .route("/v1/{model_id}/patches/{name}", delete(patches::handle_remove_patch_multi))
         .route("/v1/{model_id}/explain-infer", post(explain::handle_explain_multi))
+        .route("/v1/{model_id}/insert", post(insert::handle_insert_multi))
         .with_state(state)
 }

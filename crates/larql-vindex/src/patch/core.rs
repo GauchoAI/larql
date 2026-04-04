@@ -274,6 +274,16 @@ impl PatchedVindex {
         &self.base
     }
 
+    /// Access the underlying base index (mutable, for down vector overrides).
+    pub fn base_mut(&mut self) -> &mut VectorIndex {
+        &mut self.base
+    }
+
+    /// Set a down vector override for a feature.
+    pub fn set_down_vector(&mut self, layer: usize, feature: usize, vector: Vec<f32>) {
+        self.base.set_down_vector(layer, feature, vector);
+    }
+
     /// Find a free feature slot in the base (weakest or empty).
     pub fn find_free_feature(&self, layer: usize) -> Option<usize> {
         self.base.find_free_feature(layer)

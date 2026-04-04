@@ -57,6 +57,12 @@ impl<'a> WalkFfn<'a> {
         }
     }
 
+    /// Take raw per-layer residuals (the exact vectors gate_knn sees during inference).
+    /// These are the normalized post-attention hidden states at the last token position.
+    pub fn take_residuals(&self) -> Vec<(usize, Vec<f32>)> {
+        self.trace_residuals.borrow_mut().drain(..).collect()
+    }
+
     pub fn take_trace(&self) -> WalkTrace {
         let residuals = self.trace_residuals.borrow_mut().drain(..).collect::<Vec<_>>();
         let mut layers = Vec::with_capacity(residuals.len());

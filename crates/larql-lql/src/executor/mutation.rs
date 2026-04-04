@@ -24,155 +24,183 @@ impl Session {
         layer_hint: Option<u32>,
         confidence: Option<f32>,
     ) -> Result<Vec<String>, LqlError> {
-        // Look up relation in classifier to find cluster centre + typical layer
-        let relation_info = self.relation_classifier().and_then(|rc| {
-            let cluster_centre = rc.cluster_centre_for_relation(relation);
-            let typical_layer = rc.typical_layer_for_relation(relation);
-            let cluster_id = rc.cluster_for_relation(relation);
-            let label = cluster_id.and_then(|id| rc.cluster_info(id).map(|(l, _, _)| l.to_string()));
-            Some((cluster_centre, typical_layer, label))
-        });
+        // ── Phase 1: Read — capture config, embeddings, and residuals (immutable borrow) ──
+        let (insert_layers, hidden, target_embed, target_id, residuals, use_constellation, alpha);
+        {
+            let (path, config, patched) = self.require_vindex()?;
 
-        let (cluster_centre, typical_layer, matched_label) = relation_info
-            .unwrap_or((None, None, None));
+            let bands = config.layer_bands.clone()
+                .or_else(|| larql_vindex::LayerBands::for_family(&config.family, config.num_layers))
+                .unwrap_or(larql_vindex::LayerBands {
+                    syntax: (0, config.num_layers.saturating_sub(1)),
+                    knowledge: (0, config.num_layers.saturating_sub(1)),
+                    output: (0, config.num_layers.saturating_sub(1)),
+                });
 
-        let (path, config, patched) = self.require_patched_mut()?;
-
-        // Determine layer: user hint > relation's typical layer > knowledge band middle
-        let insert_layer = layer_hint
-            .map(|l| l as usize)
-            .or(typical_layer)
-            .unwrap_or_else(|| {
-                config.layer_bands.as_ref()
-                    .map(|b| (b.knowledge.0 + b.knowledge.1) / 2)
-                    .unwrap_or(config.num_layers * 3 / 5)
-            });
-
-        if insert_layer >= config.num_layers {
-            return Err(LqlError::Execution(format!(
-                "layer {} out of range (model has {} layers)",
-                insert_layer, config.num_layers
-            )));
-        }
-
-        // Find a feature slot (empty or weakest) from the base
-        let feature = patched.find_free_feature(insert_layer).ok_or_else(|| {
-            LqlError::Execution(format!("no feature slot at layer {insert_layer}"))
-        })?;
-
-        // Load embeddings for gate vector synthesis
-        let (embed, embed_scale) = larql_vindex::load_vindex_embeddings(path)
-            .map_err(|e| LqlError::Execution(format!("failed to load embeddings: {e}")))?;
-        let tokenizer = larql_vindex::load_vindex_tokenizer(path)
-            .map_err(|e| LqlError::Execution(format!("failed to load tokenizer: {e}")))?;
-
-        // Entity embedding
-        let entity_encoding = tokenizer
-            .encode(entity, false)
-            .map_err(|e| LqlError::Execution(format!("tokenize error: {e}")))?;
-        let entity_ids: Vec<u32> = entity_encoding.get_ids().to_vec();
-        if entity_ids.is_empty() {
-            return Err(LqlError::Execution(format!("could not tokenize entity: {entity}")));
-        }
-
-        let hidden = embed.shape()[1];
-        let mut entity_embed = larql_vindex::ndarray::Array1::<f32>::zeros(hidden);
-        for &tok in &entity_ids {
-            entity_embed += &embed.row(tok as usize).mapv(|v| v * embed_scale);
-        }
-        entity_embed /= entity_ids.len() as f32;
-
-        // Synthesize gate vector using relation cluster centre if available
-        let gate_vec = if let Some(ref centre) = cluster_centre {
-            let centre_arr = larql_vindex::ndarray::Array1::from_vec(centre.clone());
-            if centre_arr.len() == hidden {
-                // Blend: 70% entity + 30% relation direction
-                &entity_embed * 0.7 + &centre_arr * 0.3
+            insert_layers = if let Some(l) = layer_hint {
+                vec![l as usize]
             } else {
-                entity_embed.clone()
+                let mid = (bands.knowledge.0 + bands.knowledge.1) / 2;
+                (mid..=bands.knowledge.1).collect()
+            };
+
+            let (embed, embed_scale) = larql_vindex::load_vindex_embeddings(path)
+                .map_err(|e| LqlError::Execution(format!("failed to load embeddings: {e}")))?;
+            let tokenizer = larql_vindex::load_vindex_tokenizer(path)
+                .map_err(|e| LqlError::Execution(format!("failed to load tokenizer: {e}")))?;
+
+            hidden = embed.shape()[1];
+            alpha = 2.0f32;
+
+            // Target embedding for down vector
+            let target_encoding = tokenizer.encode(target, false)
+                .map_err(|e| LqlError::Execution(format!("tokenize error: {e}")))?;
+            let target_ids: Vec<u32> = target_encoding.get_ids().to_vec();
+            target_id = target_ids.first().copied().unwrap_or(0);
+
+            let mut te = vec![0.0f32; hidden];
+            for &tok in &target_ids {
+                let row = embed.row(tok as usize);
+                for j in 0..hidden { te[j] += row[j] * embed_scale; }
             }
-        } else {
-            entity_embed.clone()
-        };
+            let n = target_ids.len().max(1) as f32;
+            for v in &mut te { *v /= n; }
+            target_embed = te;
 
-        // Scale gate vector to match existing magnitudes at this layer
-        let mut gate_vec = gate_vec;
-        if let Some(gate_matrix) = patched.base().gate_vectors_at(insert_layer) {
-            let sample = gate_matrix.shape()[0].min(100);
-            let avg_norm: f32 = (0..sample)
-                .filter_map(|i| {
-                    let norm = gate_matrix.row(i).dot(&gate_matrix.row(i)).sqrt();
-                    if norm > 0.0 { Some(norm) } else { None }
-                })
-                .sum::<f32>()
-                / sample as f32;
+            // Constellation: forward pass to capture residuals as gate vectors
+            use_constellation = config.has_model_weights;
+            residuals = if use_constellation {
+                let prompt = format!("The {} of {} is",
+                    relation.replace('-', " ").replace('_', " "), entity);
 
-            let current_norm = gate_vec.dot(&gate_vec).sqrt();
-            if current_norm > 0.0 && avg_norm > 0.0 {
-                gate_vec *= avg_norm / current_norm;
-            }
-        }
+                let mut cb = larql_vindex::SilentLoadCallbacks;
+                let weights = larql_vindex::load_model_weights(path, &mut cb)
+                    .map_err(|e| LqlError::Execution(format!("failed to load weights: {e}")))?;
 
-        // Tokenize target for metadata
-        let target_encoding = tokenizer
-            .encode(target, false)
-            .map_err(|e| LqlError::Execution(format!("tokenize error: {e}")))?;
-        let target_ids: Vec<u32> = target_encoding.get_ids().to_vec();
-        let target_id = target_ids.first().copied().unwrap_or(0);
+                let encoding = tokenizer.encode(prompt.as_str(), true)
+                    .map_err(|e| LqlError::Execution(format!("tokenize error: {e}")))?;
+                let token_ids: Vec<u32> = encoding.get_ids().to_vec();
 
+                let walk_ffn = larql_inference::vindex::WalkFfn::new_with_trace(&weights, patched, 8092);
+                let _result = larql_inference::predict_with_ffn(
+                    &weights, &tokenizer, &token_ids, 1, &walk_ffn,
+                );
+
+                // Take the exact residuals gate_knn sees (normalized post-attention states)
+                walk_ffn.take_residuals().into_iter()
+                    .filter(|(layer, _)| insert_layers.contains(layer))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+        } // immutable borrow ends
+
+        // ── Phase 2: Write — insert features across layers (mutable borrow) ──
         let c_score = confidence.unwrap_or(0.9);
+        let mut inserted_count = 0;
+        let mut patch_ops = Vec::new();
 
-        let meta = larql_vindex::FeatureMeta {
-            top_token: target.to_string(),
-            top_token_id: target_id,
-            c_score,
-            top_k: vec![larql_models::TopKEntry {
-                token: target.to_string(),
-                token_id: target_id,
-                logit: c_score,
-            }],
-        };
+        {
+            let (path, _config, patched) = self.require_patched_mut()?;
 
-        // Encode gate vector for patch recording
-        let gate_vec_slice = gate_vec.as_slice().unwrap();
-        let gate_b64 = larql_vindex::patch::core::encode_gate_vector(gate_vec_slice);
+            let (embed, embed_scale) = larql_vindex::load_vindex_embeddings(path)
+                .map_err(|e| LqlError::Execution(format!("failed to load embeddings: {e}")))?;
+            let tokenizer = larql_vindex::load_vindex_tokenizer(path)
+                .map_err(|e| LqlError::Execution(format!("failed to load tokenizer: {e}")))?;
 
-        // Insert into the patch overlay (base files untouched)
-        patched.insert_feature(insert_layer, feature, gate_vec_slice.to_vec(), meta.clone());
+            for &layer in &insert_layers {
+                let feature = match patched.find_free_feature(layer) {
+                    Some(f) => f,
+                    None => continue,
+                };
 
-        // Record to patch session
-        if let Some(ref mut recording) = self.patch_recording {
-            recording.operations.push(larql_vindex::PatchOp::Insert {
-                layer: insert_layer,
-                feature,
-                relation: Some(relation.to_string()),
-                entity: entity.to_string(),
-                target: target.to_string(),
-                confidence: Some(c_score),
-                gate_vector_b64: Some(gate_b64),
-                down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
+                // Gate vector: residual (constellation) or entity embedding (fallback)
+                let gate_vec: Vec<f32> = if let Some((_, ref residual)) = residuals.iter().find(|(l, _)| *l == layer) {
+                    let mut gv = residual.clone();
+                    if let Some(gate_matrix) = patched.base().gate_vectors_at(layer) {
+                        let sample = gate_matrix.nrows().min(100);
+                        if sample > 0 {
+                            let avg_norm: f32 = (0..sample)
+                                .map(|i| gate_matrix.row(i).dot(&gate_matrix.row(i)).sqrt())
+                                .sum::<f32>() / sample as f32;
+                            let res_norm: f32 = gv.iter().map(|v| v * v).sum::<f32>().sqrt();
+                            if res_norm > 1e-8 && avg_norm > 0.0 {
+                                let scale = avg_norm / res_norm;
+                                for v in &mut gv { *v *= scale; }
+                            }
+                        }
+                    }
+                    gv
+                } else {
+                    let entity_encoding = tokenizer.encode(entity, false)
+                        .map_err(|e| LqlError::Execution(format!("tokenize error: {e}")))?;
+                    let entity_ids: Vec<u32> = entity_encoding.get_ids().to_vec();
+                    let mut ev = vec![0.0f32; hidden];
+                    for &tok in &entity_ids {
+                        let row = embed.row(tok as usize);
+                        for j in 0..hidden { ev[j] += row[j] * embed_scale; }
+                    }
+                    let n = entity_ids.len().max(1) as f32;
+                    for v in &mut ev { *v /= n; }
+                    ev
+                };
+
+                let down_vec: Vec<f32> = target_embed.iter().map(|v| v * alpha).collect();
+
+                let meta = larql_vindex::FeatureMeta {
                     top_token: target.to_string(),
                     top_token_id: target_id,
                     c_score,
-                }),
-            });
+                    top_k: vec![larql_models::TopKEntry {
+                        token: target.to_string(),
+                        token_id: target_id,
+                        logit: c_score,
+                    }],
+                };
+
+                patched.insert_feature(layer, feature, gate_vec.clone(), meta);
+                patched.set_down_vector(layer, feature, down_vec);
+
+                let gate_b64 = larql_vindex::patch::core::encode_gate_vector(&gate_vec);
+                patch_ops.push(larql_vindex::PatchOp::Insert {
+                    layer,
+                    feature,
+                    relation: Some(relation.to_string()),
+                    entity: entity.to_string(),
+                    target: target.to_string(),
+                    confidence: Some(c_score),
+                    gate_vector_b64: Some(gate_b64),
+                    down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
+                        top_token: target.to_string(),
+                        top_token_id: target_id,
+                        c_score,
+                    }),
+                });
+
+                inserted_count += 1;
+            }
+        } // mutable borrow of patched ends
+
+        // Record to patch session
+        if let Some(ref mut recording) = self.patch_recording {
+            recording.operations.extend(patch_ops);
+        }
+
+        if inserted_count == 0 {
+            return Err(LqlError::Execution("no free feature slots in target layers".into()));
         }
 
         let mut out = Vec::new();
         out.push(format!(
-            "Inserted: {} —[{}]→ {} at L{} F{} (patch overlay)",
-            entity, relation, target, insert_layer, feature
+            "Inserted: {} —[{}]→ {} ({} layers, L{}-L{})",
+            entity, relation, target, inserted_count,
+            insert_layers.first().unwrap_or(&0),
+            insert_layers.last().unwrap_or(&0),
         ));
-        out.push(format!("  confidence: {:.2}", c_score));
-
-        if let Some(ref label) = matched_label {
-            out.push(format!("  relation matched: {} (cluster centre used for gate synthesis)", label));
+        if use_constellation {
+            out.push(format!("  mode: constellation (trace-guided gate + down override, alpha={:.2})", alpha));
         } else {
-            out.push("  relation: no cluster match (entity embedding used)".into());
-        }
-
-        if typical_layer.is_some() && layer_hint.is_none() {
-            out.push(format!("  layer auto-selected: L{} (typical for this relation)", insert_layer));
+            out.push("  mode: embedding (no model weights — gate only, no down override)".into());
         }
 
         Ok(out)

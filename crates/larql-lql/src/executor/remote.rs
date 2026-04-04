@@ -577,46 +577,41 @@ impl Session {
     ) -> Result<Vec<String>, LqlError> {
         let (url, client) = self.require_remote()?;
 
-        let op = larql_vindex::PatchOp::Insert {
-            layer: layer.unwrap_or(26) as usize,
-            feature: 0, // server assigns
-            relation: Some(relation.to_string()),
-            entity: entity.to_string(),
-            target: target.to_string(),
-            confidence,
-            gate_vector_b64: None,
-            down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
-                top_token: target.to_string(),
-                top_token_id: 0,
-                c_score: confidence.unwrap_or(0.9),
-            }),
-        };
-
-        let patch = larql_vindex::VindexPatch {
-            version: 1,
-            base_model: String::new(),
-            base_checksum: None,
-            created_at: String::new(),
-            description: Some(format!("INSERT ({entity}, {relation}, {target})")),
-            author: None,
-            tags: vec![],
-            operations: vec![op],
-        };
+        let body = serde_json::json!({
+            "entity": entity,
+            "relation": relation,
+            "target": target,
+            "layer": layer,
+            "confidence": confidence.unwrap_or(0.9),
+        });
 
         let resp = client
-            .post(format!("{url}/v1/patches/apply"))
-            .json(&serde_json::json!({"patch": patch}))
+            .post(format!("{url}/v1/insert"))
+            .json(&body)
             .send()
             .map_err(|e| LqlError::Execution(format!("request failed: {e}")))?;
 
         if !resp.status().is_success() {
+            let status = resp.status();
             let text = resp.text().unwrap_or_default();
-            return Err(LqlError::Execution(format!("INSERT failed: {text}")));
+            return Err(LqlError::Execution(format!("INSERT failed ({}): {}", status, text)));
         }
 
-        Ok(vec![format!(
-            "Inserted: ({entity}, {relation}, {target}) → remote server"
-        )])
+        let result: serde_json::Value = resp.json()
+            .map_err(|e| LqlError::Execution(format!("invalid response: {e}")))?;
+
+        let inserted = result["inserted"].as_u64().unwrap_or(0);
+        let mode = result["mode"].as_str().unwrap_or("unknown");
+        let ms = result["latency_ms"].as_f64().unwrap_or(0.0);
+
+        let mut out = Vec::new();
+        out.push(format!(
+            "Inserted: {} —[{}]→ {} ({} layers, mode: {})",
+            entity, relation, target, inserted, mode,
+        ));
+        out.push(format!("{:.0}ms (remote)", ms));
+
+        Ok(out)
     }
 
     pub(crate) fn remote_delete(

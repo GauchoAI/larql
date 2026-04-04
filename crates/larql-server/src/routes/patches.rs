@@ -61,6 +61,64 @@ fn resolve_patch(req: &ApplyPatchRequest) -> Result<(larql_vindex::VindexPatch, 
     Err(ServerError::BadRequest("must provide 'url' or 'patch' in request body".into()))
 }
 
+/// Synthesise a gate vector from entity embedding when the client didn't provide one.
+fn enrich_patch_ops(model: &crate::state::LoadedModel, patch: &mut larql_vindex::VindexPatch) {
+    let hidden = model.embeddings.shape()[1];
+    for op in &mut patch.operations {
+        if let larql_vindex::PatchOp::Insert {
+            entity,
+            relation,
+            feature,
+            gate_vector_b64,
+            ..
+        } = op
+        {
+            // Synthesise gate vector if missing
+            if gate_vector_b64.is_none() {
+                let encoding = model.tokenizer.encode(entity.as_str(), false);
+                if let Ok(enc) = encoding {
+                    let ids = enc.get_ids();
+                    if !ids.is_empty() {
+                        let mut embed = vec![0.0f32; hidden];
+                        for &tok in ids {
+                            let row = model.embeddings.row(tok as usize);
+                            for j in 0..hidden {
+                                embed[j] += row[j] * model.embed_scale;
+                            }
+                        }
+                        let n = ids.len() as f32;
+                        for v in &mut embed { *v /= n; }
+
+                        // Normalise the embedding to unit length — gate KNN uses
+                        // cosine similarity so magnitude doesn't matter.
+                        let embed_norm: f32 = embed.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        if embed_norm > 1e-8 {
+                            for v in &mut embed { *v /= embed_norm; }
+                        }
+
+                        *gate_vector_b64 = Some(larql_vindex::patch::core::encode_gate_vector(&embed));
+                    }
+                }
+
+                // Assign a feature slot if unset
+                if *feature == 0 {
+                    // Use a deterministic slot based on layer + entity hash
+                    let hash = entity.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+                    *feature = (hash as usize % 10240) + 1;
+                }
+            }
+
+            // Register the relation label so DESCRIBE shows it
+            if let Some(rel) = relation {
+                if !rel.is_empty() {
+                    // We can't mutate probe_labels directly (it's not behind a lock),
+                    // but the patched overlay will store the metadata.
+                }
+            }
+        }
+    }
+}
+
 async fn apply_patch_to_model(
     state: &AppState,
     model_id: Option<&str>,
@@ -71,7 +129,11 @@ async fn apply_patch_to_model(
         .model(model_id)
         .ok_or_else(|| ServerError::NotFound("model not found".into()))?;
 
-    let (patch, name) = resolve_patch(&req)?;
+    let (mut patch, name) = resolve_patch(&req)?;
+
+    // Enrich INSERT ops with gate vectors if missing
+    enrich_patch_ops(model, &mut patch);
+
     let op_count = patch.operations.len();
 
     // Session-scoped or global?

@@ -23,6 +23,7 @@ pub mod residual_inject;
 pub mod rope;
 pub mod fused_attention;
 pub mod fused_ops;
+pub mod q8_attn_proj;
 
 /// Concatenate all shaders into one MSL source string for compilation.
 pub fn all_shaders() -> String {
@@ -53,5 +54,6 @@ pub fn all_shaders() -> String {
     src.push_str(rope::SHADER);
     src.push_str(fused_attention::SHADER);
     src.push_str(fused_ops::SHADER);
+    src.push_str(q8_attn_proj::SHADER);
     src
 }

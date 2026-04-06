@@ -48,6 +48,7 @@ pub struct MetalBackend {
     q8_matvec_pipeline: ComputePipelineState,
     rms_norm_pipeline: ComputePipelineState,
     residual_add_pipeline: ComputePipelineState,
+    q8_qkv_proj_pipeline: ComputePipelineState,
     rms_norm_q8_pipeline: ComputePipelineState,
     residual_norm_pipeline: ComputePipelineState,
     residual_norm_q8_pipeline: ComputePipelineState,
@@ -105,6 +106,10 @@ impl MetalBackend {
         let rms_norm_pipeline = device.new_compute_pipeline_state_with_function(&rms_norm_fn).ok()?;
         let residual_add_pipeline = device.new_compute_pipeline_state_with_function(&residual_add_fn).ok()?;
 
+        // Fused Q8 QKV projection (all 3 in one dispatch)
+        let q8_qkv_fn = library.get_function("q8_qkv_proj", None).ok()?;
+        let q8_qkv_proj_pipeline = device.new_compute_pipeline_state_with_function(&q8_qkv_fn).ok()?;
+
         // Fused ops (norm+quantize, residual+norm, residual+norm+quantize)
         let rms_norm_q8_fn = library.get_function("rms_norm_q8", None).ok()?;
         let residual_norm_fn = library.get_function("residual_norm", None).ok()?;
@@ -129,6 +134,7 @@ impl MetalBackend {
             kv_attend_pipeline, kv_append_pipeline,
             q8_matvec_pipeline,
             rms_norm_pipeline, residual_add_pipeline,
+            q8_qkv_proj_pipeline,
             rms_norm_q8_pipeline, residual_norm_pipeline, residual_norm_q8_pipeline,
             flop_threshold: AtomicUsize::new(calibrate::DEFAULT_FLOP_THRESHOLD),
         })
@@ -239,6 +245,7 @@ impl MetalBackend {
             &self.geglu_pipeline, &self.q8_quant_pipeline,
             None,
             &self.q8_matvec_pipeline,
+            &self.q8_qkv_proj_pipeline,
             &self.rms_norm_pipeline, &self.residual_add_pipeline,
             &self.rms_norm_q8_pipeline, &self.residual_norm_q8_pipeline,
             &full_layers, x, hidden, inter, q_dim, kv_dim,
@@ -313,6 +320,7 @@ impl ComputeBackend for MetalBackend {
             &self.geglu_pipeline, &self.q8_quant_pipeline,
             Some(&self.fused_attn_pipeline),
             &self.q8_matvec_pipeline,
+            &self.q8_qkv_proj_pipeline,
             &self.rms_norm_pipeline, &self.residual_add_pipeline,
             &self.rms_norm_q8_pipeline, &self.residual_norm_q8_pipeline,
             layers, x, hidden, inter, q_dim, kv_dim,

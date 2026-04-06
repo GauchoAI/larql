@@ -123,9 +123,20 @@ Remaining optimizations:
   → ~10ms = 100 tok/s (projected Ollama parity)
 ```
 
-The FFN is essentially at parity. The gap is attention dispatch count:
-- LARQL: norm_q8 + Q8_Q + Q8_K + Q8_V + fused_attn + Q8_O = 6 dispatches
-- Ollama: fused_dequant_matvec_rope_QKV + fused_attn + fused_O = ~2 dispatches
+Fused Q8 QKV projection (measured):
+- Separate Q+K+V (3 dispatches): 0.856ms/layer × 21 = 18.0ms
+- Fused Q+K+V (1 dispatch):      0.387ms/layer × 21 = 8.1ms  ← 2.2x faster
+- Simdgroup reduction, shared input loading, zero intermediate buffers
 
-The fix: one fused kernel that reads Q8 weights, dequantizes, multiplies,
-applies RoPE, and outputs f32 Q/K/V — all in one dispatch.
+Projected pipeline with fused QKV:
+- Q8 QKV fused:  8.1ms
+- Fused attention: ~3ms
+- Q8 O projection: ~2ms  
+- Q4 FFN batch: 8.4ms
+- Norms + residuals: ~2ms
+- Total: ~24ms → 42 tok/s
+
+Remaining gap to Ollama (10ms):
+- KV cache eliminates K/V recompute: saves ~3ms
+- Fused O projection into attention output: saves ~2ms  
+- Tighter pipeline (fewer command buffers): saves ~5ms

@@ -133,6 +133,7 @@ pub fn dispatch_full_pipeline(
     q8_quant_pipeline: &ComputePipelineState,
     fused_attn_pipeline: Option<&ComputePipelineState>,
     q8_matvec_pipeline: &ComputePipelineState,
+    q8_qkv_pipeline: &ComputePipelineState,
     rms_norm_pipeline: &ComputePipelineState,
     residual_add_pipeline: &ComputePipelineState,
     rms_norm_q8_pipeline: &ComputePipelineState,
@@ -245,12 +246,35 @@ pub fn dispatch_full_pipeline(
             enc.end_encoding();
         }
 
-        // ── 3. Q8 Q/K/V projections — all 3 in one encoder ──
+        // ── 3. FUSED Q8 Q+K+V projection — one dispatch for all 3 ──
         {
+            let q_rows_val = q_dim as u32;
+            let k_rows_val = kv_dim as u32;
+            let v_rows_val = kv_dim as u32;
+            let k_val = hidden as u32;
+            let total_rows = q_dim + kv_dim + kv_dim;
+
             let enc = cmd.new_compute_command_encoder();
-            encode_q8_matvec(enc, q8_matvec_pipeline, &wq_bufs[l], &q8_bufs[l], &wq_scale_bufs[l], &q8s_bufs[l], &q_outs[l], q_dim, hidden);
-            encode_q8_matvec(enc, q8_matvec_pipeline, &wk_bufs[l], &q8_bufs[l], &wk_scale_bufs[l], &q8s_bufs[l], &k_outs[l], kv_dim, hidden);
-            encode_q8_matvec(enc, q8_matvec_pipeline, &wv_bufs[l], &q8_bufs[l], &wv_scale_bufs[l], &q8s_bufs[l], &v_outs[l], kv_dim, hidden);
+            enc.set_compute_pipeline_state(q8_qkv_pipeline);
+            enc.set_buffer(0, Some(&wq_bufs[l]), 0);
+            enc.set_buffer(1, Some(&wk_bufs[l]), 0);
+            enc.set_buffer(2, Some(&wv_bufs[l]), 0);
+            enc.set_buffer(3, Some(&q8_bufs[l]), 0);    // Q8 input (same for all)
+            enc.set_buffer(4, Some(&wq_scale_bufs[l]), 0);
+            enc.set_buffer(5, Some(&wk_scale_bufs[l]), 0);
+            enc.set_buffer(6, Some(&wv_scale_bufs[l]), 0);
+            enc.set_buffer(7, Some(&q8s_bufs[l]), 0);   // input scales
+            enc.set_buffer(8, Some(&q_outs[l]), 0);
+            enc.set_buffer(9, Some(&k_outs[l]), 0);
+            enc.set_buffer(10, Some(&v_outs[l]), 0);
+            enc.set_bytes(11, 4, &q_rows_val as *const u32 as *const c_void);
+            enc.set_bytes(12, 4, &k_rows_val as *const u32 as *const c_void);
+            enc.set_bytes(13, 4, &v_rows_val as *const u32 as *const c_void);
+            enc.set_bytes(14, 4, &k_val as *const u32 as *const c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(total_rows as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
             enc.end_encoding();
         }
 
@@ -303,7 +327,22 @@ pub fn dispatch_full_pipeline(
         }
         {
             let enc = cmd.new_compute_command_encoder();
-            encode_q8_matvec(enc, q8_matvec_pipeline, &wo_bufs[l], &q8_bufs[l], &wo_scale_bufs[l], &q8s_bufs[l], &o_outs[l], hidden, q_dim);
+            // O projection uses simdgroup Q8 (q8_proj_rope kernel)
+            let o_rows = hidden as u32;
+            let o_k = q_dim as u32;
+            let o_tgs = ((hidden as u64) + 7) / 8;
+            enc.set_compute_pipeline_state(q8_matvec_pipeline); // fallback to existing Q8 for now
+            enc.set_buffer(0, Some(&wo_bufs[l]), 0);
+            enc.set_buffer(1, Some(&q8_bufs[l]), 0);  // reuse attn Q8
+            enc.set_buffer(2, Some(&wo_scale_bufs[l]), 0);
+            enc.set_buffer(3, Some(&q8s_bufs[l]), 0);
+            enc.set_buffer(4, Some(&o_outs[l]), 0);
+            enc.set_bytes(5, 4, &o_rows as *const u32 as *const c_void);
+            enc.set_bytes(6, 4, &o_k as *const u32 as *const c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(o_tgs, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
             enc.end_encoding();
         }
 

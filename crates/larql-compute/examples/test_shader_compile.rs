@@ -18,7 +18,9 @@ fn main() {
                               "kv_attention", "kv_cache_append",
                               "q4_matvec_v2", "q4_matvec_v3", "q4_matvec_v4", "q4_matvec_v5",
                               "rms_norm_q8", "residual_norm", "residual_norm_q8",
-                              "rms_norm", "residual_add", "q8_matvec"] {
+                              "rms_norm", "residual_add", "q8_matvec",
+                              "q8_proj_rope", "q8_qkv_proj",
+                              "rms_norm_q8", "residual_norm", "residual_norm_q8"] {
                     match lib.get_function(name, None) {
                         Ok(_) => println!("  ✓ {name}"),
                         Err(e) => println!("  ✗ {name}: {e}"),

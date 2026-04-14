@@ -844,6 +844,32 @@ impl MetalBackend {
         cmd.commit();
         cmd.wait_until_completed();
 
+        // DIAGNOSTIC: LARQL_READBACK=1 dumps intermediate buffer stats to stderr.
+        // Limited to buffers defined OUTSIDE the per-layer loop (the others would
+        // need explicit copy-out during the loop).
+        if std::env::var("LARQL_READBACK").ok().as_deref() == Some("1") {
+            for (name, buf) in [
+                ("q_out", &q_out),
+                ("k_out", &k_out),
+                ("v_out", &v_out),
+                ("ffn_norm_out", &ffn_norm_out),
+                ("gate_out", &gate_out_scratch),
+                ("up_out", &up_out),
+                ("act_buf", &act_buf),
+                ("down_out", &down_out),
+                ("h_a", &h_a),
+                ("h_b", &h_b),
+            ] {
+                let n = (buf.length() / 4) as usize;
+                let data = super::buffers::read_buffer_f32(buf, n);
+                let ninf = data.iter().filter(|v| v.is_infinite()).count();
+                let nnan = data.iter().filter(|v| v.is_nan()).count();
+                let fmx = data.iter().filter(|v| v.is_finite()).map(|v| v.abs()).fold(0.0f32, f32::max);
+                eprintln!("[readback] {:<14} len={:<6} {} inf, {} nan, max|finite|={:.2}",
+                    name, n, ninf, nnan, fmx);
+            }
+        }
+
         super::buffers::read_buffer_f32(&h_buf, hidden)
     }
 }

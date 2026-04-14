@@ -199,6 +199,18 @@ impl ComputeBackend for MetalBackend {
         k_data: &[f32], v_data: &[f32],
         seq_len: usize, num_kv_heads: usize, head_dim: usize,
     ) {
+        if layer == 0 && std::env::var("LARQL_DUMP_KV").ok().as_deref() == Some("1") {
+            let expected = seq_len * num_kv_heads * head_dim;
+            let k_max = k_data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let v_max = v_data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let k_nf = k_data.iter().filter(|v| !v.is_finite()).count();
+            let v_nf = v_data.iter().filter(|v| !v.is_finite()).count();
+            eprintln!("[populate_kv_layer] L{layer} seq_len={seq_len} num_kv={num_kv_heads} head_dim={head_dim} expected={expected}");
+            eprintln!("  k: len={} max|val|={k_max:.3} non-finite={k_nf}  (first 8: {:?})",
+                k_data.len(), &k_data[..k_data.len().min(8)]);
+            eprintln!("  v: len={} max|val|={v_max:.3} non-finite={v_nf}  (first 8: {:?})",
+                v_data.len(), &v_data[..v_data.len().min(8)]);
+        }
         let mut cache_guard = self.kv_cache.lock().unwrap();
         // Ensure KV cache exists with enough layers
         if cache_guard.is_none() {

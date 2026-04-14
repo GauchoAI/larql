@@ -149,12 +149,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         f32_data.to_vec()
                     };
 
-                    // Down gets Q6_K, gate/up get Q4_K
-                    let q_data = if *name == "down" {
-                        quantize_q6_k(&padded)
-                    } else {
-                        quantize_q4_k(&padded)
-                    };
+                    // NOTE: loader resolve_ffn_weights assumes uniform Q4_K sizing
+                    // across gate/up/down. Using Q4_K for down too keeps the layout
+                    // uniform; accuracy loss vs Q6_K is small for FFN down.
+                    let q_data = quantize_q4_k(&padded);
 
                     out.write_all(&q_data)?;
                     total_bytes += q_data.len();

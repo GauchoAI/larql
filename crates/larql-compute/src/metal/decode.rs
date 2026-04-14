@@ -644,18 +644,36 @@ impl MetalBackend {
                         let gate_out = &gate_out_scratch;
                         // Fused gate+up: one dispatch, reads input once
                         let n_tgs_per_mat = (inter as u64).div_ceil(q4k_gu::ROWS_PER_TG);
-                        enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline);
-                        enc.set_buffer(0, Some(&gate_bufs[l]), 0);
-                        enc.set_buffer(1, Some(&up_bufs[l]), 0);
-                        enc.set_buffer(2, Some(&ffn_norm_out), 0);
-                        enc.set_buffer(3, Some(&gate_out), 0);
-                        enc.set_buffer(4, Some(&up_out), 0);
-                        enc.set_bytes(5, 4, &inter_val as *const u32 as *const std::ffi::c_void);
-                        enc.set_bytes(6, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-                        enc.dispatch_thread_groups(
-                            MTLSize::new(n_tgs_per_mat * 2, 1, 1),
-                            MTLSize::new(q4k_gu::THREADS_PER_TG, 1, 1),
-                        );
+                        // DIAGNOSTIC: LARQL_SEPARATE_GATE_UP=1 bypasses the fused gate_up kernel
+                        // and uses two independent q4k_matvec dispatches. Standalone q4k_matvec
+                        // is verified clean for real weights at any input magnitude.
+                        let separate_gate_up = std::env::var("LARQL_SEPARATE_GATE_UP").ok().as_deref() == Some("1");
+                        if separate_gate_up {
+                            let n_tgs_gu = (inter as u64).div_ceil(q4k::ROWS_PER_TG);
+                            enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline);
+                            enc.set_buffer(0, Some(&gate_bufs[l]), 0);
+                            enc.set_buffer(1, Some(&ffn_norm_out), 0);
+                            enc.set_buffer(2, Some(&gate_out), 0);
+                            enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                            enc.dispatch_thread_groups(MTLSize::new(n_tgs_gu, 1, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
+                            enc.set_buffer(0, Some(&up_bufs[l]), 0);
+                            enc.set_buffer(2, Some(&up_out), 0);
+                            enc.dispatch_thread_groups(MTLSize::new(n_tgs_gu, 1, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
+                        } else {
+                            enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline);
+                            enc.set_buffer(0, Some(&gate_bufs[l]), 0);
+                            enc.set_buffer(1, Some(&up_bufs[l]), 0);
+                            enc.set_buffer(2, Some(&ffn_norm_out), 0);
+                            enc.set_buffer(3, Some(&gate_out), 0);
+                            enc.set_buffer(4, Some(&up_out), 0);
+                            enc.set_bytes(5, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(6, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                            enc.dispatch_thread_groups(
+                                MTLSize::new(n_tgs_per_mat * 2, 1, 1),
+                                MTLSize::new(q4k_gu::THREADS_PER_TG, 1, 1),
+                            );
+                        }
                         // GEGLU activation
                         let geglu = match layer.activation {
                             crate::Activation::GeluTanh => &self.geglu_gelu_tanh_pipeline,

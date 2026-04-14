@@ -535,6 +535,26 @@ impl MetalBackend {
                 enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
             }
 
+            // DIAGNOSTIC: LARQL_SKIP_FFN=1 bypasses FFN entirely, returning h_post_attn
+            // as the layer output. Used to isolate whether the Gemma 3 decode NaN
+            // comes from attention+O-proj+post-attn-norm vs. FFN+post-FFN-norm.
+            let skip_ffn = std::env::var("LARQL_SKIP_FFN").ok().as_deref() == Some("1");
+            if skip_ffn {
+                // Copy h_post_attn to new_h so downstream logic still works.
+                let len_val = hidden as u32;
+                enc.set_compute_pipeline_state(&self.residual_add_pipeline);
+                // residual_add(a, b, out) = a + b; pass zero-buffer as b.
+                let zero_vec = vec![0.0f32; hidden];
+                let zero_buf = self.bufs.transient_from_f32(&zero_vec);
+                enc.set_buffer(0, Some(&h_post_attn), 0);
+                enc.set_buffer(1, Some(&zero_buf), 0);
+                enc.set_buffer(2, Some(&new_h), 0);
+                enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+                h_buf = new_h;
+                continue; // skip steps 6-8
+            }
+
             // ── Step 6: FFN (format-aware: Q4_KF uses llama.cpp kernel, Q4_K uses our kernel, Q4_0 uses Q8) ──
             {
                 let ffn_is_q4kf = layer.gate.format == crate::QuantFormat::Q4_KF;
@@ -732,7 +752,8 @@ impl MetalBackend {
             }
 
             // ── Step 7: Post-FFN residual ──
-            if has_post_norms {
+            let skip_post_ffn_norm = std::env::var("LARQL_SKIP_POST_FFN_NORM").ok().as_deref() == Some("1");
+            if has_post_norms && !skip_post_ffn_norm {
                 if let Some(post_ffn) = layer.post_ffn_norm {
                     let post_ffn_buf = self.bufs.transient_from_f32(post_ffn);
                     let normed_ffn = &normed_scratch;

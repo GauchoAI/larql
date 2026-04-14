@@ -154,6 +154,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 backend.reset_kv_cache();
                 println!("  kv cache cleared");
             }
+            "gpuprefill" => {
+                // Prefill-via-decode-loop: reset cache, then call decode_token once per
+                // prompt token in sequence. This keeps the entire forward pass in
+                // Q4K-quantized space (matching subsequent kvdecode) instead of the
+                // CPU-f16 mismatch that kvprefill creates.
+                backend.reset_kv_cache();
+                let text = parse_quoted(rest);
+                let enc = tokenizer.encode(text.as_str(), true).map_err(|e| e.to_string())?;
+                let ids: Vec<u32> = enc.get_ids().to_vec();
+                let cache = CachedLayerGraph::build(weights, &ids, &empty_cache_layers, &dense_ffn);
+                let t = Instant::now();
+                let mut last_preds: Vec<(String, f64)> = Vec::new();
+                let mut last_raw: Vec<(u32, f32, f64)> = Vec::new();
+                for (i, &tid) in ids.iter().enumerate() {
+                    let t_step = Instant::now();
+                    let r = larql_inference::layer_graph::predict::predict_honest(
+                        weights, tokenizer, &[tid], 5, &index, &*backend, &cache, 0..num_layers,
+                    );
+                    let ms = t_step.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[gpuprefill tok {i}/{}  id={}  {:.1}ms]", ids.len(), tid, ms);
+                    last_preds = r.predictions.clone();
+                    last_raw = r.raw_predictions.clone();
+                }
+                let total_ms = t.elapsed().as_secs_f64() * 1000.0;
+                for (i, (s, p)) in last_preds.iter().take(5).enumerate() {
+                    println!("  {:>2}. {:?}  {:.2}%", i+1, s, p * 100.0);
+                }
+                println!("  gpuprefill total: {:.1}ms  ({} tokens, KV populated via decode loop)", total_ms, ids.len());
+                last_prompt_tokens = ids;
+                let _ = last_raw;
+            }
             "kvprefill" => {
                 let text = parse_quoted(rest);
                 let enc = tokenizer.encode(text.as_str(), true).map_err(|e| e.to_string())?;

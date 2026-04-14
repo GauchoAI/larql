@@ -1952,3 +1952,186 @@ fn decode_token_gemma3_produces_finite() {
 
     be.reset_kv_cache();
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Real-data decode_token reproducer — loads Gemma 3 4B layer 0
+// Q4K weights + real norm vectors from a vindex, uses synthetic
+// input, calls decode_token. Fast (no model load, ~10s).
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore]
+fn decode_token_real_layer0_produces_finite() {
+    let vindex_path = std::env::var("LARQL_VINDEX_PATH")
+        .expect("set LARQL_VINDEX_PATH to a Q4K-prepared Gemma 3 4B vindex");
+    let dir = std::path::Path::new(&vindex_path);
+
+    // Config values — hard-coded to match Gemma 3 4B. Could read from index.json.
+    let hidden = 2560usize;
+    let inter = 10240usize;
+    let num_q_heads = 8usize;
+    let num_kv_heads = 4usize;
+    let head_dim = 256usize;
+    let q_dim = num_q_heads * head_dim;  // 2048
+    let kv_dim = num_kv_heads * head_dim; // 1024
+    let _ = (q_dim, kv_dim);
+
+    // ── 1. Read weight_manifest.json, find layer 0 entries ──
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("weight_manifest.json")).unwrap()
+    ).unwrap();
+    // Inline f16 → f32 decode (avoid larql_models dep from this test)
+    fn decode_f16(raw: &[u8]) -> Vec<f32> {
+        raw.chunks_exact(2).map(|b| {
+            let bits = u16::from_le_bytes([b[0], b[1]]);
+            let sign = (bits >> 15) & 0x1;
+            let exp  = (bits >> 10) & 0x1F;
+            let mant = (bits & 0x3FF) as u32;
+            let f32_bits = if exp == 0 {
+                if mant == 0 { (sign as u32) << 31 }
+                else {
+                    let mut m = mant;
+                    let mut e: i32 = -14;
+                    while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+                    let exp32 = (e + 127) as u32;
+                    ((sign as u32) << 31) | (exp32 << 23) | ((m & 0x3FF) << 13)
+                }
+            } else if exp == 0x1F {
+                ((sign as u32) << 31) | (0xFF << 23) | (mant << 13)
+            } else {
+                let exp32 = (exp as i32 - 15 + 127) as u32;
+                ((sign as u32) << 31) | (exp32 << 23) | (mant << 13)
+            };
+            f32::from_bits(f32_bits)
+        }).collect()
+    }
+    let find_vec = |key: &str| -> Vec<f32> {
+        let e = manifest.iter().find(|e|
+            e.get("key").and_then(|k| k.as_str()) == Some(key)
+        ).unwrap_or_else(|| panic!("missing vector {key}"));
+        let offset = e["offset"].as_u64().unwrap() as usize;
+        let length = e["length"].as_u64().unwrap() as usize;
+        let file_name = e["file"].as_str().unwrap();
+        let file = std::fs::File::open(dir.join(file_name)).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let raw = &mmap[offset..offset + length];
+        decode_f16(raw)
+    };
+    let input_norm = find_vec("layers.0.input_layernorm.weight");
+    let post_attn_norm = find_vec("layers.0.post_attention_layernorm.weight");
+    let pre_ffn_norm = find_vec("layers.0.pre_feedforward_layernorm.weight");
+    let post_ffn_norm = find_vec("layers.0.post_feedforward_layernorm.weight");
+    // Gemma 3 QK-norm weights (not currently plumbed through FullPipelineLayer).
+    let _q_norm = find_vec("layers.0.self_attn.q_norm.weight");
+    let _k_norm = find_vec("layers.0.self_attn.k_norm.weight");
+    println!("Loaded norms: input max {:.3}, post_attn max {:.3}, pre_ffn max {:.3}, post_ffn max {:.3}",
+        input_norm.iter().map(|v| v.abs()).fold(0.0f32, f32::max),
+        post_attn_norm.iter().map(|v| v.abs()).fold(0.0f32, f32::max),
+        pre_ffn_norm.iter().map(|v| v.abs()).fold(0.0f32, f32::max),
+        post_ffn_norm.iter().map(|v| v.abs()).fold(0.0f32, f32::max));
+
+    // ── 2. Real Q4K attention weights (layer 0 only) ──
+    let q4k_manifest: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("attn_weights_q4k_manifest.json")).unwrap()
+    ).unwrap();
+    let attn_file = std::fs::File::open(dir.join("attn_weights_q4k.bin")).unwrap();
+    let attn_mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&attn_file).unwrap() });
+
+    let find_q4k = |key_needle: &str| -> (usize, usize, &str) {
+        let e = q4k_manifest.iter().find(|e|
+            e.get("key").and_then(|k| k.as_str()).is_some_and(|k| k.contains("layers.0") && k.contains(key_needle))
+        ).unwrap_or_else(|| panic!("missing q4k {key_needle}"));
+        let offset = e["offset"].as_u64().unwrap() as usize;
+        let length = e["length"].as_u64().unwrap() as usize;
+        let format = e.get("format").and_then(|v| v.as_str()).unwrap_or("Q4_K");
+        let _ = format;
+        (offset, length, "")
+    };
+    let (q_off, q_len, _) = find_q4k("q_proj");
+    let (k_off, k_len, _) = find_q4k("k_proj");
+    let (v_off, v_len, _) = find_q4k("v_proj");
+    let (o_off, o_len, _) = find_q4k("o_proj");
+    let wq_bytes = &attn_mmap[q_off..q_off + q_len];
+    let wk_bytes = &attn_mmap[k_off..k_off + k_len];
+    let wv_bytes = &attn_mmap[v_off..v_off + v_len];
+    let wo_bytes = &attn_mmap[o_off..o_off + o_len];
+    println!("Q4K attn layer 0: q={}B k={}B v={}B o={}B", q_len, k_len, v_len, o_len);
+
+    // ── 3. Layer 0 FFN weights from interleaved_q4k.bin ──
+    // Per-layer layout: [gate Q4_K | up Q4_K | down Q6_K]. Sizes computed from dims.
+    let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 144; // Q4_K ≈ 144B/256vals
+    let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210; // Q6_K ≈ 210B/256vals
+    // Layer size: gate + up (Q4_K) + down (Q6_K)
+    let layer_bytes = 2 * q4k_bytes_per_matrix + q6k_bytes_per_matrix;
+
+    let inter_file = std::fs::File::open(dir.join("interleaved_q4k.bin")).unwrap();
+    let inter_mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&inter_file).unwrap() });
+    let inter_total = inter_mmap.len();
+    println!("interleaved_q4k.bin: {}B total, layer 0 computed bytes={}B", inter_total, layer_bytes);
+
+    // Layer 0 offsets
+    let gate_bytes = &inter_mmap[0..q4k_bytes_per_matrix];
+    let up_bytes = &inter_mmap[q4k_bytes_per_matrix..2*q4k_bytes_per_matrix];
+    let down_bytes = &inter_mmap[2*q4k_bytes_per_matrix..2*q4k_bytes_per_matrix + q6k_bytes_per_matrix];
+
+    // ── 4. Construct FullPipelineLayer (Gemma 3 config) ──
+    let (_q8_x, q8_scales) = q4::quantize_to_q8(&vec![0.01f32; hidden]);
+    let layer = larql_compute::FullPipelineLayer {
+        wq: larql_compute::QuantWeight { data: wq_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
+        wk: larql_compute::QuantWeight { data: wk_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
+        wv: larql_compute::QuantWeight { data: wv_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q6_K },
+        wo: larql_compute::QuantWeight { data: wo_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
+        gate: larql_compute::QuantWeight { data: gate_bytes, scales: None, format: larql_compute::QuantFormat::Q4_K },
+        up: larql_compute::QuantWeight { data: up_bytes, scales: None, format: larql_compute::QuantFormat::Q4_K },
+        down: larql_compute::QuantWeight { data: down_bytes, scales: None, format: larql_compute::QuantFormat::Q6_K },
+        input_norm: &input_norm,
+        post_attn_norm: &post_attn_norm,
+        pre_ffn_norm: Some(&pre_ffn_norm),
+        post_ffn_norm: Some(&post_ffn_norm),
+        norm_offset: 1.0,
+        qk_norm_offset: 1.0,
+        eps: 1e-6,
+        has_post_norms: true,
+        norm_type: larql_compute::NormType::RmsNorm,
+        ffn_type: larql_compute::FfnType::Gated,
+        activation: larql_compute::Activation::GeluTanh,
+        attn_scale: 1.0 / (head_dim as f32).sqrt(),
+        head_dim,
+        num_q_heads,
+        num_kv_heads,
+        rope_base: 10000.0,
+        rotary_dim: 0,
+        sliding_window: 0,
+        has_v_norm: false,
+        layer_scalar: 0.0,
+        input_norm_bias: None,
+        post_attn_norm_bias: None,
+        ffn_up_bias: None,
+        ffn_down_bias: None,
+    };
+
+    // ── 5. Real post-embed-scale-sized input, like real Gemma 3 embedding output ──
+    let x: Vec<f32> = (0..hidden).map(|i| ((i as f32 * 0.003).sin() * 20.0)).collect();
+
+    let metal = get_metal();
+    let be: &dyn ComputeBackend = &metal;
+    be.reset_kv_cache();
+
+    let result = be.decode_token(
+        &[layer], &x, hidden, inter, q_dim, kv_dim,
+        num_q_heads, num_kv_heads, head_dim, 10000.0,
+    );
+
+    assert!(result.is_some(), "decode_token returned None");
+    let out = result.unwrap();
+    let n_inf = out.iter().copied().filter(|v: &f32| v.is_infinite()).count();
+    let n_nan = out.iter().copied().filter(|v: &f32| v.is_nan()).count();
+    let mn = out.iter().copied().filter(|v: &f32| v.is_finite()).fold(f32::INFINITY, f32::min);
+    let mx = out.iter().copied().filter(|v: &f32| v.is_finite()).fold(f32::NEG_INFINITY, f32::max);
+    println!("Real-data decode_token output: {} inf, {} nan, {} finite, range [{}, {}]",
+        n_inf, n_nan, out.len() - n_inf - n_nan,
+        if mn == f32::INFINITY { f32::NAN } else { mn },
+        if mx == f32::NEG_INFINITY { f32::NAN } else { mx });
+    assert_eq!(n_inf + n_nan, 0,
+        "Real-data decode_token produces {} inf + {} nan of {} — REPRODUCER", n_inf, n_nan, out.len());
+}

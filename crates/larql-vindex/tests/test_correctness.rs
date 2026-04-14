@@ -88,6 +88,37 @@ fn q4k_build_matches_fresh_quantization() {
 
 #[test]
 #[ignore]
+fn q4k_matvec_real_gate_synthetic_x() {
+    // Same structure: real gate weights (Q4_K) + synthetic x=1.0.
+    // Finite output → the FFN NaN comes from real ffn_norm_out magnitudes.
+    // Non-finite → gate's Q4_K dequant has an issue.
+    let vindex = std::env::var("LARQL_VINDEX_PATH").expect("set LARQL_VINDEX_PATH");
+    let dir = std::path::Path::new(&vindex);
+
+    let hidden = 2560usize;
+    let inter = 10240usize;
+    let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 148;
+
+    let file = std::fs::File::open(dir.join("interleaved_q4k.bin")).unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let gate_bytes = &mmap[0..q4k_bytes_per_matrix]; // layer 0 gate is first
+
+    let metal = larql_compute::metal::MetalBackend::new().expect("metal");
+    let be: &dyn larql_compute::ComputeBackend = &metal;
+
+    // Sweep x magnitudes to find where gate_matvec goes non-finite.
+    for x_mag in [1.0f32, 10.0, 100.0, 1000.0, 10000.0, 100000.0] {
+        let x = vec![x_mag; hidden];
+        let result = be.q4k_matvec(gate_bytes, &x, inter, hidden).expect("q4k_matvec");
+        let n_inf = result.iter().filter(|v| v.is_infinite()).count();
+        let n_nan = result.iter().filter(|v| v.is_nan()).count();
+        let max_abs = result.iter().filter(|v| v.is_finite()).map(|v| v.abs()).fold(0.0f32, f32::max);
+        println!("q4k_matvec(real_gate, x={x_mag}): {n_inf} inf, {n_nan} nan, max|val|={max_abs:.2}");
+    }
+}
+
+#[test]
+#[ignore]
 fn q6k_matvec_real_down_synthetic_x() {
     // Run Metal q6k_matvec with real layer-0 down weights + synthetic x=1.0.
     // If output is finite, the NaN comes from act_buf magnitudes, not weights.

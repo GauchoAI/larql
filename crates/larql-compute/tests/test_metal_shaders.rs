@@ -1850,3 +1850,105 @@ fn rms_norm_with_different_eps() {
     let diff = max_diff(&r1, &r2);
     assert!(diff > 0.1, "Different eps values should produce different outputs (diff={diff})");
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Gemma 3 decode_token: reproduces the QK-norm NaN bug
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn decode_token_gemma3_produces_finite() {
+    // Reproduces the inf/NaN output bug for Gemma 3's post-norm architecture.
+    // Config matches Gemma 3: has_post_norms=true, qk_norm_offset=1.0.
+    // Realistic dims (especially head_dim=256 matching Gemma 3 4B) plus
+    // pre-populated KV cache to mirror the CPU-prefill + GPU-decode flow.
+
+    let metal = get_metal();
+    // Gemma 3 4B actual dims: hidden=2560, inter=10240, q_heads=8, kv_heads=4, head_dim=256.
+    // We use scaled-down dims but keep the GQA ratio and head_dim=256 that match real Gemma 3.
+    let hidden = 1024usize;
+    let inter = 2048usize;
+    let num_q_heads = 4usize;
+    let num_kv_heads = 2usize;
+    let head_dim = 256usize;
+    let q_dim = num_q_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+
+    // Gemma 3 4B vindex ships Q4_K for Q/K/O/gate/up and Q6_K for V/down.
+    // Using Q4_K here (not Q4_0) so we exercise the same shader dispatch path.
+    use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
+    // Q4_K super-blocks are 256 elements; input lengths must be multiples of 256.
+    let gate_data = quantize_q4_k(&vec![0.01f32; inter * hidden]);
+    let up_data = quantize_q4_k(&vec![0.01f32; inter * hidden]);
+    let down_data = quantize_q6_k(&vec![0.01f32; hidden * inter]);
+    let wq_data = quantize_q4_k(&vec![0.01f32; q_dim * hidden]);
+    let wk_data = quantize_q4_k(&vec![0.01f32; kv_dim * hidden]);
+    let wv_data = quantize_q6_k(&vec![0.01f32; kv_dim * hidden]);
+    let wo_data = quantize_q4_k(&vec![0.01f32; hidden * q_dim]);
+    let (_q8_x, q8_scales) = q4::quantize_to_q8(&vec![0.01f32; hidden]);
+
+    let norm = vec![1.0f32; hidden];
+    // Gemma 3 post-embed hidden state range is ~[-26, 12]. Scale x to match.
+    let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.01).sin() * 20.0).collect();
+
+    let layer = larql_compute::FullPipelineLayer {
+        wq: larql_compute::QuantWeight { data: &wq_data, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
+        wk: larql_compute::QuantWeight { data: &wk_data, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
+        wv: larql_compute::QuantWeight { data: &wv_data, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q6_K },
+        wo: larql_compute::QuantWeight { data: &wo_data, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
+        gate: larql_compute::QuantWeight { data: &gate_data, scales: None, format: larql_compute::QuantFormat::Q4_K },
+        up: larql_compute::QuantWeight { data: &up_data, scales: None, format: larql_compute::QuantFormat::Q4_K },
+        down: larql_compute::QuantWeight { data: &down_data, scales: None, format: larql_compute::QuantFormat::Q6_K },
+        input_norm: &norm,
+        post_attn_norm: &norm,
+        pre_ffn_norm: Some(&norm),   // Gemma 3: has post-norms
+        post_ffn_norm: Some(&norm),
+        norm_offset: 1.0,             // Gemma 3: +1.0 convention
+        qk_norm_offset: 1.0,
+        eps: 1e-6,
+        has_post_norms: true,         // Gemma 3: yes
+        norm_type: larql_compute::NormType::RmsNorm,
+        ffn_type: larql_compute::FfnType::Gated,
+        activation: larql_compute::Activation::GeluTanh, // Gemma
+        attn_scale: 1.0 / (head_dim as f32).sqrt(),
+        head_dim,
+        num_q_heads,
+        num_kv_heads,
+        rope_base: 10000.0,
+        rotary_dim: 0,
+        sliding_window: 0,
+        has_v_norm: false,
+        layer_scalar: 0.0,
+        input_norm_bias: None,
+        post_attn_norm_bias: None,
+        ffn_up_bias: None,
+        ffn_down_bias: None,
+    };
+
+    // Simulate CPU prefill populating KV for 3 positions. The K values are
+    // "already QK-normed" (unit-ish variance). Metal decode_token will
+    // then produce an un-normed new K, causing scale mismatch.
+    let be: &dyn ComputeBackend = &metal;
+    be.reset_kv_cache();
+    // Simulate 6-token CPU prefill with LARGER-magnitude K/V to stress attention.
+    // Real Gemma K after QKV projection can have |values| in the ~10s range.
+    let seq_len_pre = 6usize;
+    let k_large: Vec<f32> = (0..seq_len_pre * kv_dim).map(|i| (i as f32 * 0.01).sin() * 8.0).collect();
+    let v_large: Vec<f32> = (0..seq_len_pre * kv_dim).map(|i| (i as f32 * 0.013).cos() * 5.0).collect();
+    be.populate_kv_layer(0, &k_large, &v_large, seq_len_pre, num_kv_heads, head_dim);
+
+    let result = be.decode_token(
+        &[layer], &x, hidden, inter, q_dim, kv_dim,
+        num_q_heads, num_kv_heads, head_dim, 10000.0,
+    );
+
+    assert!(result.is_some(), "decode_token should return Some");
+    let out = result.unwrap();
+    assert_eq!(out.len(), hidden);
+    let n_inf = out.iter().copied().filter(|v: &f32| v.is_infinite()).count();
+    let n_nan = out.iter().copied().filter(|v: &f32| v.is_nan()).count();
+    println!("decode_token output: {} inf, {} nan, of {}", n_inf, n_nan, out.len());
+    assert_eq!(n_inf, 0, "decode_token output contains inf values (QK-norm bug)");
+    assert_eq!(n_nan, 0, "decode_token output contains NaN values (QK-norm bug)");
+
+    be.reset_kv_cache();
+}

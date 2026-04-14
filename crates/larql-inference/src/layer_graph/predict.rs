@@ -474,6 +474,29 @@ pub fn predict_honest(
                             let v_flat = v.as_slice().unwrap_or(&[]);
                             backend.populate_kv_layer(rel_idx, k_flat, v_flat,
                                 seq_len, weights.num_kv_heads, weights.head_dim);
+                            // LARQL_VERIFY_KV=1: for layer 0, read cache back and compare first 8 floats.
+                            if rel_idx == 0 && std::env::var("LARQL_VERIFY_KV").ok().as_deref() == Some("1") {
+                                if let Some((k_back, v_back, n)) = backend.debug_read_kv_layer(0) {
+                                    let kmatch8: Vec<bool> = (0..8.min(k_flat.len().min(k_back.len())))
+                                        .map(|i| (k_flat[i] - k_back[i]).abs() < 1e-5).collect();
+                                    let vmatch8: Vec<bool> = (0..8.min(v_flat.len().min(v_back.len())))
+                                        .map(|i| (v_flat[i] - v_back[i]).abs() < 1e-5).collect();
+                                    eprintln!("[verify_kv L0] cache_len={n} k_in.len={} k_back.len={} v_in.len={} v_back.len={}",
+                                        k_flat.len(), k_back.len(), v_flat.len(), v_back.len());
+                                    eprintln!("  k_in  [0..8]: {:?}", &k_flat[..8.min(k_flat.len())]);
+                                    eprintln!("  k_back[0..8]: {:?}", &k_back[..8.min(k_back.len())]);
+                                    eprintln!("  k_match[0..8]: {:?}", kmatch8);
+                                    eprintln!("  v_in  [0..8]: {:?}", &v_flat[..8.min(v_flat.len())]);
+                                    eprintln!("  v_back[0..8]: {:?}", &v_back[..8.min(v_back.len())]);
+                                    eprintln!("  v_match[0..8]: {:?}", vmatch8);
+                                    // Count total mismatches (>1e-5 diff)
+                                    let k_mismatch = k_flat.iter().zip(k_back.iter())
+                                        .filter(|(a, b)| (*a - *b).abs() >= 1e-5).count();
+                                    let v_mismatch = v_flat.iter().zip(v_back.iter())
+                                        .filter(|(a, b)| (*a - *b).abs() >= 1e-5).count();
+                                    eprintln!("  k_mismatch_total={k_mismatch}  v_mismatch_total={v_mismatch}");
+                                }
+                            }
                         }
 
                         let (h_out, _) = crate::forward::run_ffn(

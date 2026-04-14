@@ -19,7 +19,19 @@ pub fn finalize_logits(
     let seq_len = h_final.shape()[0];
     let last_row = h_final.row(seq_len - 1).to_owned();
 
+    let trace_nan = std::env::var("LARQL_TRACE_NAN").ok().as_deref() == Some("1");
+    if trace_nan {
+        let n = last_row.iter().filter(|v| !v.is_finite()).count();
+        let mn = last_row.iter().copied().fold(f32::INFINITY, f32::min);
+        let mx = last_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!("[nan] finalize_logits last_row: {} non-finite of {}, range [{:.3}, {:.3}]", n, last_row.len(), mn, mx);
+    }
+
     let hits = index.lm_head_knn_backend(&last_row, top_k, backend);
+    if trace_nan {
+        let n = hits.iter().filter(|(_, s)| !s.is_finite()).count();
+        eprintln!("[nan] lm_head_knn_backend: {} non-finite scores of {}", n, hits.len());
+    }
 
     let logits_scale = weights.arch.logits_scaling();
     let final_softcap = weights.arch.final_logit_softcapping();

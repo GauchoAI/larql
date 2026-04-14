@@ -393,14 +393,35 @@ pub fn predict_honest(
                 if seq_len == 1 {
                     // Decode path (seq=1): try KV-cached decode first, then full_pipeline
                     let x: Vec<f32> = h.row(0).to_vec();
+                    let trace_nan = std::env::var("LARQL_TRACE_NAN").ok().as_deref() == Some("1");
+
+                    if trace_nan {
+                        let in_nans = x.iter().filter(|v| !v.is_finite()).count();
+                        let in_min = x.iter().copied().fold(f32::INFINITY, f32::min);
+                        let in_max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        eprintln!("[nan] decode_token INPUT: {} non-finite, range [{:.3}, {:.3}]", in_nans, in_min, in_max);
+                    }
 
                     if let Some(result) = backend.decode_token(
                         &layers, &x, hidden, intermediate, q_dim, kv_dim,
                         weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
                     ) {
+                        if trace_nan {
+                            let n = result.iter().filter(|v| !v.is_finite()).count();
+                            let mn = result.iter().copied().fold(f32::INFINITY, f32::min);
+                            let mx = result.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                            eprintln!("[nan] decode_token OUTPUT: {} non-finite of {}, range [{:.3}, {:.3}]", n, result.len(), mn, mx);
+                        }
                         let mut row = h.row_mut(0);
                         for j in 0..hidden { row[j] = result[j]; }
+                        if trace_nan {
+                            // Check final h before finalize_logits
+                            let h_nans = h.iter().filter(|v| !v.is_finite()).count();
+                            eprintln!("[nan] h-matrix before finalize_logits: {} non-finite", h_nans);
+                        }
                         return finalize_logits(weights, tokenizer, &h, top_k, index, backend, norm_offset);
+                    } else if trace_nan {
+                        eprintln!("[nan] decode_token returned None");
                     }
 
                     if let Some(result) = backend.full_pipeline_q4(

@@ -101,4 +101,32 @@ mod tests {
         let out = dispatch(&q6k, &x, rows, hidden);
         assert!(out.iter().any(|&v| v.abs() > 0.001), "Q6_K matvec should produce nonzero");
     }
+
+    #[test]
+    fn q6k_roundtrip_accuracy_single_block() {
+        // Realistic distribution: Gaussian-like values with amax ≈ 0.16.
+        let block: Vec<f32> = (0..256)
+            .map(|i| {
+                let t = i as f32 * 0.0173;
+                0.16 * (t.sin() * t.cos() * (t * 0.37).sin())
+            })
+            .collect();
+        let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let q6k = quantize_q6_k(&block);
+        // one-hot dequant per column to recover matrix
+        let mut max_err = 0.0f32;
+        let mut sum_sq = 0.0f64;
+        for col in 0..256 {
+            let mut x = vec![0.0f32; 256];
+            x[col] = 1.0;
+            let out = dispatch(&q6k, &x, 1, 256);
+            let err = (out[0] - block[col]).abs();
+            max_err = max_err.max(err);
+            sum_sq += (err as f64).powi(2);
+        }
+        let rms = (sum_sq / 256.0).sqrt() as f32;
+        println!("[q6k-rt] amax={amax:.4} max_err={max_err:.5} rms={rms:.5} rel_max={:.2}%",
+            100.0 * max_err / amax);
+        assert!(max_err < 0.02 * amax, "Q6K round-trip max err {max_err} > 2% of amax {amax}");
+    }
 }

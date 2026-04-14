@@ -157,6 +157,67 @@ fn q4k_dequant_vs_original_accuracy() {
 
 #[test]
 #[ignore]
+fn q6k_dequant_vs_original_accuracy() {
+    // Same as q4k_dequant test but for v_proj layer 0 (Q6_K).
+    let vindex = std::env::var("LARQL_VINDEX_PATH").expect("set LARQL_VINDEX_PATH");
+    let dir = std::path::Path::new(&vindex);
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("weight_manifest.json")).unwrap()
+    ).unwrap();
+    let entry = manifest.iter().find(|e|
+        e.get("file").and_then(|f| f.as_str()) == Some("attn_weights.bin")
+            && e.get("key").and_then(|k| k.as_str()).is_some_and(|k| k.contains("layers.0.self_attn.v_proj"))
+    ).unwrap();
+    let offset = entry["offset"].as_u64().unwrap() as usize;
+    let length = entry["length"].as_u64().unwrap() as usize;
+    let shape = entry["shape"].as_array().unwrap();
+    let rows = shape[0].as_u64().unwrap() as usize;
+    let cols = shape[1].as_u64().unwrap() as usize;
+    let src = std::fs::File::open(dir.join("attn_weights.bin")).unwrap();
+    let src_mmap = unsafe { memmap2::Mmap::map(&src).unwrap() };
+    let orig_f32: Vec<f32> = larql_models::quant::half::decode_f16(&src_mmap[offset..offset + length]);
+
+    // Find Q6K bytes for v_proj
+    let q4k_manifest: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("attn_weights_q4k_manifest.json")).unwrap()
+    ).unwrap();
+    let q6k_entry = q4k_manifest.iter().find(|e|
+        e.get("key").and_then(|k| k.as_str()).is_some_and(|k| k.contains("layers.0.self_attn.v_proj"))
+    ).unwrap();
+    let q6k_offset = q6k_entry["offset"].as_u64().unwrap() as usize;
+    let q6k_length = q6k_entry["length"].as_u64().unwrap() as usize;
+    let q6k_file = std::fs::File::open(dir.join("attn_weights_q4k.bin")).unwrap();
+    let q6k_mmap = unsafe { memmap2::Mmap::map(&q6k_file).unwrap() };
+    let q6k_bytes = &q6k_mmap[q6k_offset..q6k_offset + q6k_length];
+
+    let metal = larql_compute::metal::MetalBackend::new().expect("metal");
+    let be: &dyn larql_compute::ComputeBackend = &metal;
+
+    let mut max_abs_err = 0.0f32;
+    let mut sum_sq_err = 0.0f64;
+    let mut n_samples = 0usize;
+    for &col in &[0usize, 1, 100, 500, 1000, 2000, 2559] {
+        if col >= cols { continue; }
+        let mut x = vec![0.0f32; cols];
+        x[col] = 1.0;
+        let out = be.q6k_matvec(q6k_bytes, &x, rows, cols).expect("q6k_matvec");
+        for row in 0..rows {
+            let expected = orig_f32[row * cols + col];
+            let got = out[row];
+            let err = (expected - got).abs();
+            max_abs_err = max_abs_err.max(err);
+            sum_sq_err += (err as f64).powi(2);
+            n_samples += 1;
+        }
+    }
+    let rms_err = (sum_sq_err / n_samples as f64).sqrt() as f32;
+    let orig_max = orig_f32.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    println!("v_proj L0 (Q6_K): orig max|w|={orig_max:.4}  max_abs_err={max_abs_err:.4}  rms_err={rms_err:.6}");
+    println!("  relative max err: {:.2}%", 100.0 * max_abs_err / orig_max.max(1e-6));
+}
+
+#[test]
+#[ignore]
 fn q4k_matvec_real_gate_synthetic_x() {
     // Same structure: real gate weights (Q4_K) + synthetic x=1.0.
     // Finite output → the FFN NaN comes from real ffn_norm_out magnitudes.

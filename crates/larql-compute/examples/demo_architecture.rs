@@ -110,7 +110,7 @@ fn main() {
             has_v_norm: false,
             layer_scalar: 0.0,
             input_norm_bias: None,
-            post_attn_norm_bias: None,
+            q_norm_weight: None, k_norm_weight: None, post_attn_norm_bias: None,
             ffn_up_bias: None,
             ffn_down_bias: None,
         };

@@ -241,6 +241,17 @@ impl ComputeBackend for MetalBackend {
         *cache_guard = None; // drop entirely so next decode_token re-creates with correct layer count
     }
 
+    fn debug_read_kv_layer(&self, layer: usize) -> Option<(Vec<f32>, Vec<f32>, usize)> {
+        let guard = self.kv_cache.lock().ok()?;
+        let kv = guard.as_ref()?;
+        let lc = kv.layers.get(layer)?;
+        let n = lc.current_len;
+        let total = n * lc.num_kv_heads * lc.head_dim;
+        let k = super::buffers::read_buffer_f32(&lc.k_cache, total);
+        let v = super::buffers::read_buffer_f32(&lc.v_cache, total);
+        Some((k, v, n))
+    }
+
     fn decode_token(
         &self,
         layers: &[crate::FullPipelineLayer<'_>],

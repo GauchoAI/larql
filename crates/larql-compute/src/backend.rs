@@ -109,6 +109,11 @@ pub trait ComputeBackend: Send + Sync {
     /// Reset KV cache (for new prompt).
     fn reset_kv_cache(&self) {}
 
+    /// Diagnostic: read back K and V cache contents for one layer.
+    /// Returns (k_flat, v_flat, current_len) or None if unsupported.
+    #[allow(clippy::type_complexity)]
+    fn debug_read_kv_layer(&self, _layer: usize) -> Option<(Vec<f32>, Vec<f32>, usize)> { None }
+
     /// Decode one token through all layers with KV cache.
     /// Q8 attention + KV cache + Q4 FFN, one command buffer.
     #[allow(clippy::too_many_arguments)]

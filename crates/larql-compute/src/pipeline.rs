@@ -75,6 +75,11 @@ pub struct FullPipelineLayer<'a> {
     pub post_attn_norm: &'a [f32],
     pub pre_ffn_norm: Option<&'a [f32]>,
     pub post_ffn_norm: Option<&'a [f32]>,
+    /// Per-head RMSNorm weight for Q (length = head_dim). Gemma 3 / Gemma 4
+    /// apply this between QKV projection and RoPE. None = no QK-norm.
+    pub q_norm_weight: Option<&'a [f32]>,
+    /// Per-head RMSNorm weight for K (length = head_dim). None = no QK-norm.
+    pub k_norm_weight: Option<&'a [f32]>,
     /// Norm bias (only for LayerNorm). None for RMSNorm.
     pub input_norm_bias: Option<&'a [f32]>,
     pub post_attn_norm_bias: Option<&'a [f32]>,

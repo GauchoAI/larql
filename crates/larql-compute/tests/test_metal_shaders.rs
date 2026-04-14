@@ -1550,7 +1550,7 @@ fn full_pipeline_seq1_produces_nonzero() {
             has_v_norm: false,
             layer_scalar: 0.0,
             input_norm_bias: None,
-            post_attn_norm_bias: None,
+            q_norm_weight: None, k_norm_weight: None, post_attn_norm_bias: None,
             ffn_up_bias: None,
             ffn_down_bias: None,
     };
@@ -1919,7 +1919,7 @@ fn decode_token_gemma3_produces_finite() {
         has_v_norm: false,
         layer_scalar: 0.0,
         input_norm_bias: None,
-        post_attn_norm_bias: None,
+        q_norm_weight: None, k_norm_weight: None, post_attn_norm_bias: None,
         ffn_up_bias: None,
         ffn_down_bias: None,
     };
@@ -2021,9 +2021,12 @@ fn decode_token_real_layer0_produces_finite() {
     let post_attn_norm = find_vec("layers.0.post_attention_layernorm.weight");
     let pre_ffn_norm = find_vec("layers.0.pre_feedforward_layernorm.weight");
     let post_ffn_norm = find_vec("layers.0.post_feedforward_layernorm.weight");
-    // Gemma 3 QK-norm weights (not currently plumbed through FullPipelineLayer).
-    let _q_norm = find_vec("layers.0.self_attn.q_norm.weight");
-    let _k_norm = find_vec("layers.0.self_attn.k_norm.weight");
+    // Gemma 3 QK-norm weights — now plumbed through FullPipelineLayer.
+    let q_norm = find_vec("layers.0.self_attn.q_norm.weight");
+    let k_norm = find_vec("layers.0.self_attn.k_norm.weight");
+    println!("QK-norm weights: q len={} max={:.3}, k len={} max={:.3}",
+        q_norm.len(), q_norm.iter().map(|v| v.abs()).fold(0.0f32, f32::max),
+        k_norm.len(), k_norm.iter().map(|v| v.abs()).fold(0.0f32, f32::max));
     println!("Loaded norms: input max {:.3}, post_attn max {:.3}, pre_ffn max {:.3}, post_ffn max {:.3}",
         input_norm.iter().map(|v| v.abs()).fold(0.0f32, f32::max),
         post_attn_norm.iter().map(|v| v.abs()).fold(0.0f32, f32::max),
@@ -2088,6 +2091,8 @@ fn decode_token_real_layer0_produces_finite() {
         post_attn_norm: &post_attn_norm,
         pre_ffn_norm: Some(&pre_ffn_norm),
         post_ffn_norm: Some(&post_ffn_norm),
+        q_norm_weight: Some(&q_norm),
+        k_norm_weight: Some(&k_norm),
         norm_offset: 1.0,
         qk_norm_offset: 1.0,
         eps: 1e-6,

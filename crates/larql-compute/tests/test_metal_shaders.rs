@@ -2062,8 +2062,8 @@ fn decode_token_real_layer0_produces_finite() {
 
     // ── 3. Layer 0 FFN weights from interleaved_q4k.bin ──
     // Per-layer layout: [gate Q4_K | up Q4_K | down Q6_K]. Sizes computed from dims.
-    let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 144; // Q4_K ≈ 144B/256vals
-    let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210; // Q6_K ≈ 210B/256vals
+    let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 148; // Q4_K = 148B/256vals
+    let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210; // Q6_K = 210B/256vals
     // Layer size: gate + up (Q4_K) + down (Q6_K)
     let layer_bytes = 2 * q4k_bytes_per_matrix + q6k_bytes_per_matrix;
 

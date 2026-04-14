@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use larql_inference::{InferenceModel, CachedLayerGraph, default_backend, predict_with_ffn};
 use larql_inference::ffn::WeightFfn;
+use larql_inference::vindex::WalkFfn;
 use larql_vindex::{SilentLoadCallbacks, VectorIndex};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -60,6 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let backend = default_backend();
     let dense_ffn = WeightFfn { weights };
+    let walk_ffn = WalkFfn::new_unlimited(weights, &index);
     let empty_cache_layers: Vec<usize> = Vec::new();
 
     eprintln!("[ready] backend={} layers={num_layers}", backend.name());
@@ -108,8 +110,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 println!("  time: {:.1}ms  ({} input tokens)", ms, ids.len());
             }
-            "gen" => {
-                // Expected: "text" N. Uses fast forward::predict_with_ffn path.
+            "gen" | "walkgen" => {
+                // `gen "text" N`     — uses dense WeightFfn
+                // `walkgen "text" N` — uses WalkFfn (KNN walk over gate index)
+                let use_walk = cmd == "walkgen";
                 let (text_raw, n_raw) = split_trailing_int(rest);
                 let text = parse_quoted(text_raw);
                 let n: usize = n_raw.parse().unwrap_or(20);
@@ -121,23 +125,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut per: Vec<f64> = Vec::with_capacity(n);
                 for step in 0..n {
                     let t = Instant::now();
-                    let r = predict_with_ffn(weights, tokenizer, &ids, 1, &dense_ffn);
+                    let r = if use_walk {
+                        predict_with_ffn(weights, tokenizer, &ids, 1, &walk_ffn)
+                    } else {
+                        predict_with_ffn(weights, tokenizer, &ids, 1, &dense_ffn)
+                    };
                     let ms = t.elapsed().as_secs_f64() * 1000.0;
                     per.push(ms);
                     if let Some(&(tid, _, _)) = r.raw_predictions.first() {
                         let s = r.predictions.first().map(|(s,_)| s.clone()).unwrap_or_default();
                         print!("{s}"); stdout.flush().ok();
                         ids.push(tid);
-                        eprintln!("[gen step {:>3} tid={:>6} {:>6.0}ms {:.2} tok/s]", step+1, tid, ms, 1000.0/ms);
+                        eprintln!("[{} step {:>3} tid={:>6} {:>6.0}ms {:.2} tok/s]",
+                            if use_walk {"walk"} else {"dense"}, step+1, tid, ms, 1000.0/ms);
                     } else {
-                        eprintln!("[gen step {:>3} empty, stopping]", step+1);
+                        eprintln!("[{} step {:>3} empty, stopping]",
+                            if use_walk {"walk"} else {"dense"}, step+1);
                         break;
                     }
                 }
                 println!();
                 let total = total_start.elapsed().as_secs_f64();
                 let avg = if !per.is_empty() { per.iter().sum::<f64>() / per.len() as f64 } else { 0.0 };
-                println!("  total: {:.1}s  avg: {:.0}ms/tok ({:.2} tok/s)", total, avg, if avg>0.0 {1000.0/avg} else {0.0});
+                println!("  total: {:.1}s  avg: {:.0}ms/tok ({:.2} tok/s) [{}]",
+                    total, avg, if avg>0.0 {1000.0/avg} else {0.0}, if use_walk {"WalkFfn"} else {"WeightFfn dense"});
             }
             "kvreset" => {
                 backend.reset_kv_cache();

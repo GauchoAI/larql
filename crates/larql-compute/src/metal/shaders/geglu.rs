@@ -28,7 +28,13 @@ kernel void geglu_gelu_tanh(
     float g = gate[tid];
     // GELU with tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     float c = 0.7978845608f; // sqrt(2/pi)
-    float t = tanh(c * (g + 0.044715f * g * g * g));
+    // Clamp input to tanh: for |x| > ~16 tanh saturates to ±1, but Metal's
+    // tanh overflows exp() internally for large x and returns NaN. Clamping
+    // keeps the kernel finite for large gate magnitudes (e.g. Gemma 3 with
+    // non-quantized layer norms giving pre-activation ~100+).
+    float arg = c * (g + 0.044715f * g * g * g);
+    arg = clamp(arg, -20.0f, 20.0f);
+    float t = tanh(arg);
     out[tid] = (0.5f * g * (1.0f + t)) * up[tid];
 }
 "#;

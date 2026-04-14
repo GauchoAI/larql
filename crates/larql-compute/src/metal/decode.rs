@@ -667,19 +667,33 @@ impl MetalBackend {
                         enc.set_buffer(2, Some(&act_buf), 0);
                         enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
                         enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
-                        // Down projection: Q6_K for Ollama/Gemma 3, Q4_K for llama.cpp Q4_K_M.
-                        if down_is_q6k {
-                            enc.set_compute_pipeline_state(&self.q6k_matvec_pipeline);
+                        // DIAGNOSTIC: LARQL_SKIP_DOWN=1 bypasses down projection (zero-fills down_out).
+                        let skip_down = std::env::var("LARQL_SKIP_DOWN").ok().as_deref() == Some("1");
+                        if skip_down {
+                            let zero_vec = vec![0.0f32; hidden];
+                            let zero_buf = self.bufs.transient_from_f32(&zero_vec);
+                            let len_val = hidden as u32;
+                            enc.set_compute_pipeline_state(&self.residual_add_pipeline);
+                            enc.set_buffer(0, Some(&zero_buf), 0);
+                            enc.set_buffer(1, Some(&zero_buf), 0);
+                            enc.set_buffer(2, Some(&down_out), 0);
+                            enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+                            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
                         } else {
-                            enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline);
+                            // Down projection: Q6_K for Ollama/Gemma 3, Q4_K for llama.cpp Q4_K_M.
+                            if down_is_q6k {
+                                enc.set_compute_pipeline_state(&self.q6k_matvec_pipeline);
+                            } else {
+                                enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline);
+                            }
+                            enc.set_buffer(0, Some(&down_bufs[l]), 0);
+                            enc.set_buffer(1, Some(&act_buf), 0);
+                            enc.set_buffer(2, Some(&down_out), 0);
+                            enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                            let threads = if down_is_q6k { q6k::THREADS_PER_TG } else { q4k::THREADS_PER_TG };
+                            enc.dispatch_thread_groups(MTLSize::new(n_tgs_down, 1, 1), MTLSize::new(threads, 1, 1));
                         }
-                        enc.set_buffer(0, Some(&down_bufs[l]), 0);
-                        enc.set_buffer(1, Some(&act_buf), 0);
-                        enc.set_buffer(2, Some(&down_out), 0);
-                        enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-                        enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
-                        let threads = if down_is_q6k { q6k::THREADS_PER_TG } else { q4k::THREADS_PER_TG };
-                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_down, 1, 1), MTLSize::new(threads, 1, 1));
                     } else {
                         let n_tgs_up = (inter as u64).div_ceil(q4k::ROWS_PER_TG);
                         enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline);

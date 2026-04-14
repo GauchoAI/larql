@@ -154,6 +154,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 backend.reset_kv_cache();
                 println!("  kv cache cleared");
             }
+            "cpupredict" => {
+                // Pure CPU forward pass via forward::predict (matches bench_inference).
+                // Use this as numerical ground truth to diff against Metal decode_token.
+                let text = parse_quoted(rest);
+                let enc = tokenizer.encode(text.as_str(), true).map_err(|e| e.to_string())?;
+                let ids: Vec<u32> = enc.get_ids().to_vec();
+                let t = Instant::now();
+                let r = larql_inference::predict(weights, tokenizer, &ids, 5);
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                for (i, (s, p)) in r.predictions.iter().take(5).enumerate() {
+                    println!("  {:>2}. {:?}  {:.2}%", i+1, s, p * 100.0);
+                }
+                println!("  cpupredict: {:.1}ms  ({} tokens, CPU forward::predict)", ms, ids.len());
+            }
             "gpuprefill" => {
                 // Prefill-via-decode-loop: reset cache, then call decode_token once per
                 // prompt token in sequence. This keeps the entire forward pass in

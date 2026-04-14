@@ -149,10 +149,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         f32_data.to_vec()
                     };
 
-                    // NOTE: loader resolve_ffn_weights assumes uniform Q4_K sizing
-                    // across gate/up/down. Using Q4_K for down too keeps the layout
-                    // uniform; accuracy loss vs Q6_K is small for FFN down.
-                    let q_data = quantize_q4_k(&padded);
+                    // Ollama strategy: Q4_K for gate/up, Q6_K for down (higher
+                    // precision on the down projection). The loader
+                    // (build_pipeline_layers) detects the mixed layout from
+                    // per-layer byte size and dispatches q6k_matvec accordingly.
+                    let q_data = if *name == "down" {
+                        quantize_q6_k(&padded)
+                    } else {
+                        quantize_q4_k(&padded)
+                    };
 
                     out.write_all(&q_data)?;
                     total_bytes += q_data.len();

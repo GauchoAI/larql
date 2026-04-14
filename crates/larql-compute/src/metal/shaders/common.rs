@@ -9,7 +9,16 @@ static inline float decode_f16_metal(ushort bits) {
     uint sign = uint(bits & 0x8000) << 16;
     uint exp = (bits >> 10) & 0x1F;
     uint mant = bits & 0x3FF;
-    if (exp == 0) return as_type<float>(sign);
+    if (exp == 31) {
+        // Inf / NaN.
+        return as_type<float>(sign | 0x7F800000u | (mant << 13));
+    }
+    if (exp == 0) {
+        // Subnormal f16: value = mant * 2^-24. Compute explicitly so we don't
+        // depend on Metal's optional denorm support (fast-math may flush to 0).
+        float mag = float(mant) * (1.0f / 16777216.0f); // 2^-24
+        return (bits & 0x8000) ? -mag : mag;
+    }
     exp = exp + 127 - 15;
     return as_type<float>(sign | (exp << 23) | (mant << 13));
 }

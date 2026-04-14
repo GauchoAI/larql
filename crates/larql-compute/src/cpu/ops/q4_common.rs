@@ -79,18 +79,46 @@ pub fn quantize_q4_0(data: &[f32]) -> Vec<u8> {
     out
 }
 
-/// Encode f32 to f16 bits (for quantize helpers).
+/// Encode f32 to f16 bits (for quantize helpers). Handles normals, subnormals,
+/// infinities and NaN. Rounds to nearest (ties round up — simpler than
+/// round-half-even and within 1 ulp either way, which is fine for Q-scales).
 fn f32_to_f16(val: f32) -> u16 {
     let bits = val.to_bits();
     let sign = (bits >> 16) & 0x8000;
     let exp = ((bits >> 23) & 0xFF) as i32;
     let mant = bits & 0x7FFFFF;
+    // f32 zero / f32 subnormal → f16 zero.
     if exp == 0 { return sign as u16; }
-    if exp == 255 { return (sign | 0x7C00 | (mant >> 13)) as u16; }
+    // f32 inf / nan.
+    if exp == 255 {
+        let m16 = mant >> 13;
+        // Preserve NaN (non-zero mantissa) vs inf (zero mantissa).
+        return (sign | 0x7C00 | if mant != 0 && m16 == 0 { 1 } else { m16 }) as u16;
+    }
     let new_exp = exp - 127 + 15;
+    // f16 overflow → inf with correct sign.
     if new_exp >= 31 { return (sign | 0x7C00) as u16; }
-    if new_exp <= 0 { return sign as u16; }
-    (sign | ((new_exp as u32) << 10) | (mant >> 13)) as u16
+    if new_exp > 0 {
+        // Normal f16. Round to nearest (half-up) on the discarded 13 mantissa bits.
+        let base = (new_exp as u32) << 10 | (mant >> 13);
+        let round = if (mant & 0x1000) != 0 { 1 } else { 0 };
+        let rounded = base + round;
+        // If rounding bumped exponent past max, emit inf.
+        if rounded >= 0x7C00 { return (sign | 0x7C00) as u16; }
+        return (sign | rounded) as u16;
+    }
+    // Subnormal f16: value = mant_sub * 2^-24, mant_sub ∈ [0..1024).
+    // full_m = (1 << 23) | mant is the 24-bit mantissa with implicit leading 1.
+    // mant_sub = full_m >> (14 - new_exp), with round-to-nearest on the shifted-out bits.
+    let full_m = (1u32 << 23) | mant;
+    let shift = (14 - new_exp) as u32;
+    if shift >= 25 { return sign as u16; } // underflows even subnormal range → zero
+    let shifted = full_m >> shift;
+    let round_bit = (full_m >> (shift - 1)) & 1;
+    let mant_sub = shifted + round_bit;
+    // mant_sub == 1024 means we rounded up into the smallest normal — that's correct,
+    // exponent 1 with mantissa 0 is the smallest normal, bit pattern 0x0400.
+    (sign | mant_sub) as u16
 }
 
 /// Quantize f32 data to Q4_K format (4-bit with sub-block scales, Ollama-compatible).
@@ -129,12 +157,19 @@ pub fn quantize_q4_k(data: &[f32]) -> Vec<u8> {
         out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
         out.extend_from_slice(&f32_to_f16(dmin).to_le_bytes());
 
-        // Compute 8 sub-block scales and mins (quantized to 6-bit and 4-bit)
+        // Compute 8 sub-block scales and mins (quantized to 6-bit and 4-bit).
+        // Per-sub-block effective scale must be sub_range / 15 (so 4-bit q in [0..15]
+        // spans the sub-block range). q_scales encodes that scale in units of d:
+        //   sc_eff = d * q_scales[j]      (kernel does this)
+        //   q = (value + mn) / sc_eff     (encoder does this)
+        //   so q_scales[j] = (sub_range / 15) / d.
+        // The earlier (range/d) form gave sc_eff = sub_range (15× too large), which
+        // collapsed the 4-bit q values to ~{0, 1} and produced ~43% dequant error.
         let mut q_scales = [0u8; 8];
         let mut q_mins = [0u8; 8];
         for j in 0..8 {
             let range = sub_maxs[j] - sub_mins[j];
-            q_scales[j] = if d > 0.0 { (range / d).round().clamp(0.0, 63.0) as u8 } else { 0 };
+            q_scales[j] = if d > 0.0 { (range / 15.0 / d).round().clamp(0.0, 63.0) as u8 } else { 0 };
             q_mins[j] = if dmin > 0.0 { (-sub_mins[j] / dmin).round().clamp(0.0, 15.0) as u8 } else { 0 };
         }
 
@@ -184,21 +219,33 @@ pub fn quantize_q6_k(data: &[f32]) -> Vec<u8> {
     for sb in 0..n_superblocks {
         let block = &data[sb * 256..(sb + 1) * 256];
 
-        // Find global abs max for super-block scale
-        let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-        let d = amax / 32.0; // 6-bit range: -32..+31
-        let _inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
+        // Kernel formula: val = (d * sub_scale) * (raw - 32) with raw ∈ [0..63],
+        // so q = raw - 32 ∈ [-32..31]. Per sub-block j, the *effective* scale
+        // we'd want is s_j = sub_amax_j / 31 so q=31 recovers sub_amax_j.
+        // Then we pack s_j into (f16 d) × (i8 sub_scale) by choosing
+        //   d        = max_s / 127            (uses full positive i8 range)
+        //   sub[j]   = round(s_j / d) ∈ [0..127]
+        // This is the llama.cpp Q6_K layout. The previous formula derived d
+        // from the global amax and computed sub_scale from there, which
+        // collapsed sub_scale to 0 or 1 for sub-blocks much smaller than the
+        // super-block max — losing ~all per-sub-block dynamic range.
+        let mut s_per_sub = [0.0f32; 16];
+        for (j, slot) in s_per_sub.iter_mut().enumerate() {
+            let sub = &block[j * 16..(j + 1) * 16];
+            let sub_amax = sub.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            *slot = sub_amax / 31.0;
+        }
+        let max_s = s_per_sub.iter().cloned().fold(0.0f32, f32::max);
+        let d = max_s / 127.0;
+        let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
 
-        // Compute per-sub-block (16 values) int8 scales
         let mut sub_scales = [0i8; 16];
         for (j, sub_scale) in sub_scales.iter_mut().enumerate() {
-            let sub = &block[j * 16..(j + 1) * 16];
-            let sub_max = sub.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-            let sc = if d > 0.0 { sub_max / d } else { 0.0 };
-            *sub_scale = sc.round().clamp(-128.0, 127.0) as i8;
+            let sc = (s_per_sub[j] * inv_d).round().clamp(-128.0, 127.0);
+            *sub_scale = sc as i8;
         }
 
-        // Quantize all 256 values to 6-bit
+        // Quantize all 256 values to 6-bit using effective scale (d * sub_scale).
         let mut q6_vals = [0u8; 256];
         for (j, &sub_scale) in sub_scales.iter().enumerate() {
             let sc = d * sub_scale as f32;

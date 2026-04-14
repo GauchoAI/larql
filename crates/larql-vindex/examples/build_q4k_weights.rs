@@ -57,10 +57,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cols = shape[1].as_u64().unwrap() as usize;
             let num_floats = rows * cols;
 
-            let f32_data = unsafe {
-                let ptr = mmap[file_offset..file_offset + length].as_ptr() as *const f32;
-                std::slice::from_raw_parts(ptr, num_floats)
+            // Detect stored dtype from bytes-per-element. f16 = 2, f32 = 4.
+            let bytes_per_elem = length / num_floats;
+            let f32_owned: Vec<f32> = match bytes_per_elem {
+                2 => larql_models::quant::half::decode_f16(&mmap[file_offset..file_offset + length]),
+                4 => unsafe {
+                    let ptr = mmap[file_offset..file_offset + length].as_ptr() as *const f32;
+                    std::slice::from_raw_parts(ptr, num_floats).to_vec()
+                },
+                other => return Err(format!("unsupported bytes/elem: {other} for {key}").into()),
             };
+            let f32_data: &[f32] = &f32_owned;
 
             // Pad to 256 for K-quant super-blocks
             let padded_len = num_floats.div_ceil(256) * 256;

@@ -35,15 +35,17 @@ pub fn finalize_logits(
 
     let max_logit = scaled.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
     let exp_sum: f64 = scaled.iter().map(|(_, l)| ((*l - max_logit) as f64).exp()).sum();
-    let predictions = scaled.iter()
-        .filter_map(|&(tid, logit)| {
-            let prob = ((logit - max_logit) as f64).exp() / exp_sum;
-            tokenizer.decode(&[tid], true).ok()
-                .map(|s| (s.trim().to_string(), prob))
-        })
-        .collect();
+    let mut predictions: Vec<(String, f64)> = Vec::with_capacity(scaled.len());
+    let mut raw_predictions: Vec<(u32, f32, f64)> = Vec::with_capacity(scaled.len());
+    for &(tid, logit) in scaled.iter() {
+        let prob = ((logit - max_logit) as f64).exp() / exp_sum;
+        if let Ok(s) = tokenizer.decode(&[tid], false) {
+            predictions.push((s, prob));
+            raw_predictions.push((tid, logit, prob));
+        }
+    }
 
-    crate::forward::PredictResult { predictions }
+    crate::forward::PredictResult { predictions, raw_predictions }
 }
 
 /// Softmax probability of a single score within a set of hits.

@@ -65,17 +65,17 @@ pub(super) fn logits_to_predictions(
     indexed.truncate(k);
     indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-    let predictions = indexed
-        .into_iter()
-        .filter_map(|(idx, prob)| {
-            tokenizer
-                .decode(&[idx as u32], true)
-                .ok()
-                .map(|s| (s.trim().to_string(), prob as f64))
-        })
-        .collect();
+    let mut predictions: Vec<(String, f64)> = Vec::with_capacity(indexed.len());
+    let mut raw_predictions: Vec<(u32, f32, f64)> = Vec::with_capacity(indexed.len());
+    for (idx, prob) in indexed.into_iter() {
+        if let Ok(s) = tokenizer.decode(&[idx as u32], false) {
+            let logit_v = logits[idx];
+            predictions.push((s, prob as f64));
+            raw_predictions.push((idx as u32, logit_v, prob as f64));
+        }
+    }
 
-    PredictResult { predictions }
+    PredictResult { predictions, raw_predictions }
 }
 
 /// Run a full forward pass and return the top-k next token predictions.

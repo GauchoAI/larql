@@ -2139,4 +2139,465 @@ fn decode_token_real_layer0_produces_finite() {
         if mx == f32::NEG_INFINITY { f32::NAN } else { mx });
     assert_eq!(n_inf + n_nan, 0,
         "Real-data decode_token produces {} inf + {} nan of {} — REPRODUCER", n_inf, n_nan, out.len());
+
+    // ── 7. Scaling sweep: replicate layer 0 N times, measure how output magnitude
+    //    grows. On a well-behaved Gemma 3 layer, post-norms should keep the
+    //    residual stream bounded. Exponential or fast-linear growth points
+    //    at a missing / miscomputed norm.
+    for n_layers in [2usize, 4, 8, 16, 32] {
+        let layers: Vec<_> = (0..n_layers).map(|_| larql_compute::FullPipelineLayer {
+            wq: larql_compute::QuantWeight { data: wq_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
+            wk: larql_compute::QuantWeight { data: wk_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
+            wv: larql_compute::QuantWeight { data: wv_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q6_K },
+            wo: larql_compute::QuantWeight { data: wo_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
+            gate: larql_compute::QuantWeight { data: gate_bytes, scales: None, format: larql_compute::QuantFormat::Q4_K },
+            up: larql_compute::QuantWeight { data: up_bytes, scales: None, format: larql_compute::QuantFormat::Q4_K },
+            down: larql_compute::QuantWeight { data: down_bytes, scales: None, format: larql_compute::QuantFormat::Q6_K },
+            input_norm: &input_norm,
+            post_attn_norm: &post_attn_norm,
+            pre_ffn_norm: Some(&pre_ffn_norm),
+            post_ffn_norm: Some(&post_ffn_norm),
+            q_norm_weight: Some(&q_norm),
+            k_norm_weight: Some(&k_norm),
+            norm_offset: 1.0, qk_norm_offset: 1.0, eps: 1e-6, has_post_norms: true,
+            norm_type: larql_compute::NormType::RmsNorm,
+            ffn_type: larql_compute::FfnType::Gated,
+            activation: larql_compute::Activation::GeluTanh,
+            attn_scale: 1.0 / (head_dim as f32).sqrt(),
+            head_dim, num_q_heads, num_kv_heads,
+            rope_base: 10000.0, rotary_dim: 0, sliding_window: 0,
+            has_v_norm: false, layer_scalar: 0.0,
+            input_norm_bias: None, post_attn_norm_bias: None,
+            ffn_up_bias: None, ffn_down_bias: None,
+        }).collect();
+        be.reset_kv_cache();
+        let r = be.decode_token(
+            &layers, &x, hidden, inter, q_dim, kv_dim,
+            num_q_heads, num_kv_heads, head_dim, 10000.0,
+        ).expect("decode_token none");
+        let mn = r.iter().copied().fold(f32::INFINITY, f32::min);
+        let mx = r.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let amax = r.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let nnf = r.iter().filter(|v| !v.is_finite()).count();
+        println!("[scale-sweep] n_layers={n_layers:>2} range=[{mn:>10.2}, {mx:>10.2}] amax={amax:>9.2} non-finite={nnf}");
+    }
+
+    // ── 8. Isolated post_ffn_norm comparison: Metal shader vs CPU reference.
+    //    Uses real Gemma 3 L0 post_ffn_norm weights (max≈304) and a synthetic
+    //    f32 input matching what decode_token's FFN produces (amax~167). If
+    //    Metal's amplification differs materially from CPU's, rms_norm is the
+    //    bug.
+    let synthetic_ffn_out: Vec<f32> = (0..hidden)
+        .map(|i| {
+            let t = i as f32 * 0.017;
+            167.0 * (t.sin() * (t * 0.31).cos()).signum()
+                * ((t * 1.3).sin().abs())
+        })
+        .collect();
+    // CPU reference
+    let sum_sq: f64 = synthetic_ffn_out.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+    let rms_cpu = 1.0f32 / ((sum_sq / hidden as f64 + 1e-6) as f32).sqrt();
+    let cpu_out: Vec<f32> = synthetic_ffn_out.iter().zip(post_ffn_norm.iter())
+        .map(|(x, w)| x * (w + 1.0) * rms_cpu)
+        .collect();
+    let cpu_amax = cpu_out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+
+    // Metal
+    let metal_raw = larql_compute::metal::MetalBackend::new().expect("metal");
+    let bufs = larql_compute::metal::buffers::BufferCache::new(
+        &metal::Device::system_default().unwrap(),
+    );
+    let device = metal::Device::system_default().unwrap();
+    let src = larql_compute::metal::shaders::all_shaders();
+    let lib = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
+    let pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("rms_norm", None).unwrap()
+    ).unwrap();
+    let queue = device.new_command_queue();
+    let buf_x = bufs.transient_from_f32(&synthetic_ffn_out);
+    let buf_w = bufs.transient_from_f32(&post_ffn_norm);
+    let buf_out = bufs.output((hidden * 4) as u64);
+    let len_val = hidden as u32;
+    let eps_val = 1e-6f32;
+    let off_val = 1.0f32;
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&buf_x), 0);
+    enc.set_buffer(1, Some(&buf_w), 0);
+    enc.set_buffer(2, Some(&buf_out), 0);
+    enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &eps_val as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &off_val as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1),
+        metal::MTLSize::new(256u64.min(hidden as u64), 1, 1));
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+    let metal_out = larql_compute::metal::buffers::read_buffer_f32(&buf_out, hidden);
+    let metal_amax = metal_out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let max_diff = cpu_out.iter().zip(metal_out.iter())
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    println!("[rmsnorm-parity] cpu_amax={cpu_amax:.2}  metal_amax={metal_amax:.2}  max_diff={max_diff:.4}");
+    assert!(max_diff < 0.05 * cpu_amax,
+        "rms_norm Metal vs CPU diverge: max_diff={max_diff:.4} (>5% of cpu_amax={cpu_amax:.2})");
+
+    // ── 9. FFN parity: Metal's GEGLU-FFN chain (gate Q4K → up Q4K → GEGLU → down Q6K)
+    //    vs a CPU reference that dequantises the same bytes and does the same math
+    //    with f32 matmuls. If they disagree by >10%, the FFN shader chain has a bug.
+    let be: &dyn ComputeBackend = &metal_raw;
+    // Sparse-spike distribution like real Gemma 3 post-norm outputs: most values
+    // small, a few channels spike to amax. This is the distribution that makes
+    // post_ffn_norm amplify by 400× downstream.
+    let synthetic_ffn_in: Vec<f32> = (0..hidden)
+        .map(|i| {
+            let t = i as f32 * 0.013;
+            let small = t.sin() * 0.5;
+            // A few spike channels (~5% of positions).
+            if i % 20 == 0 { 30.0 * ((i as f32 * 0.007).sin().signum()) } else { small }
+        })
+        .collect();
+    let sin_amax = synthetic_ffn_in.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let sin_sq: f64 = synthetic_ffn_in.iter().map(|v| (*v as f64).powi(2)).sum();
+    let sin_rms = (sin_sq / hidden as f64).sqrt() as f32;
+    println!("[ffn-parity] input amax={sin_amax:.2} rms={sin_rms:.4} (spike distribution)");
+
+    // Metal: gate @ x, up @ x (each produces `inter` rows)
+    let metal_gate = be.q4k_matvec(gate_bytes, &synthetic_ffn_in, inter, hidden).expect("q4k gate");
+    let metal_up = be.q4k_matvec(up_bytes, &synthetic_ffn_in, inter, hidden).expect("q4k up");
+    // GEGLU (gemma gelu_tanh): act[i] = gelu_tanh(gate[i]) * up[i]
+    //   gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    fn gelu_tanh(x: f32) -> f32 {
+        let c: f32 = (2.0 / std::f32::consts::PI).sqrt();
+        let arg = (c * (x + 0.044715 * x * x * x)).clamp(-20.0, 20.0);
+        0.5 * x * (1.0 + arg.tanh())
+    }
+    let metal_act: Vec<f32> = metal_gate.iter().zip(metal_up.iter())
+        .map(|(g, u)| gelu_tanh(*g) * u).collect();
+    // Metal: down @ act → hidden-dim output
+    let metal_down = be.q6k_matvec(down_bytes, &metal_act, hidden, inter).expect("q6k down");
+
+    // CPU reference: dequantise each quant matrix once, then do f32 matmuls.
+    // Simplest: use the CPU backend's q4k_matvec + q6k_matvec (scalar reference
+    // implementations in cpu/ops). If Metal ≈ CPU ops here, the shader chain
+    // does what its own reference does, and the bug is elsewhere.
+    let cpu_backend = larql_compute::CpuBackend;
+    let cpu_be: &dyn ComputeBackend = &cpu_backend;
+    let cpu_gate = cpu_be.q4k_matvec(gate_bytes, &synthetic_ffn_in, inter, hidden).unwrap();
+    let cpu_up = cpu_be.q4k_matvec(up_bytes, &synthetic_ffn_in, inter, hidden).unwrap();
+    let cpu_act: Vec<f32> = cpu_gate.iter().zip(cpu_up.iter())
+        .map(|(g, u)| gelu_tanh(*g) * u).collect();
+    let cpu_down = cpu_be.q6k_matvec(down_bytes, &cpu_act, hidden, inter).unwrap();
+
+    let gate_maxdiff = metal_gate.iter().zip(cpu_gate.iter())
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let up_maxdiff = metal_up.iter().zip(cpu_up.iter())
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let act_maxdiff = metal_act.iter().zip(cpu_act.iter())
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let down_maxdiff = metal_down.iter().zip(cpu_down.iter())
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let metal_down_amax = metal_down.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let cpu_down_amax = cpu_down.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    println!("[ffn-parity] gate  metal_amax={:.3} cpu_amax={:.3} max_diff={:.4}",
+        metal_gate.iter().map(|v| v.abs()).fold(0.0f32, f32::max),
+        cpu_gate.iter().map(|v| v.abs()).fold(0.0f32, f32::max), gate_maxdiff);
+    println!("[ffn-parity] up    metal_amax={:.3} cpu_amax={:.3} max_diff={:.4}",
+        metal_up.iter().map(|v| v.abs()).fold(0.0f32, f32::max),
+        cpu_up.iter().map(|v| v.abs()).fold(0.0f32, f32::max), up_maxdiff);
+    println!("[ffn-parity] act   metal_amax={:.3} cpu_amax={:.3} max_diff={:.4}",
+        metal_act.iter().map(|v| v.abs()).fold(0.0f32, f32::max),
+        cpu_act.iter().map(|v| v.abs()).fold(0.0f32, f32::max), act_maxdiff);
+    println!("[ffn-parity] down  metal_amax={metal_down_amax:.3} cpu_amax={cpu_down_amax:.3} max_diff={down_maxdiff:.4}");
+
+    // ── Compare q4k_matvec vs q4k_proj kernels on wo weights.
+    //    q4k_matvec uses `half` cast; q4k_proj uses decode_f16_metal.
+    {
+        let test_x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.007).sin() * 20.0).collect();
+        let via_matvec = be.q4k_matvec(wo_bytes, &test_x, hidden, hidden).unwrap();
+        let proj_pipeline = device.new_compute_pipeline_state_with_function(
+            &lib.get_function("q4k_proj", None).unwrap()
+        ).unwrap();
+        let buf_w_raw = device.new_buffer_with_data(
+            wo_bytes.as_ptr() as *const std::ffi::c_void,
+            wo_bytes.len() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let buf_x_p = bufs.transient_from_f32(&test_x);
+        let buf_out_p = bufs.output((hidden * 4) as u64);
+        let n_val = hidden as u32;
+        let k_val = hidden as u32;
+        let cmd_p = queue.new_command_buffer();
+        let enc_p = cmd_p.new_compute_command_encoder();
+        enc_p.set_compute_pipeline_state(&proj_pipeline);
+        enc_p.set_buffer(0, Some(&buf_w_raw), 0);
+        enc_p.set_buffer(1, Some(&buf_x_p), 0);
+        enc_p.set_buffer(2, Some(&buf_out_p), 0);
+        enc_p.set_bytes(3, 4, &n_val as *const u32 as *const std::ffi::c_void);
+        enc_p.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
+        let n_tgs = (hidden as u64).div_ceil(8);
+        enc_p.dispatch_thread_groups(
+            metal::MTLSize::new(n_tgs, 1, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+        enc_p.end_encoding();
+        cmd_p.commit();
+        cmd_p.wait_until_completed();
+        let via_proj = larql_compute::metal::buffers::read_buffer_f32(&buf_out_p, hidden);
+        let matvec_amax = via_matvec.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let proj_amax = via_proj.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let diff = via_matvec.iter().zip(via_proj.iter())
+            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!("[q4k-kernel-cmp] wo_proj matvec_amax={matvec_amax:.3} proj_amax={proj_amax:.3} max_diff={diff:.5}");
+    }
+
+    // ── 10a-metal: Repeat the same layer-0 pipeline using Metal backend ops
+    //    (q4k_matvec + q6k_matvec + manual norms) and compare to decode_token's
+    //    result. This isolates whether the divergence is in decode_token's
+    //    orchestration or in the kernel outputs.
+    {
+        // Step 1: input_norm(x) via manual CPU math (already verified parity).
+        let sum_sq_x: f64 = x.iter().map(|v| (*v as f64).powi(2)).sum();
+        let rms_x = 1.0f32 / ((sum_sq_x / hidden as f64 + 1e-6) as f32).sqrt();
+        let normed_x: Vec<f32> = x.iter().zip(input_norm.iter())
+            .map(|(v, w)| v * (w + 1.0) * rms_x).collect();
+        // Step 2: Q/K/V via Metal backend
+        let q_raw = be.q4k_matvec(wq_bytes, &normed_x, q_dim, hidden).unwrap();
+        let k_raw = be.q4k_matvec(wk_bytes, &normed_x, kv_dim, hidden).unwrap();
+        let v_raw = be.q6k_matvec(wv_bytes, &normed_x, kv_dim, hidden).unwrap();
+        // Step 3: QK-norm via per-head CPU math
+        let mut q_n = q_raw.clone();
+        for h in 0..num_q_heads {
+            let off = h * head_dim;
+            let sq: f64 = q_raw[off..off+head_dim].iter().map(|v| (*v as f64).powi(2)).sum();
+            let r = 1.0f32 / ((sq / head_dim as f64 + 1e-6) as f32).sqrt();
+            for d in 0..head_dim { q_n[off+d] = q_raw[off+d] * (q_norm[d] + 1.0) * r; }
+        }
+        let mut k_n = k_raw.clone();
+        for h in 0..num_kv_heads {
+            let off = h * head_dim;
+            let sq: f64 = k_raw[off..off+head_dim].iter().map(|v| (*v as f64).powi(2)).sum();
+            let r = 1.0f32 / ((sq / head_dim as f64 + 1e-6) as f32).sqrt();
+            for d in 0..head_dim { k_n[off+d] = k_raw[off+d] * (k_norm[d] + 1.0) * r; }
+        }
+        let _ = (q_n, k_n);
+        // Step 4/5: T=1 attention → attn_out = V per Q head via GQA
+        let mut attn_out = vec![0.0f32; q_dim];
+        let reps = num_q_heads / num_kv_heads;
+        for h in 0..num_q_heads {
+            let kv_h = h / reps;
+            let src = &v_raw[kv_h*head_dim..(kv_h+1)*head_dim];
+            let dst = &mut attn_out[h*head_dim..(h+1)*head_dim];
+            dst.copy_from_slice(src);
+        }
+        // Step 6: O projection via Metal
+        let o_proj = be.q4k_matvec(wo_bytes, &attn_out, hidden, q_dim).unwrap();
+        // Step 7: post_attn_norm(o)
+        let sq: f64 = o_proj.iter().map(|v| (*v as f64).powi(2)).sum();
+        let r = 1.0f32 / ((sq / hidden as f64 + 1e-6) as f32).sqrt();
+        let normed_o: Vec<f32> = o_proj.iter().zip(post_attn_norm.iter())
+            .map(|(v, w)| v * (w + 1.0) * r).collect();
+        // Step 8: h_post_attn
+        let h_post_attn_m: Vec<f32> = x.iter().zip(normed_o.iter()).map(|(a, b)| a + b).collect();
+        // Step 9: pre_ffn_norm(h_post_attn)
+        let sq2: f64 = h_post_attn_m.iter().map(|v| (*v as f64).powi(2)).sum();
+        let rms2 = 1.0f32 / ((sq2 / hidden as f64 + 1e-6) as f32).sqrt();
+        let ffn_in_m: Vec<f32> = h_post_attn_m.iter().zip(pre_ffn_norm.iter())
+            .map(|(v, w)| v * (w + 1.0) * rms2).collect();
+        // Step 10: gate/up via Metal, GEGLU, down via Metal
+        let gate_m = be.q4k_matvec(gate_bytes, &ffn_in_m, inter, hidden).unwrap();
+        let up_m = be.q4k_matvec(up_bytes, &ffn_in_m, inter, hidden).unwrap();
+        let act_m: Vec<f32> = gate_m.iter().zip(up_m.iter())
+            .map(|(g, u)| gelu_tanh(*g) * u).collect();
+        let down_m = be.q6k_matvec(down_bytes, &act_m, hidden, inter).unwrap();
+        // Step 11: post_ffn_norm(down) + h_post_attn
+        let sq3: f64 = down_m.iter().map(|v| (*v as f64).powi(2)).sum();
+        let r3 = 1.0f32 / ((sq3 / hidden as f64 + 1e-6) as f32).sqrt();
+        let normed_down_m: Vec<f32> = down_m.iter().zip(post_ffn_norm.iter())
+            .map(|(v, w)| v * (w + 1.0) * r3).collect();
+        let h_final_m: Vec<f32> = h_post_attn_m.iter().zip(normed_down_m.iter())
+            .map(|(a, b)| a + b).collect();
+        let m_ref_amax = h_final_m.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let down_m_amax = down_m.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let m_vs_dec = h_final_m.iter().zip(out.iter())
+            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!("[metal-ref-L0] down_metal_ops={down_m_amax:.2} h_final={m_ref_amax:.2}  vs_decode_token max_elem_diff={m_vs_dec:.4}");
+        // Report channel-wise values at the top diverging channels
+        for ch in [443usize, 368, 1762] {
+            let normed_ch = normed_down_m[ch];
+            let h_pa_ch = h_post_attn_m[ch];
+            let normed_o_ch = normed_o[ch];
+            let o_ch = o_proj[ch];
+            println!("  ch={ch}  dec_out={:.3} mref_out={:.3} | h_pa_m={h_pa_ch:.3} normed_o={normed_o_ch:.3} o={o_ch:.3} | down_m={:.3} normed_down={normed_ch:.3}",
+                out[ch], h_final_m[ch], down_m[ch]);
+        }
+    }
+
+    // ── 10a. Full-layer CPU reference vs Metal decode_token.
+    //    Replicate decode_token layer 0 entirely in CPU ops (using verified-parity
+    //    kernels) and compare to Metal's result on the same synthetic x input.
+    //    Any divergence localises to the decode_token orchestration.
+    {
+        let cpu_backend = larql_compute::CpuBackend;
+        let cpu_be: &dyn ComputeBackend = &cpu_backend;
+        // ── Step 1: input_norm(x)
+        let mut sum_sq: f64 = x.iter().map(|v| (*v as f64).powi(2)).sum();
+        let mut rms_x = 1.0f32 / ((sum_sq / hidden as f64 + 1e-6) as f32).sqrt();
+        let normed_x: Vec<f32> = x.iter().zip(input_norm.iter())
+            .map(|(v, w)| v * (w + 1.0) * rms_x).collect();
+        // ── Step 2: Q/K/V projection
+        let q_raw = cpu_be.q4k_matvec(wq_bytes, &normed_x, q_dim, hidden).unwrap();
+        let k_raw = cpu_be.q4k_matvec(wk_bytes, &normed_x, kv_dim, hidden).unwrap();
+        let v_raw = cpu_be.q6k_matvec(wv_bytes, &normed_x, kv_dim, hidden).unwrap();
+        // ── Step 3: QK-norm per head (Gemma 3)
+        let mut q_n = q_raw.clone();
+        for h in 0..num_q_heads {
+            let off = h * head_dim;
+            let sq: f64 = q_raw[off..off+head_dim].iter().map(|v| (*v as f64).powi(2)).sum();
+            let r = 1.0f32 / ((sq / head_dim as f64 + 1e-6) as f32).sqrt();
+            for d in 0..head_dim { q_n[off+d] = q_raw[off+d] * (q_norm[d] + 1.0) * r; }
+        }
+        let mut k_n = k_raw.clone();
+        for h in 0..num_kv_heads {
+            let off = h * head_dim;
+            let sq: f64 = k_raw[off..off+head_dim].iter().map(|v| (*v as f64).powi(2)).sum();
+            let r = 1.0f32 / ((sq / head_dim as f64 + 1e-6) as f32).sqrt();
+            for d in 0..head_dim { k_n[off+d] = k_raw[off+d] * (k_norm[d] + 1.0) * r; }
+        }
+        // ── Step 4: RoPE at position 0 — RoPE angle at pos=0 is 1 for cos and 0
+        //    for sin on every channel, so Q/K are unchanged.
+        // ── Step 5: Attention (T=1, empty cache pre-append, so T becomes 1
+        //    with current token; softmax over a single score = 1; attn_out = V).
+        //    For GQA, each Q head reads from its corresponding KV head (num_q / num_kv heads per group).
+        let mut attn_out = vec![0.0f32; q_dim];
+        let reps = num_q_heads / num_kv_heads;
+        for h in 0..num_q_heads {
+            let kv_h = h / reps;
+            let src = &v_raw[kv_h*head_dim..(kv_h+1)*head_dim];
+            let dst = &mut attn_out[h*head_dim..(h+1)*head_dim];
+            dst.copy_from_slice(src);
+        }
+        // ── Step 6: O projection
+        let o_proj = cpu_be.q4k_matvec(wo_bytes, &attn_out, hidden, q_dim).unwrap();
+        // ── Step 7: post_attn_norm(o)
+        let sq: f64 = o_proj.iter().map(|v| (*v as f64).powi(2)).sum();
+        let r = 1.0f32 / ((sq / hidden as f64 + 1e-6) as f32).sqrt();
+        let normed_o: Vec<f32> = o_proj.iter().zip(post_attn_norm.iter())
+            .map(|(v, w)| v * (w + 1.0) * r).collect();
+        // ── Step 8: h_post_attn = x + normed_o
+        let h_post_attn_cpu: Vec<f32> = x.iter().zip(normed_o.iter()).map(|(a, b)| a + b).collect();
+        let h_pa_amax = h_post_attn_cpu.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        // ── Step 9: pre_ffn_norm(h_post_attn) → ffn_in
+        sum_sq = h_post_attn_cpu.iter().map(|v| (*v as f64).powi(2)).sum();
+        rms_x = 1.0f32 / ((sum_sq / hidden as f64 + 1e-6) as f32).sqrt();
+        let ffn_in: Vec<f32> = h_post_attn_cpu.iter().zip(pre_ffn_norm.iter())
+            .map(|(v, w)| v * (w + 1.0) * rms_x).collect();
+        let ffn_in_amax = ffn_in.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        // ── Step 10: FFN = gate(ffn_in), up(ffn_in), GEGLU, down
+        let gate_ffn = cpu_be.q4k_matvec(gate_bytes, &ffn_in, inter, hidden).unwrap();
+        let up_ffn = cpu_be.q4k_matvec(up_bytes, &ffn_in, inter, hidden).unwrap();
+        let act: Vec<f32> = gate_ffn.iter().zip(up_ffn.iter())
+            .map(|(g, u)| gelu_tanh(*g) * u).collect();
+        let down = cpu_be.q6k_matvec(down_bytes, &act, hidden, inter).unwrap();
+        let down_amax = down.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        // ── Step 11: post_ffn_norm(down) + h_post_attn
+        let sq: f64 = down.iter().map(|v| (*v as f64).powi(2)).sum();
+        let r = 1.0f32 / ((sq / hidden as f64 + 1e-6) as f32).sqrt();
+        let normed_down: Vec<f32> = down.iter().zip(post_ffn_norm.iter())
+            .map(|(v, w)| v * (w + 1.0) * r).collect();
+        let pfn_amax = normed_down.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let h_final: Vec<f32> = h_post_attn_cpu.iter().zip(normed_down.iter())
+            .map(|(a, b)| a + b).collect();
+        let cpu_final_amax = h_final.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+
+        // Compare element-by-element to the Metal result captured earlier in `out`.
+        let metal_final_amax = out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let maxdiff = h_final.iter().zip(out.iter())
+            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!("[cpu-ref-L0] h_post_attn={h_pa_amax:.2} ffn_in={ffn_in_amax:.2} down={down_amax:.2} post_ffn_contrib={pfn_amax:.2} h_final={cpu_final_amax:.2}");
+        println!("[metal-vs-cpu-L0] metal_amax={metal_final_amax:.2} cpu_amax={cpu_final_amax:.2} max_elem_diff={maxdiff:.4}");
+
+        // Find the top-5 diverging channels
+        let mut diffs: Vec<(usize, f32, f32, f32)> = out.iter().zip(h_final.iter()).enumerate()
+            .map(|(i, (m, c))| (i, *m, *c, (m - c).abs()))
+            .collect();
+        diffs.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+        println!("[metal-vs-cpu-L0] top-5 diverging channels (idx, metal, cpu, diff):");
+        for (i, m, c, d) in diffs.iter().take(5) {
+            println!("  ch={i}  metal={m:.3}  cpu={c:.3}  diff={d:.3}  post_ffn_weight[ch]={:.3} down_cpu[ch]={:.3}",
+                post_ffn_norm[*i], down[*i]);
+        }
+
+        // Test rms_norm with the EXACT inputs from the L0 pipeline (real down, real post_ffn_norm)
+        // that trigger the divergence. If the isolated call agrees with CPU, the bug is in
+        // how decode_token feeds inputs to the kernel.
+        let buf_x2 = bufs.transient_from_f32(&down);
+        let buf_w3 = bufs.transient_from_f32(&post_ffn_norm);
+        let buf_out2 = bufs.output((hidden * 4) as u64);
+        let cmd_rp = queue.new_command_buffer();
+        let enc_rp = cmd_rp.new_compute_command_encoder();
+        enc_rp.set_compute_pipeline_state(&pipeline);
+        enc_rp.set_buffer(0, Some(&buf_x2), 0);
+        enc_rp.set_buffer(1, Some(&buf_w3), 0);
+        enc_rp.set_buffer(2, Some(&buf_out2), 0);
+        enc_rp.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+        enc_rp.set_bytes(4, 4, &eps_val as *const f32 as *const std::ffi::c_void);
+        enc_rp.set_bytes(5, 4, &off_val as *const f32 as *const std::ffi::c_void);
+        enc_rp.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1),
+            metal::MTLSize::new(256u64.min(hidden as u64), 1, 1));
+        enc_rp.end_encoding();
+        cmd_rp.commit();
+        cmd_rp.wait_until_completed();
+        let metal_isolated = larql_compute::metal::buffers::read_buffer_f32(&buf_out2, hidden);
+        let isolated_amax = metal_isolated.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let isolated_vs_cpu_maxdiff = metal_isolated.iter().zip(normed_down.iter())
+            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!("[isolated-postffn] metal_amax={isolated_amax:.3} cpu_amax={pfn_amax:.3} max_diff={isolated_vs_cpu_maxdiff:.5}");
+    }
+
+    // ── 10. residual_norm parity: out = (a + b) * (weight + offset) / rms(a+b)
+    //    Used in decode_token step 5 to fuse residual add and pre_ffn_norm.
+    //    Test with realistic magnitudes: h_buf (large residual) + normed_o.
+    let a: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.021).sin() * 4000.0).collect();
+    let b: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.017).cos() * 200.0).collect();
+    let sum_sq: f64 = a.iter().zip(b.iter()).map(|(x, y)| {
+        let s = *x as f64 + *y as f64;
+        s * s
+    }).sum();
+    let rms = 1.0f32 / ((sum_sq / hidden as f64 + 1e-6) as f32).sqrt();
+    let cpu_rn: Vec<f32> = a.iter().zip(b.iter()).zip(pre_ffn_norm.iter())
+        .map(|((x, y), w)| (x + y) * (w + 1.0) * rms).collect();
+    let cpu_rn_amax = cpu_rn.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+
+    let buf_a = bufs.transient_from_f32(&a);
+    let buf_b = bufs.transient_from_f32(&b);
+    let buf_w2 = bufs.transient_from_f32(&pre_ffn_norm);
+    let buf_out_rn = bufs.output((hidden * 4) as u64);
+    let rn_pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("residual_norm", None).unwrap()
+    ).unwrap();
+    let cmd2 = queue.new_command_buffer();
+    let enc2 = cmd2.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&rn_pipeline);
+    enc2.set_buffer(0, Some(&buf_a), 0);
+    enc2.set_buffer(1, Some(&buf_b), 0);
+    enc2.set_buffer(2, Some(&buf_w2), 0);
+    enc2.set_buffer(3, Some(&buf_out_rn), 0);
+    enc2.set_bytes(4, 4, &len_val as *const u32 as *const std::ffi::c_void);
+    enc2.set_bytes(5, 4, &eps_val as *const f32 as *const std::ffi::c_void);
+    enc2.set_bytes(6, 4, &off_val as *const f32 as *const std::ffi::c_void);
+    enc2.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1),
+        metal::MTLSize::new(256u64.min(hidden as u64), 1, 1));
+    enc2.end_encoding();
+    cmd2.commit();
+    cmd2.wait_until_completed();
+    let metal_rn = larql_compute::metal::buffers::read_buffer_f32(&buf_out_rn, hidden);
+    let metal_rn_amax = metal_rn.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let rn_maxdiff = cpu_rn.iter().zip(metal_rn.iter())
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    println!("[resnorm-parity] cpu_amax={cpu_rn_amax:.3} metal_amax={metal_rn_amax:.3} max_diff={rn_maxdiff:.5}");
+    assert!(rn_maxdiff < 0.01 * cpu_rn_amax,
+        "residual_norm diverges: max_diff={rn_maxdiff:.5}");
+
+    let _ = metal_raw;
 }

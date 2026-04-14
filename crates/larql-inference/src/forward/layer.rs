@@ -67,6 +67,13 @@ pub fn run_ffn(
         None => rms_norm(h_post_attn, None, norm_offset),
     };
 
+    let trace = std::env::var("LARQL_TRACE_FFN").ok().as_deref() == Some("1");
+    if trace {
+        let pa_amax = h_post_attn.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let hf_amax = h_ffn.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        eprintln!("[ffn-cpu] L{layer:02} h_post_attn amax={pa_amax:.2}  h_ffn(after pre_ffn_norm) amax={hf_amax:.2}");
+    }
+
     let (ffn_out, activation) = if capture_activation {
         let (out, act) = ffn.forward_with_activation(layer, &h_ffn);
         (out, Some(act))
@@ -74,12 +81,21 @@ pub fn run_ffn(
         (ffn.forward(layer, &h_ffn), None)
     };
 
+    if trace {
+        let fo_amax = ffn_out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        eprintln!("[ffn-cpu] L{layer:02} ffn_out amax={fo_amax:.2}");
+    }
+
     let res_mult = arch.residual_multiplier();
     let h_out = if arch.has_post_norms() {
         let normed = match arch.post_feedforward_layernorm_key(layer) {
             Some(key) => apply_norm(weights, &ffn_out, &key, norm_offset),
             None => rms_norm(&ffn_out, None, norm_offset),
         };
+        if trace {
+            let n_amax = normed.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            eprintln!("[ffn-cpu] L{layer:02} post_ffn_norm(ffn_out) amax={n_amax:.2}");
+        }
         if res_mult != 1.0 {
             h_post_attn + &(&normed * res_mult)
         } else {

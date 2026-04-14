@@ -410,15 +410,23 @@ impl MetalBackend {
             let new_h = if l % 2 == 0 { &h_a } else { &h_b };
             {
                 if uses_q4k {
-                    use crate::metal::shaders::q4kf_qkv_proj as proj_sh;
+                    // Pipeline choice decides ROWS/THREADS per TG: q4k_proj uses 8/256,
+                    // q4kf_proj uses 4/64. Previously both paths used q4kf dims,
+                    // causing q4k_proj to dispatch only 2 simdgroups per TG (expected 8)
+                    // — 75% of output rows never written, left as zero from the
+                    //  uninitialised buffer. That silently corrupted every Q4_K O
+                    // projection in decode_token.
                     let o_rows = hidden as u32;
                     let o_k = layer_q_dim as u32;
-                    let num_tgs = (hidden as u64).div_ceil(proj_sh::ROWS_PER_TG);
-                    let o_pipeline = if layer.wo.format == crate::QuantFormat::Q4_KF {
-                        &self.q4kf_proj_pipeline
-                    } else {
-                        &self.q4k_proj_pipeline
-                    };
+                    let (o_pipeline, rows_per_tg, threads_per_tg) =
+                        if layer.wo.format == crate::QuantFormat::Q4_KF {
+                            use crate::metal::shaders::q4kf_qkv_proj as kf;
+                            (&self.q4kf_proj_pipeline, kf::ROWS_PER_TG, kf::THREADS_PER_TG)
+                        } else {
+                            use crate::metal::shaders::q4k_qkv_proj as k;
+                            (&self.q4k_proj_pipeline, k::ROWS_PER_TG, k::THREADS_PER_TG)
+                        };
+                    let num_tgs = (hidden as u64).div_ceil(rows_per_tg);
                     enc.set_compute_pipeline_state(o_pipeline);
                     enc.set_buffer(0, Some(&wo_bufs[l]), 0);
                     enc.set_buffer(1, Some(&attn_out), 0);
@@ -427,7 +435,7 @@ impl MetalBackend {
                     enc.set_bytes(4, 4, &o_k as *const u32 as *const std::ffi::c_void);
                     enc.dispatch_thread_groups(
                         MTLSize::new(num_tgs, 1, 1),
-                        MTLSize::new(proj_sh::THREADS_PER_TG, 1, 1),
+                        MTLSize::new(threads_per_tg, 1, 1),
                     );
                 } else {
                     let o_q8 = &o_q8_scratch;
@@ -847,10 +855,28 @@ impl MetalBackend {
         // Limited to buffers defined OUTSIDE the per-layer loop (the others would
         // need explicit copy-out during the loop).
         if std::env::var("LARQL_READBACK").ok().as_deref() == Some("1") {
+            // Dump specific channel values at Gemma 3 L0 divergent channels.
+            let chs = [443usize, 368, 1762, 1365, 1638];
+            for (name, buf, n_expected) in [
+                ("o_out", &o_out_buf, hidden),
+                ("h_post_attn", &h_post_attn, hidden),
+                ("ffn_norm_out", &ffn_norm_out, hidden),
+                ("down_out", &down_out, hidden),
+                ("h_a", &h_a, hidden),
+                ("h_b", &h_b, hidden),
+            ] {
+                let data = super::buffers::read_buffer_f32(buf, n_expected);
+                let vals: Vec<String> = chs.iter().filter(|&&i| i < n_expected)
+                    .map(|&i| format!("[{i}]={:.3}", data[i])).collect();
+                eprintln!("[readback-ch] {:<14} {}", name, vals.join(" "));
+            }
             for (name, buf) in [
                 ("q_out", &q_out),
                 ("k_out", &k_out),
                 ("v_out", &v_out),
+                ("attn_out", &attn_out_buf),
+                ("o_out", &o_out_buf),
+                ("h_post_attn", &h_post_attn),
                 ("ffn_norm_out", &ffn_norm_out),
                 ("gate_out", &gate_out_scratch),
                 ("up_out", &up_out),

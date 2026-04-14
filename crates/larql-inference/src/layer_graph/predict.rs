@@ -464,6 +464,11 @@ pub fn predict_honest(
 
                     let walk_ffn = crate::vindex::WalkFfn::new_unlimited(weights, index);
                     let mut h_cpu = h.clone();
+                    let trace_layers = std::env::var("LARQL_TRACE_LAYERS").ok().as_deref() == Some("1");
+                    if trace_layers {
+                        let amax = h_cpu.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                        eprintln!("[trace-cpu] pre-L0 h amax={amax:.2}");
+                    }
                     for (rel_idx, abs_layer) in layer_range.clone().enumerate() {
                         let (h_post_attn, k_rope, v) =
                             crate::attention::gpu::run_attention_with_kv_backend(weights, &h_cpu, abs_layer, Some(backend))
@@ -502,6 +507,11 @@ pub fn predict_honest(
                         let (h_out, _) = crate::forward::run_ffn(
                             weights, &h_post_attn, abs_layer, &walk_ffn, false);
                         h_cpu = h_out;
+                        if trace_layers {
+                            let pa_amax = h_post_attn.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                            let amax = h_cpu.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                            eprintln!("[trace-cpu] L{abs_layer:02} h_post_attn amax={pa_amax:.2}  h_out amax={amax:.2}");
+                        }
                     }
 
                     // Use correct CPU hidden state, finalize with GPU logits

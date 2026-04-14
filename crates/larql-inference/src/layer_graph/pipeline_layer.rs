@@ -122,19 +122,35 @@ pub fn resolve_attn_weights<'a>(
 }
 
 /// Helper: resolve FFN weights from vindex interleaved mmap.
+///
+/// Supports the Ollama / build_q4k_weights mixed layout where gate and up
+/// are Q4_K but down is Q6_K. Pass `Some(down_bytes_per_matrix)` and
+/// `Some(down_format)` to override; `None` falls back to uniform layout.
+pub fn resolve_ffn_weights_mixed<'a>(
+    q4_ffn_mmap: &'a [u8],
+    layer: usize,
+    gate_up_bytes: usize,
+    gate_up_format: QuantFormat,
+    down_bytes: usize,
+    down_format: QuantFormat,
+) -> (QuantWeight<'a>, QuantWeight<'a>, QuantWeight<'a>) {
+    let per_layer = gate_up_bytes * 2 + down_bytes;
+    let fs = layer * per_layer;
+    (
+        QuantWeight { data: &q4_ffn_mmap[fs..fs + gate_up_bytes], scales: None, format: gate_up_format },
+        QuantWeight { data: &q4_ffn_mmap[fs + gate_up_bytes..fs + 2 * gate_up_bytes], scales: None, format: gate_up_format },
+        QuantWeight { data: &q4_ffn_mmap[fs + 2 * gate_up_bytes..fs + 2 * gate_up_bytes + down_bytes], scales: None, format: down_format },
+    )
+}
+
+/// Uniform-Q4 layout (gate/up/down all same size + format).
 pub fn resolve_ffn_weights<'a>(
     q4_ffn_mmap: &'a [u8],
     layer: usize,
     q4_ffn_per_matrix: usize,
     ffn_format: QuantFormat,
 ) -> (QuantWeight<'a>, QuantWeight<'a>, QuantWeight<'a>) {
-    let q4_ffn_per_layer = q4_ffn_per_matrix * 3;
-    let fs = layer * q4_ffn_per_layer;
-    (
-        QuantWeight { data: &q4_ffn_mmap[fs..fs + q4_ffn_per_matrix], scales: None, format: ffn_format },
-        QuantWeight { data: &q4_ffn_mmap[fs + q4_ffn_per_matrix..fs + 2 * q4_ffn_per_matrix], scales: None, format: ffn_format },
-        QuantWeight { data: &q4_ffn_mmap[fs + 2 * q4_ffn_per_matrix..fs + 3 * q4_ffn_per_matrix], scales: None, format: ffn_format },
-    )
+    resolve_ffn_weights_mixed(q4_ffn_mmap, layer, q4_ffn_per_matrix, ffn_format, q4_ffn_per_matrix, ffn_format)
 }
 
 /// Build a complete Vec<FullPipelineLayer> for a range of layers.
@@ -148,10 +164,26 @@ pub fn build_pipeline_layers<'a>(
     q4_ffn_per_matrix: usize,
     ffn_format: QuantFormat,
 ) -> Vec<FullPipelineLayer<'a>> {
+    let num_layers_in_file = weights.num_layers;
+    // Detect Q4K+Q4K+Q6K mixed layout (Ollama / build_q4k_weights convention):
+    // uniform layout's per-layer bytes = 3 * q4_ffn_per_matrix.
+    // Mixed layout inflates down's size by Q6_K/Q4_K ratio (210/148 ≈ 1.4189).
+    let uniform_per_layer = q4_ffn_per_matrix * 3;
+    let actual_per_layer = q4_ffn_mmap.len() / num_layers_in_file.max(1);
+    let (down_bytes, down_format) = if actual_per_layer > uniform_per_layer {
+        // Mixed: down is Q6_K, takes the extra bytes
+        (actual_per_layer - 2 * q4_ffn_per_matrix, QuantFormat::Q6_K)
+    } else {
+        (q4_ffn_per_matrix, ffn_format)
+    };
     layer_range.map(|layer| {
         let (wq, wk, wv, wo) = resolve_attn_weights(index, layer)
             .expect("No attention weights available for layer");
-        let (gate, up, down) = resolve_ffn_weights(q4_ffn_mmap, layer, q4_ffn_per_matrix, ffn_format);
+        let (gate, up, down) = resolve_ffn_weights_mixed(
+            q4_ffn_mmap, layer,
+            q4_ffn_per_matrix, ffn_format,
+            down_bytes, down_format,
+        );
         build_arch_params(weights, layer, wq, wk, wv, wo, gate, up, down)
     }).collect()
 }

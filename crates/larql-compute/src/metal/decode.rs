@@ -633,7 +633,6 @@ impl MetalBackend {
                     use crate::metal::shaders::q4k_ffn_gate_up as q4k_gu;
                     // Down projection dispatch depends on down.format (Ollama uses Q6_K).
                     let down_is_q6k = layer.down.format == crate::QuantFormat::Q6_K;
-                    eprintln!("[ffn-down] L{l} down.format={:?} down_is_q6k={}", layer.down.format, down_is_q6k);
                     let n_tgs_down = if down_is_q6k {
                         (hidden as u64).div_ceil(q6k::ROWS_PER_TG)
                     } else {

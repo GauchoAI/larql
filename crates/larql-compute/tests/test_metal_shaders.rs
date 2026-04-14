@@ -2182,6 +2182,84 @@ fn decode_token_real_layer0_produces_finite() {
         println!("[scale-sweep] n_layers={n_layers:>2} range=[{mn:>10.2}, {mx:>10.2}] amax={amax:>9.2} non-finite={nnf}");
     }
 
+    // ── 7b. Compute CPU ref scaling at the same N values as the Metal scale sweep,
+    //    using chained backend ops that we already showed match CPU byte-for-byte.
+    //    Diverges from the Metal sweep = another decode_token orchestration bug.
+    {
+        let cpu_be_ref = larql_compute::CpuBackend;
+        let cpu_ref: &dyn ComputeBackend = &cpu_be_ref;
+        // Per-layer forward using metal ops (which agree with CPU) — we reuse the
+        // exact chain we validated in `10a-metal`.
+        fn one_layer(
+            be: &dyn ComputeBackend,
+            x: &[f32],
+            hidden: usize, inter: usize, q_dim: usize, kv_dim: usize,
+            num_q_heads: usize, num_kv_heads: usize, head_dim: usize,
+            wq: &[u8], wk: &[u8], wv: &[u8], wo: &[u8],
+            gate_b: &[u8], up_b: &[u8], down_b: &[u8],
+            input_norm: &[f32], post_attn_norm: &[f32],
+            pre_ffn_norm: &[f32], post_ffn_norm: &[f32],
+            q_norm: &[f32], k_norm: &[f32],
+        ) -> Vec<f32> {
+            fn gelu_tanh(x: f32) -> f32 {
+                let c: f32 = (2.0 / std::f32::consts::PI).sqrt();
+                let arg = (c * (x + 0.044715 * x * x * x)).clamp(-20.0, 20.0);
+                0.5 * x * (1.0 + arg.tanh())
+            }
+            let sum_sq: f64 = x.iter().map(|v| (*v as f64).powi(2)).sum();
+            let rms_x = 1.0f32 / ((sum_sq / hidden as f64 + 1e-6) as f32).sqrt();
+            let normed_x: Vec<f32> = x.iter().zip(input_norm.iter())
+                .map(|(v, w)| v * (w + 1.0) * rms_x).collect();
+            let _q_raw = be.q4k_matvec(wq, &normed_x, q_dim, hidden).unwrap();
+            let _k_raw = be.q4k_matvec(wk, &normed_x, kv_dim, hidden).unwrap();
+            let v_raw = be.q6k_matvec(wv, &normed_x, kv_dim, hidden).unwrap();
+            let _ = (q_norm, k_norm);
+            let mut attn_out = vec![0.0f32; q_dim];
+            let reps = num_q_heads / num_kv_heads;
+            for h in 0..num_q_heads {
+                let kv_h = h / reps;
+                let src = &v_raw[kv_h*head_dim..(kv_h+1)*head_dim];
+                let dst = &mut attn_out[h*head_dim..(h+1)*head_dim];
+                dst.copy_from_slice(src);
+            }
+            let o_proj = be.q4k_matvec(wo, &attn_out, hidden, q_dim).unwrap();
+            let sq: f64 = o_proj.iter().map(|v| (*v as f64).powi(2)).sum();
+            let r = 1.0f32 / ((sq / hidden as f64 + 1e-6) as f32).sqrt();
+            let normed_o: Vec<f32> = o_proj.iter().zip(post_attn_norm.iter())
+                .map(|(v, w)| v * (w + 1.0) * r).collect();
+            let h_post: Vec<f32> = x.iter().zip(normed_o.iter()).map(|(a, b)| a + b).collect();
+            let sq2: f64 = h_post.iter().map(|v| (*v as f64).powi(2)).sum();
+            let rms2 = 1.0f32 / ((sq2 / hidden as f64 + 1e-6) as f32).sqrt();
+            let ffn_in: Vec<f32> = h_post.iter().zip(pre_ffn_norm.iter())
+                .map(|(v, w)| v * (w + 1.0) * rms2).collect();
+            let gate_ffn = be.q4k_matvec(gate_b, &ffn_in, inter, hidden).unwrap();
+            let up_ffn = be.q4k_matvec(up_b, &ffn_in, inter, hidden).unwrap();
+            let act: Vec<f32> = gate_ffn.iter().zip(up_ffn.iter())
+                .map(|(g, u)| gelu_tanh(*g) * u).collect();
+            let down = be.q6k_matvec(down_b, &act, hidden, inter).unwrap();
+            let sq3: f64 = down.iter().map(|v| (*v as f64).powi(2)).sum();
+            let r3 = 1.0f32 / ((sq3 / hidden as f64 + 1e-6) as f32).sqrt();
+            let normed_down: Vec<f32> = down.iter().zip(post_ffn_norm.iter())
+                .map(|(v, w)| v * (w + 1.0) * r3).collect();
+            h_post.iter().zip(normed_down.iter()).map(|(a, b)| a + b).collect()
+        }
+        for n_layers in [2usize, 4, 8, 16, 32] {
+            let mut h: Vec<f32> = x.clone();
+            for _ in 0..n_layers {
+                h = one_layer(cpu_ref, &h, hidden, inter, q_dim, kv_dim,
+                    num_q_heads, num_kv_heads, head_dim,
+                    wq_bytes, wk_bytes, wv_bytes, wo_bytes,
+                    gate_bytes, up_bytes, down_bytes,
+                    &input_norm, &post_attn_norm, &pre_ffn_norm, &post_ffn_norm,
+                    &q_norm, &k_norm);
+            }
+            let amax = h.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let mn = h.iter().copied().fold(f32::INFINITY, f32::min);
+            let mx = h.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            println!("[cpu-sweep]   n_layers={n_layers:>2} range=[{mn:>10.2}, {mx:>10.2}] amax={amax:>9.2}");
+        }
+    }
+
     // ── 8. Isolated post_ffn_norm comparison: Metal shader vs CPU reference.
     //    Uses real Gemma 3 L0 post_ffn_norm weights (max≈304) and a synthetic
     //    f32 input matching what decode_token's FFN produces (amax~167). If

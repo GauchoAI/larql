@@ -85,3 +85,100 @@ fn q4k_build_matches_fresh_quantization() {
     println!("Byte comparison: {} mismatched of {} total", diff_bytes, fresh.len());
     assert_eq!(diff_bytes, 0, "stored Q4K differs from fresh quantization — build_q4k_weights path may be buggy");
 }
+
+#[test]
+#[ignore]
+fn q6k_matvec_real_down_synthetic_x() {
+    // Run Metal q6k_matvec with real layer-0 down weights + synthetic x=1.0.
+    // If output is finite, the NaN comes from act_buf magnitudes, not weights.
+    let vindex = std::env::var("LARQL_VINDEX_PATH").expect("set LARQL_VINDEX_PATH");
+    let dir = std::path::Path::new(&vindex);
+
+    let hidden = 2560usize;
+    let inter = 10240usize;
+    let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 148;
+    let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210;
+    let down_offset = 2 * q4k_bytes_per_matrix;
+
+    let file = std::fs::File::open(dir.join("interleaved_q4k.bin")).unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let down_bytes = &mmap[down_offset..down_offset + q6k_bytes_per_matrix];
+
+    let metal = larql_compute::metal::MetalBackend::new().expect("metal");
+    use larql_compute::ComputeBackend;
+    let be: &dyn ComputeBackend = &metal;
+
+    let x = vec![1.0f32; inter];
+    let result = be.q6k_matvec(down_bytes, &x, hidden, inter).expect("q6k_matvec");
+    let n_inf = result.iter().filter(|v| v.is_infinite()).count();
+    let n_nan = result.iter().filter(|v| v.is_nan()).count();
+    let finite_cnt = result.len() - n_inf - n_nan;
+    let max_abs = result.iter().filter(|v| v.is_finite()).map(|v| v.abs()).fold(0.0f32, f32::max);
+    println!("q6k_matvec(real_down, x=1.0): {n_inf} inf, {n_nan} nan, {finite_cnt} finite, max|val|={max_abs:.4}");
+    assert_eq!(n_inf + n_nan, 0, "q6k_matvec of real down × synthetic x=1 produces non-finite");
+}
+
+#[test]
+#[ignore]
+fn q6k_down_layer0_scale_check() {
+    // Inspect every super-block scale (f16 `d` and 16 int8 sub-block scales)
+    // in layer 0's down weight. If any d is huge (overflow territory), that's
+    // our decode_token NaN source.
+    let vindex = std::env::var("LARQL_VINDEX_PATH").expect("set LARQL_VINDEX_PATH");
+    let dir = std::path::Path::new(&vindex);
+
+    // Gemma 3 4B dims
+    let hidden = 2560usize;
+    let inter = 10240usize;
+    let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 148;
+    let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210;
+    let down_offset_in_layer0 = 2 * q4k_bytes_per_matrix;
+
+    let file = std::fs::File::open(dir.join("interleaved_q4k.bin")).unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let down = &mmap[down_offset_in_layer0..down_offset_in_layer0 + q6k_bytes_per_matrix];
+
+    fn decode_f16_one(bits: u16) -> f32 {
+        let sign = (bits >> 15) & 0x1;
+        let exp  = (bits >> 10) & 0x1F;
+        let mant = (bits & 0x3FF) as u32;
+        let b = if exp == 0 {
+            if mant == 0 { (sign as u32) << 31 }
+            else {
+                let mut m = mant; let mut e: i32 = -14;
+                while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+                ((sign as u32) << 31) | (((e + 127) as u32) << 23) | ((m & 0x3FF) << 13)
+            }
+        } else if exp == 0x1F {
+            ((sign as u32) << 31) | (0xFF << 23) | (mant << 13)
+        } else {
+            ((sign as u32) << 31) | (((exp as i32 - 15 + 127) as u32) << 23) | (mant << 13)
+        };
+        f32::from_bits(b)
+    }
+
+    let num_sb = down.len() / 210;
+    println!("layer 0 down: {} super-blocks", num_sb);
+    let mut d_abs_max = 0.0f32;
+    let mut sc_abs_max = 0i32;
+    let mut n_d_nonfinite = 0usize;
+    let mut max_dequant = 0.0f32;
+    for sb_idx in 0..num_sb {
+        let block = &down[sb_idx * 210 .. (sb_idx + 1) * 210];
+        let d_bits = u16::from_le_bytes([block[208], block[209]]);
+        let d = decode_f16_one(d_bits);
+        if !d.is_finite() { n_d_nonfinite += 1; continue; }
+        d_abs_max = d_abs_max.max(d.abs());
+        for j in 0..16 {
+            let sc = block[192 + j] as i8 as i32;
+            sc_abs_max = sc_abs_max.max(sc.abs());
+            // max possible dequantized value for this sub-block:
+            //   d * sc * ((0b111111) - 32) = d * sc * 31
+            let m = (d * sc as f32 * 31.0).abs();
+            if m.is_finite() { max_dequant = max_dequant.max(m); }
+        }
+    }
+    println!("f16 super-block scale |d| max: {d_abs_max}, non-finite: {n_d_nonfinite}");
+    println!("int8 sub-block scale |sc| max: {sc_abs_max}");
+    println!("max possible |dequantized value|: {max_dequant}");
+}

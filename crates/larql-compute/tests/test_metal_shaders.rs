@@ -2144,7 +2144,7 @@ fn decode_token_real_layer0_produces_finite() {
     //    grows. On a well-behaved Gemma 3 layer, post-norms should keep the
     //    residual stream bounded. Exponential or fast-linear growth points
     //    at a missing / miscomputed norm.
-    for n_layers in [2usize, 4, 8, 16, 32] {
+    for n_layers in [2usize, 4, 8, 16, 32, 34] {
         let layers: Vec<_> = (0..n_layers).map(|_| larql_compute::FullPipelineLayer {
             wq: larql_compute::QuantWeight { data: wq_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
             wk: larql_compute::QuantWeight { data: wk_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
@@ -2243,7 +2243,7 @@ fn decode_token_real_layer0_produces_finite() {
                 .map(|(v, w)| v * (w + 1.0) * r3).collect();
             h_post.iter().zip(normed_down.iter()).map(|(a, b)| a + b).collect()
         }
-        for n_layers in [2usize, 4, 8, 16, 32] {
+        for n_layers in [2usize, 4, 8, 16, 32, 34] {
             let mut h: Vec<f32> = x.clone();
             for _ in 0..n_layers {
                 h = one_layer(cpu_ref, &h, hidden, inter, q_dim, kv_dim,
@@ -2678,4 +2678,238 @@ fn decode_token_real_layer0_produces_finite() {
         "residual_norm diverges: max_diff={rn_maxdiff:.5}");
 
     let _ = metal_raw;
+}
+
+/// Load all 34 real Gemma 3 layers and run decode_token vs a CPU-backend-ops
+/// reference on the same BOS-like synthetic input. First divergent layer
+/// pinpoints which per-layer variable (rope_base, sliding_window, weight
+/// distribution, etc) triggers the remaining Metal decode_token bug.
+#[test]
+#[ignore]
+fn decode_token_all_34_layers_matches_cpu_ref() {
+    let vindex_path = std::env::var("LARQL_VINDEX_PATH")
+        .expect("set LARQL_VINDEX_PATH to a Q4K-prepared Gemma 3 4B vindex");
+    let dir = std::path::Path::new(&vindex_path);
+
+    let hidden = 2560usize;
+    let inter = 10240usize;
+    let num_q_heads = 8usize;
+    let num_kv_heads = 4usize;
+    let head_dim = 256usize;
+    let q_dim = num_q_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let num_layers = 34usize;
+
+    // Decode f16 inline (no larql_models dep).
+    fn decode_f16(raw: &[u8]) -> Vec<f32> {
+        raw.chunks_exact(2).map(|b| {
+            let bits = u16::from_le_bytes([b[0], b[1]]);
+            let sign = (bits >> 15) & 0x1;
+            let exp = (bits >> 10) & 0x1F;
+            let mant = (bits & 0x3FF) as u32;
+            let f32_bits = if exp == 0 {
+                if mant == 0 { (sign as u32) << 31 } else {
+                    let mut m = mant; let mut e: i32 = -14;
+                    while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+                    let exp32 = (e + 127) as u32;
+                    ((sign as u32) << 31) | (exp32 << 23) | ((m & 0x3FF) << 13)
+                }
+            } else if exp == 0x1F {
+                ((sign as u32) << 31) | (0xFF << 23) | (mant << 13)
+            } else {
+                let exp32 = (exp as i32 - 15 + 127) as u32;
+                ((sign as u32) << 31) | (exp32 << 23) | (mant << 13)
+            };
+            f32::from_bits(f32_bits)
+        }).collect()
+    }
+
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("weight_manifest.json")).unwrap()
+    ).unwrap();
+    let find_vec = |key: &str| -> Vec<f32> {
+        let e = manifest.iter().find(|e|
+            e.get("key").and_then(|k| k.as_str()) == Some(key)
+        ).unwrap_or_else(|| panic!("missing vector {key}"));
+        let offset = e["offset"].as_u64().unwrap() as usize;
+        let length = e["length"].as_u64().unwrap() as usize;
+        let file_name = e["file"].as_str().unwrap();
+        let file = std::fs::File::open(dir.join(file_name)).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        decode_f16(&mmap[offset..offset + length])
+    };
+
+    // Norms per layer.
+    let mut input_norms: Vec<Vec<f32>> = Vec::new();
+    let mut post_attn_norms: Vec<Vec<f32>> = Vec::new();
+    let mut pre_ffn_norms: Vec<Vec<f32>> = Vec::new();
+    let mut post_ffn_norms: Vec<Vec<f32>> = Vec::new();
+    let mut q_norms: Vec<Vec<f32>> = Vec::new();
+    let mut k_norms: Vec<Vec<f32>> = Vec::new();
+    for l in 0..num_layers {
+        input_norms.push(find_vec(&format!("layers.{l}.input_layernorm.weight")));
+        post_attn_norms.push(find_vec(&format!("layers.{l}.post_attention_layernorm.weight")));
+        pre_ffn_norms.push(find_vec(&format!("layers.{l}.pre_feedforward_layernorm.weight")));
+        post_ffn_norms.push(find_vec(&format!("layers.{l}.post_feedforward_layernorm.weight")));
+        q_norms.push(find_vec(&format!("layers.{l}.self_attn.q_norm.weight")));
+        k_norms.push(find_vec(&format!("layers.{l}.self_attn.k_norm.weight")));
+    }
+
+    // Attention Q4K (plus v_proj Q6K) weights per layer.
+    let q4k_manifest: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("attn_weights_q4k_manifest.json")).unwrap()
+    ).unwrap();
+    let attn_file = std::fs::File::open(dir.join("attn_weights_q4k.bin")).unwrap();
+    let attn_mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&attn_file).unwrap() });
+    let find_attn = |l: usize, key: &str| -> (usize, usize) {
+        let prefix = format!("layers.{l}.");
+        let e = q4k_manifest.iter().find(|e|
+            e.get("key").and_then(|k| k.as_str())
+                .is_some_and(|k| k.starts_with(&prefix) && k.contains(key))
+        ).unwrap_or_else(|| panic!("missing q4k L{l} {key}"));
+        (e["offset"].as_u64().unwrap() as usize, e["length"].as_u64().unwrap() as usize)
+    };
+    let mut wq_offs: Vec<(usize, usize)> = (0..num_layers).map(|l| find_attn(l, "q_proj")).collect();
+    let mut wk_offs: Vec<(usize, usize)> = (0..num_layers).map(|l| find_attn(l, "k_proj")).collect();
+    let mut wv_offs: Vec<(usize, usize)> = (0..num_layers).map(|l| find_attn(l, "v_proj")).collect();
+    let mut wo_offs: Vec<(usize, usize)> = (0..num_layers).map(|l| find_attn(l, "o_proj")).collect();
+
+    // FFN interleaved weights per layer.
+    let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 148;
+    let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210;
+    let per_layer = 2 * q4k_bytes_per_matrix + q6k_bytes_per_matrix;
+    let inter_file = std::fs::File::open(dir.join("interleaved_q4k.bin")).unwrap();
+    let inter_mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&inter_file).unwrap() });
+
+    // Gemma 3 per-layer rope_base: layers where (l+1) % 6 == 0 are full attention
+    // (rope_base = 1_000_000), others are sliding (rope_local = 10_000).
+    let is_sliding = |l: usize| !(l + 1).is_multiple_of(6);
+    let rope_base_for = |l: usize| if is_sliding(l) { 10_000.0f32 } else { 1_000_000.0f32 };
+    let sliding_window_for = |l: usize| if is_sliding(l) { 1024usize } else { 0usize };
+
+    let (_q8_x, q8_scales) = q4::quantize_to_q8(&vec![0.01f32; hidden]);
+
+    // Construct FullPipelineLayer for each of the 34 layers.
+    let layers: Vec<larql_compute::FullPipelineLayer<'_>> = (0..num_layers).map(|l| {
+        let (q_off, q_len) = wq_offs[l];
+        let (k_off, k_len) = wk_offs[l];
+        let (v_off, v_len) = wv_offs[l];
+        let (o_off, o_len) = wo_offs[l];
+        let wq = &attn_mmap[q_off..q_off + q_len];
+        let wk = &attn_mmap[k_off..k_off + k_len];
+        let wv = &attn_mmap[v_off..v_off + v_len];
+        let wo = &attn_mmap[o_off..o_off + o_len];
+        let base = l * per_layer;
+        let gate = &inter_mmap[base..base + q4k_bytes_per_matrix];
+        let up = &inter_mmap[base + q4k_bytes_per_matrix..base + 2 * q4k_bytes_per_matrix];
+        let down = &inter_mmap[base + 2 * q4k_bytes_per_matrix..base + per_layer];
+        larql_compute::FullPipelineLayer {
+            wq: larql_compute::QuantWeight { data: wq, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
+            wk: larql_compute::QuantWeight { data: wk, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
+            wv: larql_compute::QuantWeight { data: wv, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q6_K },
+            wo: larql_compute::QuantWeight { data: wo, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
+            gate: larql_compute::QuantWeight { data: gate, scales: None, format: larql_compute::QuantFormat::Q4_K },
+            up: larql_compute::QuantWeight { data: up, scales: None, format: larql_compute::QuantFormat::Q4_K },
+            down: larql_compute::QuantWeight { data: down, scales: None, format: larql_compute::QuantFormat::Q6_K },
+            input_norm: &input_norms[l],
+            post_attn_norm: &post_attn_norms[l],
+            pre_ffn_norm: Some(&pre_ffn_norms[l]),
+            post_ffn_norm: Some(&post_ffn_norms[l]),
+            q_norm_weight: Some(&q_norms[l]),
+            k_norm_weight: Some(&k_norms[l]),
+            norm_offset: 1.0, qk_norm_offset: 1.0, eps: 1e-6, has_post_norms: true,
+            norm_type: larql_compute::NormType::RmsNorm,
+            ffn_type: larql_compute::FfnType::Gated,
+            activation: larql_compute::Activation::GeluTanh,
+            attn_scale: 1.0 / (head_dim as f32).sqrt(),
+            head_dim, num_q_heads, num_kv_heads,
+            rope_base: rope_base_for(l),
+            rotary_dim: 0,
+            sliding_window: sliding_window_for(l),
+            has_v_norm: false, layer_scalar: 0.0,
+            input_norm_bias: None, post_attn_norm_bias: None,
+            ffn_up_bias: None, ffn_down_bias: None,
+        }
+    }).collect();
+
+    // Synthetic input (BOS-like magnitude).
+    let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.003).sin() * 20.0).collect();
+
+    let metal = get_metal();
+    let be: &dyn ComputeBackend = &metal;
+    be.reset_kv_cache();
+    let metal_out = be.decode_token(
+        &layers, &x, hidden, inter, q_dim, kv_dim,
+        num_q_heads, num_kv_heads, head_dim, 10_000.0
+    ).expect("decode_token");
+    let metal_amax = metal_out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let m_mn = metal_out.iter().copied().fold(f32::INFINITY, f32::min);
+    let m_mx = metal_out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    println!("[metal-34]    range=[{m_mn:.2}, {m_mx:.2}] amax={metal_amax:.2}");
+
+    // CPU reference: chain the same backend-ops + CPU norm math per layer,
+    // layer-by-layer, for all 34 real layers. T=1 attention per layer
+    // (single-token test with fresh KV).
+    fn gelu_tanh(x: f32) -> f32 {
+        let c: f32 = (2.0 / std::f32::consts::PI).sqrt();
+        let arg = (c * (x + 0.044715 * x * x * x)).clamp(-20.0, 20.0);
+        0.5 * x * (1.0 + arg.tanh())
+    }
+    fn rms_norm(x: &[f32], w: &[f32], offset: f32, eps: f32) -> Vec<f32> {
+        let sq: f64 = x.iter().map(|v| (*v as f64).powi(2)).sum();
+        let r = 1.0f32 / ((sq / x.len() as f64 + eps as f64) as f32).sqrt();
+        x.iter().zip(w.iter()).map(|(v, wi)| v * (wi + offset) * r).collect()
+    }
+    let cpu_be = larql_compute::CpuBackend;
+    let cpu_ref: &dyn ComputeBackend = &cpu_be;
+    let mut h: Vec<f32> = x.clone();
+    let mut max_abs_diff_so_far: f32 = 0.0;
+    for (l, layer) in layers.iter().enumerate() {
+        let normed_x = rms_norm(&h, layer.input_norm, 1.0, 1e-6);
+        let _q_raw = cpu_ref.q4k_matvec(layer.wq.data, &normed_x, q_dim, hidden).unwrap();
+        let _k_raw = cpu_ref.q4k_matvec(layer.wk.data, &normed_x, kv_dim, hidden).unwrap();
+        let v_raw = cpu_ref.q6k_matvec(layer.wv.data, &normed_x, kv_dim, hidden).unwrap();
+        // T=1 attention → attn_out = V per Q head (GQA).
+        let reps = num_q_heads / num_kv_heads;
+        let mut attn_out = vec![0.0f32; q_dim];
+        for h_i in 0..num_q_heads {
+            let kv_h = h_i / reps;
+            attn_out[h_i*head_dim..(h_i+1)*head_dim]
+                .copy_from_slice(&v_raw[kv_h*head_dim..(kv_h+1)*head_dim]);
+        }
+        let o = cpu_ref.q4k_matvec(layer.wo.data, &attn_out, hidden, q_dim).unwrap();
+        let normed_o = rms_norm(&o, layer.post_attn_norm, 1.0, 1e-6);
+        let h_post: Vec<f32> = h.iter().zip(normed_o.iter()).map(|(a, b)| a + b).collect();
+        let ffn_in = rms_norm(&h_post, layer.pre_ffn_norm.unwrap(), 1.0, 1e-6);
+        let gate_ffn = cpu_ref.q4k_matvec(layer.gate.data, &ffn_in, inter, hidden).unwrap();
+        let up_ffn = cpu_ref.q4k_matvec(layer.up.data, &ffn_in, inter, hidden).unwrap();
+        let act: Vec<f32> = gate_ffn.iter().zip(up_ffn.iter())
+            .map(|(g, u)| gelu_tanh(*g) * u).collect();
+        let down = cpu_ref.q6k_matvec(layer.down.data, &act, hidden, inter).unwrap();
+        let normed_down = rms_norm(&down, layer.post_ffn_norm.unwrap(), 1.0, 1e-6);
+        h = h_post.iter().zip(normed_down.iter()).map(|(a, b)| a + b).collect();
+        let cpu_amax = h.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        if l < 3 || l == num_layers - 1 {
+            println!("[cpu-L{l:02}]  amax={cpu_amax:.2}");
+        }
+    }
+    let cpu_amax = h.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let c_mn = h.iter().copied().fold(f32::INFINITY, f32::min);
+    let c_mx = h.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    println!("[cpu-34]      range=[{c_mn:.2}, {c_mx:.2}] amax={cpu_amax:.2}");
+    let diff_max = metal_out.iter().zip(h.iter())
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    println!("[metal-vs-cpu-34] metal_amax={metal_amax:.2} cpu_amax={cpu_amax:.2} max_elem_diff={diff_max:.4}");
+    // Find top-3 divergent channels.
+    let mut diffs: Vec<(usize, f32, f32, f32)> = metal_out.iter().zip(h.iter()).enumerate()
+        .map(|(i, (m, c))| (i, *m, *c, (m - c).abs())).collect();
+    diffs.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+    println!("[metal-vs-cpu-34] top-3 diverging channels:");
+    for (i, m, c, d) in diffs.iter().take(3) {
+        println!("  ch={i}  metal={m:.3}  cpu={c:.3}  diff={d:.3}");
+    }
+    // Within tolerance is 5% of amax (quant noise, f32 accumulation differences).
+    assert!(diff_max < 0.05 * cpu_amax.max(1.0),
+        "Metal decode_token 34-layer output diverges from CPU ref: max_diff={diff_max:.2} amax={cpu_amax:.2}");
+    let _ = max_abs_diff_so_far;
 }

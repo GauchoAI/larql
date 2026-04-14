@@ -411,21 +411,27 @@ impl MetalBackend {
             {
                 if uses_q4k {
                     // Pipeline choice decides ROWS/THREADS per TG: q4k_proj uses 8/256,
-                    // q4kf_proj uses 4/64. Previously both paths used q4kf dims,
-                    // causing q4k_proj to dispatch only 2 simdgroups per TG (expected 8)
-                    // — 75% of output rows never written, left as zero from the
-                    //  uninitialised buffer. That silently corrupted every Q4_K O
-                    // projection in decode_token.
+                    // q4kf_proj uses 4/64, q6k_matvec uses 4/128. Previously both
+                    // Q4_K/Q4_KF paths used q4kf dims, causing q4k_proj to dispatch
+                    // only 2 simdgroups per TG (expected 8) — 75% of output rows
+                    // never written. Q6_K path now explicitly supported for O proj
+                    // too (makes attention-all-Q6K layouts work for Gemma 3).
                     let o_rows = hidden as u32;
                     let o_k = layer_q_dim as u32;
-                    let (o_pipeline, rows_per_tg, threads_per_tg) =
-                        if layer.wo.format == crate::QuantFormat::Q4_KF {
+                    let (o_pipeline, rows_per_tg, threads_per_tg) = match layer.wo.format {
+                        crate::QuantFormat::Q4_KF => {
                             use crate::metal::shaders::q4kf_qkv_proj as kf;
                             (&self.q4kf_proj_pipeline, kf::ROWS_PER_TG, kf::THREADS_PER_TG)
-                        } else {
+                        }
+                        crate::QuantFormat::Q6_K => {
+                            use crate::metal::shaders::q6k_matvec as q6k;
+                            (&self.q6k_matvec_pipeline, q6k::ROWS_PER_TG, q6k::THREADS_PER_TG)
+                        }
+                        _ => {
                             use crate::metal::shaders::q4k_qkv_proj as k;
                             (&self.q4k_proj_pipeline, k::ROWS_PER_TG, k::THREADS_PER_TG)
-                        };
+                        }
+                    };
                     let num_tgs = (hidden as u64).div_ceil(rows_per_tg);
                     enc.set_compute_pipeline_state(o_pipeline);
                     enc.set_buffer(0, Some(&wo_bufs[l]), 0);

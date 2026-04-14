@@ -14,20 +14,26 @@ use larql_vindex::{SilentLoadCallbacks, VectorIndex};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let mut vindex_path = std::path::PathBuf::from("output/gemma3-4b-v2.vindex");
+    let mut model_ref = String::from("google/gemma-3-4b-it");
+    let mut prompt_override: Option<String> = None;
+    let mut n_tokens: usize = 20;
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--vindex" { i += 1; vindex_path = std::path::PathBuf::from(&args[i]); }
+        else if args[i] == "--model" { i += 1; model_ref = args[i].clone(); }
+        else if args[i] == "--prompt" { i += 1; prompt_override = Some(args[i].clone()); }
+        else if args[i] == "--tokens" { i += 1; n_tokens = args[i].parse().unwrap_or(20); }
         i += 1;
     }
 
-    let model = InferenceModel::load("google/gemma-3-4b-it")?;
+    let model = InferenceModel::load(&model_ref)?;
     let weights = model.weights();
     let tokenizer = model.tokenizer();
     let num_layers = weights.num_layers;
 
     let mut cb = SilentLoadCallbacks;
     let mut index = VectorIndex::load_vindex(&vindex_path, &mut cb)?;
-    index.load_lm_head(&vindex_path)?;
+    let _ = index.load_lm_head(&vindex_path);
     let _ = index.load_lm_head_q4(&vindex_path);
     let _ = index.load_attn_q4k(&vindex_path);
     let _ = index.load_attn_q8(&vindex_path);
@@ -37,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gpu_be = default_backend();
     let dense_ffn = WeightFfn { weights };
     let cached_layers: Vec<usize> = (0..=12).collect();
-    let prompt = "The capital of France is";
+    let prompt = prompt_override.as_deref().unwrap_or("The capital of France is");
     let encoding = tokenizer.encode(prompt, true).map_err(|e| format!("{e}"))?;
     let token_ids: Vec<u32> = encoding.get_ids().to_vec();
     let cache = CachedLayerGraph::build(weights, &token_ids, &cached_layers, &dense_ffn);
@@ -52,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     let result = generate(
-        weights, tokenizer, &token_ids, 20,
+        weights, tokenizer, &token_ids, n_tokens,
         &index, &*gpu_be, &cache, 13..num_layers,
     );
 

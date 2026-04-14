@@ -43,6 +43,9 @@ pub struct TraceResult {
 /// Prediction result from a full forward pass.
 pub struct PredictResult {
     pub predictions: Vec<(String, f64)>,
+    /// Raw (token_id, logit, prob) for callers that need token IDs without re-encoding.
+    /// Same order as `predictions`. Empty when not populated (back-compat).
+    pub raw_predictions: Vec<(u32, f32, f64)>,
 }
 
 /// Prediction result with per-layer residual capture.

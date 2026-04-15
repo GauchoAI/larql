@@ -2945,4 +2945,43 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
     assert!(diff_max < 0.05 * cpu_amax.max(1.0),
         "Metal decode_token 34-layer output diverges from CPU ref: max_diff={diff_max:.2} amax={cpu_amax:.2}");
     let _ = max_abs_diff_so_far;
+
+    // ── 11. Compute top-5 predicted vocab indices from the CPU-ref output
+    //    (same as Metal), via final_norm (norms.bin, key "norm.weight") +
+    //    lm_head (lm_head.bin, f32 [vocab, hidden]). If this matches
+    //    gpuprefill's top-5 ("particularly", "Vancouver", …) we've confirmed
+    //    Metal = CPU-ref-Q4K end-to-end including the lookup. If it matches
+    //    cpupredict's top-5 ("The", "<h1>", …) we've found a bug distinct
+    //    from Q4K precision: the Metal decode output is quant-correct but
+    //    something between decode_token and finalize_logits is corrupting
+    //    the hidden state in live inference.
+    let final_norm = find_vec("norm.weight");
+    assert_eq!(final_norm.len(), hidden);
+    let h_normed = rms_norm(&h, &final_norm, 1.0, 1e-6);
+
+    let lm_head_file = std::fs::File::open(dir.join("lm_head.bin")).unwrap();
+    let lm_head_mmap = unsafe { memmap2::Mmap::map(&lm_head_file).unwrap() };
+    // lm_head.bin is f32 [vocab, hidden], row-major.
+    let vocab = lm_head_mmap.len() / (hidden * 4);
+    println!("[lm_head] vocab={vocab}, bytes={}", lm_head_mmap.len());
+    let lm_head_f32: &[f32] = unsafe {
+        std::slice::from_raw_parts(lm_head_mmap.as_ptr() as *const f32, vocab * hidden)
+    };
+    // Logits[v] = sum_d lm_head[v,d] * h_normed[d]
+    let mut logits = vec![0.0f32; vocab];
+    for v in 0..vocab {
+        let mut acc = 0.0f64;
+        let row = &lm_head_f32[v * hidden..(v + 1) * hidden];
+        for d in 0..hidden {
+            acc += row[d] as f64 * h_normed[d] as f64;
+        }
+        logits[v] = acc as f32;
+    }
+    // Top-5 by logit.
+    let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    println!("[cpu-ref-top5]  (these are what the Metal decode path would predict given Metal=CPU-ref):");
+    for (i, (tid, l)) in ranked.iter().take(5).enumerate() {
+        println!("  {}. tid={tid:>6}  logit={l:.3}", i + 1);
+    }
 }

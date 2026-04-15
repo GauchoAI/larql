@@ -655,24 +655,41 @@ impl MetalBackend {
 
                     if layer.is_gated() {
                         let gate_out = &gate_out_scratch;
-                        // Fused gate+up: one dispatch, reads input once
+                        let gate_is_q6k = layer.gate.format == crate::QuantFormat::Q6_K;
+                        let up_is_q6k = layer.up.format == crate::QuantFormat::Q6_K;
                         let n_tgs_per_mat = (inter as u64).div_ceil(q4k_gu::ROWS_PER_TG);
                         // DIAGNOSTIC: LARQL_SEPARATE_GATE_UP=1 bypasses the fused gate_up kernel
-                        // and uses two independent q4k_matvec dispatches. Standalone q4k_matvec
-                        // is verified clean for real weights at any input magnitude.
-                        let separate_gate_up = std::env::var("LARQL_SEPARATE_GATE_UP").ok().as_deref() == Some("1");
+                        // and uses two independent matvec dispatches. Also required when gate
+                        // or up is Q6_K (fused kernel only accepts Q4_K).
+                        let separate_gate_up = std::env::var("LARQL_SEPARATE_GATE_UP").ok().as_deref() == Some("1")
+                            || gate_is_q6k || up_is_q6k;
                         if separate_gate_up {
-                            let n_tgs_gu = (inter as u64).div_ceil(q4k::ROWS_PER_TG);
-                            enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline);
-                            enc.set_buffer(0, Some(&gate_bufs[l]), 0);
-                            enc.set_buffer(1, Some(&ffn_norm_out), 0);
-                            enc.set_buffer(2, Some(&gate_out), 0);
-                            enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
-                            enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-                            enc.dispatch_thread_groups(MTLSize::new(n_tgs_gu, 1, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
-                            enc.set_buffer(0, Some(&up_bufs[l]), 0);
-                            enc.set_buffer(2, Some(&up_out), 0);
-                            enc.dispatch_thread_groups(MTLSize::new(n_tgs_gu, 1, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
+                            let dispatch_single = |enc_ref: &metal::ComputeCommandEncoderRef,
+                                                    w_buf: &metal::Buffer,
+                                                    out_buf: &metal::Buffer,
+                                                    is_q6k: bool| {
+                                if is_q6k {
+                                    let n_tgs = (inter as u64).div_ceil(q6k::ROWS_PER_TG);
+                                    enc_ref.set_compute_pipeline_state(&self.q6k_matvec_pipeline);
+                                    enc_ref.set_buffer(0, Some(w_buf), 0);
+                                    enc_ref.set_buffer(1, Some(&ffn_norm_out), 0);
+                                    enc_ref.set_buffer(2, Some(out_buf), 0);
+                                    enc_ref.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                                    enc_ref.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                                    enc_ref.dispatch_thread_groups(MTLSize::new(n_tgs, 1, 1), MTLSize::new(q6k::THREADS_PER_TG, 1, 1));
+                                } else {
+                                    let n_tgs = (inter as u64).div_ceil(q4k::ROWS_PER_TG);
+                                    enc_ref.set_compute_pipeline_state(&self.q4k_matvec_pipeline);
+                                    enc_ref.set_buffer(0, Some(w_buf), 0);
+                                    enc_ref.set_buffer(1, Some(&ffn_norm_out), 0);
+                                    enc_ref.set_buffer(2, Some(out_buf), 0);
+                                    enc_ref.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                                    enc_ref.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                                    enc_ref.dispatch_thread_groups(MTLSize::new(n_tgs, 1, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
+                                }
+                            };
+                            dispatch_single(enc, &gate_bufs[l], &gate_out, gate_is_q6k);
+                            dispatch_single(enc, &up_bufs[l], &up_out, up_is_q6k);
                         } else {
                             enc.set_compute_pipeline_state(&self.q4k_ffn_gate_up_pipeline);
                             enc.set_buffer(0, Some(&gate_bufs[l]), 0);

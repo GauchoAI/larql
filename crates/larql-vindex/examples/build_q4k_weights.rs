@@ -149,10 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         f32_data.to_vec()
                     };
 
-                    // Ollama strategy: Q4_K for gate/up, Q6_K for down (higher
-                    // precision on the down projection). The loader
-                    // (build_pipeline_layers) detects the mixed layout from
-                    // per-layer byte size and dispatches q6k_matvec accordingly.
+                    // Ollama strategy: Q4_K for gate/up, Q6_K for down.
                     let q_data = if *name == "down" {
                         quantize_q6_k(&padded)
                     } else {

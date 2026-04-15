@@ -2774,12 +2774,26 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
     let mut wv_offs: Vec<(usize, usize)> = (0..num_layers).map(|l| find_attn(l, "v_proj")).collect();
     let mut wo_offs: Vec<(usize, usize)> = (0..num_layers).map(|l| find_attn(l, "o_proj")).collect();
 
-    // FFN interleaved weights per layer.
+    // FFN interleaved weights per layer. Detect FFN layout from file size.
     let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 148;
     let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210;
-    let per_layer = 2 * q4k_bytes_per_matrix + q6k_bytes_per_matrix;
     let inter_file = std::fs::File::open(dir.join("interleaved_q4k.bin")).unwrap();
     let inter_mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&inter_file).unwrap() });
+    let file_per_layer = inter_mmap.len() / num_layers;
+    let all_q6k = file_per_layer == q6k_bytes_per_matrix * 3;
+    let mixed = file_per_layer == 2 * q4k_bytes_per_matrix + q6k_bytes_per_matrix;
+    let (gate_bytes_per, up_bytes_per, down_bytes_per, gate_format, up_format) = if all_q6k {
+        (q6k_bytes_per_matrix, q6k_bytes_per_matrix, q6k_bytes_per_matrix,
+         larql_compute::QuantFormat::Q6_K, larql_compute::QuantFormat::Q6_K)
+    } else if mixed {
+        (q4k_bytes_per_matrix, q4k_bytes_per_matrix, q6k_bytes_per_matrix,
+         larql_compute::QuantFormat::Q4_K, larql_compute::QuantFormat::Q4_K)
+    } else {
+        panic!("unknown FFN layout: file_per_layer={file_per_layer}");
+    };
+    let per_layer = gate_bytes_per + up_bytes_per + down_bytes_per;
+    println!("FFN layout: gate={}B up={}B down={}B per_layer={}B (all_q6k={all_q6k})",
+        gate_bytes_per, up_bytes_per, down_bytes_per, per_layer);
 
     // Gemma 3 per-layer rope_base: layers where (l+1) % 6 == 0 are full attention
     // (rope_base = 1_000_000), others are sliding (rope_local = 10_000).
@@ -2800,16 +2814,16 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
         let wv = &attn_mmap[v_off..v_off + v_len];
         let wo = &attn_mmap[o_off..o_off + o_len];
         let base = l * per_layer;
-        let gate = &inter_mmap[base..base + q4k_bytes_per_matrix];
-        let up = &inter_mmap[base + q4k_bytes_per_matrix..base + 2 * q4k_bytes_per_matrix];
-        let down = &inter_mmap[base + 2 * q4k_bytes_per_matrix..base + per_layer];
+        let gate = &inter_mmap[base..base + gate_bytes_per];
+        let up = &inter_mmap[base + gate_bytes_per..base + gate_bytes_per + up_bytes_per];
+        let down = &inter_mmap[base + gate_bytes_per + up_bytes_per..base + per_layer];
         larql_compute::FullPipelineLayer {
             wq: larql_compute::QuantWeight { data: wq, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
             wk: larql_compute::QuantWeight { data: wk, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
             wv: larql_compute::QuantWeight { data: wv, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q6_K },
             wo: larql_compute::QuantWeight { data: wo, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
-            gate: larql_compute::QuantWeight { data: gate, scales: None, format: larql_compute::QuantFormat::Q4_K },
-            up: larql_compute::QuantWeight { data: up, scales: None, format: larql_compute::QuantFormat::Q4_K },
+            gate: larql_compute::QuantWeight { data: gate, scales: None, format: gate_format },
+            up: larql_compute::QuantWeight { data: up, scales: None, format: up_format },
             down: larql_compute::QuantWeight { data: down, scales: None, format: larql_compute::QuantFormat::Q6_K },
             input_norm: &input_norms[l],
             post_attn_norm: &post_attn_norms[l],
@@ -2832,8 +2846,19 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
         }
     }).collect();
 
-    // Synthetic input (BOS-like magnitude).
-    let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.003).sin() * 20.0).collect();
+    // Real BOS embedding (tok_id=2 in Gemma 3), scaled by sqrt(hidden_size).
+    // Reads from embeddings.bin (f16, row-major [vocab, hidden]).
+    let emb_file = std::fs::File::open(dir.join("embeddings.bin")).unwrap();
+    let emb_mmap = unsafe { memmap2::Mmap::map(&emb_file).unwrap() };
+    let bos_tok: usize = 2;
+    let row_bytes = hidden * 2; // f16 = 2 bytes
+    let row_start = bos_tok * row_bytes;
+    let bos_f16 = &emb_mmap[row_start..row_start + row_bytes];
+    let bos_embed = decode_f16(bos_f16);
+    let embed_scale = (hidden as f32).sqrt();
+    let x: Vec<f32> = bos_embed.iter().map(|v| v * embed_scale).collect();
+    let x_amax = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    println!("[input] real BOS scaled embed amax={x_amax:.3}");
 
     let metal = get_metal();
     let be: &dyn ComputeBackend = &metal;
@@ -2864,11 +2889,19 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
     let cpu_ref: &dyn ComputeBackend = &cpu_be;
     let mut h: Vec<f32> = x.clone();
     let mut max_abs_diff_so_far: f32 = 0.0;
+    // Dispatch matvec based on QuantFormat (Q4_K / Q6_K).
+    fn matvec(be: &dyn ComputeBackend, w: &larql_compute::QuantWeight<'_>,
+              x: &[f32], rows: usize, k: usize) -> Vec<f32> {
+        match w.format {
+            larql_compute::QuantFormat::Q6_K => be.q6k_matvec(w.data, x, rows, k).unwrap(),
+            _ => be.q4k_matvec(w.data, x, rows, k).unwrap(),
+        }
+    }
     for (l, layer) in layers.iter().enumerate() {
         let normed_x = rms_norm(&h, layer.input_norm, 1.0, 1e-6);
-        let _q_raw = cpu_ref.q4k_matvec(layer.wq.data, &normed_x, q_dim, hidden).unwrap();
-        let _k_raw = cpu_ref.q4k_matvec(layer.wk.data, &normed_x, kv_dim, hidden).unwrap();
-        let v_raw = cpu_ref.q6k_matvec(layer.wv.data, &normed_x, kv_dim, hidden).unwrap();
+        let _q_raw = matvec(cpu_ref, &layer.wq, &normed_x, q_dim, hidden);
+        let _k_raw = matvec(cpu_ref, &layer.wk, &normed_x, kv_dim, hidden);
+        let v_raw = matvec(cpu_ref, &layer.wv, &normed_x, kv_dim, hidden);
         // T=1 attention → attn_out = V per Q head (GQA).
         let reps = num_q_heads / num_kv_heads;
         let mut attn_out = vec![0.0f32; q_dim];
@@ -2877,15 +2910,15 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
             attn_out[h_i*head_dim..(h_i+1)*head_dim]
                 .copy_from_slice(&v_raw[kv_h*head_dim..(kv_h+1)*head_dim]);
         }
-        let o = cpu_ref.q4k_matvec(layer.wo.data, &attn_out, hidden, q_dim).unwrap();
+        let o = matvec(cpu_ref, &layer.wo, &attn_out, hidden, q_dim);
         let normed_o = rms_norm(&o, layer.post_attn_norm, 1.0, 1e-6);
         let h_post: Vec<f32> = h.iter().zip(normed_o.iter()).map(|(a, b)| a + b).collect();
         let ffn_in = rms_norm(&h_post, layer.pre_ffn_norm.unwrap(), 1.0, 1e-6);
-        let gate_ffn = cpu_ref.q4k_matvec(layer.gate.data, &ffn_in, inter, hidden).unwrap();
-        let up_ffn = cpu_ref.q4k_matvec(layer.up.data, &ffn_in, inter, hidden).unwrap();
+        let gate_ffn = matvec(cpu_ref, &layer.gate, &ffn_in, inter, hidden);
+        let up_ffn = matvec(cpu_ref, &layer.up, &ffn_in, inter, hidden);
         let act: Vec<f32> = gate_ffn.iter().zip(up_ffn.iter())
             .map(|(g, u)| gelu_tanh(*g) * u).collect();
-        let down = cpu_ref.q6k_matvec(layer.down.data, &act, hidden, inter).unwrap();
+        let down = matvec(cpu_ref, &layer.down, &act, hidden, inter);
         let normed_down = rms_norm(&down, layer.post_ffn_norm.unwrap(), 1.0, 1e-6);
         h = h_post.iter().zip(normed_down.iter()).map(|(a, b)| a + b).collect();
         let cpu_amax = h.iter().map(|v| v.abs()).fold(0.0f32, f32::max);

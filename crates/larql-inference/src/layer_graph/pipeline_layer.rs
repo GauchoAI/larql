@@ -165,25 +165,43 @@ pub fn build_pipeline_layers<'a>(
     ffn_format: QuantFormat,
 ) -> Vec<FullPipelineLayer<'a>> {
     let num_layers_in_file = weights.num_layers;
-    // Detect Q4K+Q4K+Q6K mixed layout (Ollama / build_q4k_weights convention):
-    // uniform layout's per-layer bytes = 3 * q4_ffn_per_matrix.
-    // Mixed layout inflates down's size by Q6_K/Q4_K ratio (210/148 ≈ 1.4189).
-    let uniform_per_layer = q4_ffn_per_matrix * 3;
+    // Three supported FFN layouts, detected from the per-layer byte count:
+    //   uniform Q4K:  per_layer = 3 × q4_per_matrix (148 B × 256 vals each)
+    //   Q4K+Q4K+Q6K:  per_layer = 2 × q4_per_matrix + q6_per_matrix (Ollama)
+    //   all Q6K:      per_layer = 3 × q6_per_matrix (Gemma 3 hi-precision)
+    // q4_ffn_per_matrix is always the Q4K size; q6_per_matrix is inferred as
+    // q4 × (210/148). We compare per_layer against each candidate to pick.
+    let q6_per_matrix = q4_ffn_per_matrix * 210 / 148;
+    let uniform_q4_per_layer = q4_ffn_per_matrix * 3;
+    let mixed_q4q6_per_layer = 2 * q4_ffn_per_matrix + q6_per_matrix;
+    let uniform_q6_per_layer = q6_per_matrix * 3;
     let actual_per_layer = q4_ffn_mmap.len() / num_layers_in_file.max(1);
-    let (down_bytes, down_format) = if actual_per_layer > uniform_per_layer {
-        // Mixed: down is Q6_K, takes the extra bytes
-        (actual_per_layer - 2 * q4_ffn_per_matrix, QuantFormat::Q6_K)
-    } else {
-        (q4_ffn_per_matrix, ffn_format)
-    };
+    // Choose the layout whose per-layer size matches actual.
+    let (gate_bytes, gate_format, up_bytes, up_format, down_bytes, down_format) =
+        if actual_per_layer == uniform_q6_per_layer {
+            (q6_per_matrix, QuantFormat::Q6_K, q6_per_matrix, QuantFormat::Q6_K, q6_per_matrix, QuantFormat::Q6_K)
+        } else if actual_per_layer == mixed_q4q6_per_layer {
+            (q4_ffn_per_matrix, ffn_format, q4_ffn_per_matrix, ffn_format, q6_per_matrix, QuantFormat::Q6_K)
+        } else {
+            (q4_ffn_per_matrix, ffn_format, q4_ffn_per_matrix, ffn_format, q4_ffn_per_matrix, ffn_format)
+        };
     layer_range.map(|layer| {
         let (wq, wk, wv, wo) = resolve_attn_weights(index, layer)
             .expect("No attention weights available for layer");
-        let (gate, up, down) = resolve_ffn_weights_mixed(
-            q4_ffn_mmap, layer,
-            q4_ffn_per_matrix, ffn_format,
-            down_bytes, down_format,
-        );
+        let per_layer = gate_bytes + up_bytes + down_bytes;
+        let base = layer * per_layer;
+        let gate = QuantWeight {
+            data: &q4_ffn_mmap[base..base + gate_bytes],
+            scales: None, format: gate_format,
+        };
+        let up = QuantWeight {
+            data: &q4_ffn_mmap[base + gate_bytes..base + gate_bytes + up_bytes],
+            scales: None, format: up_format,
+        };
+        let down = QuantWeight {
+            data: &q4_ffn_mmap[base + gate_bytes + up_bytes..base + per_layer],
+            scales: None, format: down_format,
+        };
         build_arch_params(weights, layer, wq, wk, wv, wo, gate, up, down)
     }).collect()
 }

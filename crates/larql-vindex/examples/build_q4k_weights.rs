@@ -17,7 +17,9 @@ use std::path::Path;
 use std::time::Instant;
 
 // Single source of truth for quantization — same functions used by compute kernels
-use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
+use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q4_k_gguf, quantize_q6_k};
+// quantize_q4_k_gguf is the llama.cpp 144-byte Q4_K layout (6-bit mins). We're
+// using it for attention + FFN gate/up; v_proj and down stay Q6_K.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::args().nth(1)
@@ -79,13 +81,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 f32_data.to_vec()
             };
 
-            // V projection gets Q6_K (higher precision), others get Q4_K
+            // V projection → Q6_K, others → Q4_K (148-byte Ollama layout).
+            // Temporarily reverted from Q4_KF (144-byte GGUF, 6-bit mins) while
+            // we debug the decode_token NaN regression that only shows up when
+            // Q4_KF attention bytes hit the encode_single_proj path.
             let is_v = key.contains("v_proj") || key.contains("attn_v");
             let (q_data, format) = if is_v {
                 (quantize_q6_k(&padded), "Q6_K")
             } else {
                 (quantize_q4_k(&padded), "Q4_K")
             };
+            let _ = quantize_q4_k_gguf as fn(&[f32]) -> Vec<u8>;
 
             out.write_all(&q_data)?;
             q4k_manifest.push(serde_json::json!({

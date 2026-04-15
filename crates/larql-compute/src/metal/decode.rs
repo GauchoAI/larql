@@ -894,6 +894,7 @@ impl MetalBackend {
                 eprintln!("[readback-ch] {:<14} {}", name, vals.join(" "));
             }
             for (name, buf) in [
+                ("norm_f32_buf", &norm_f32_buf),
                 ("q_out", &q_out),
                 ("k_out", &k_out),
                 ("v_out", &v_out),

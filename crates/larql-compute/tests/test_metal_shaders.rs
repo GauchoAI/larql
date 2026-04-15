@@ -2040,20 +2040,23 @@ fn decode_token_real_layer0_produces_finite() {
     let attn_file = std::fs::File::open(dir.join("attn_weights_q4k.bin")).unwrap();
     let attn_mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&attn_file).unwrap() });
 
-    let find_q4k = |key_needle: &str| -> (usize, usize, &str) {
+    let find_q4k = |key_needle: &str| -> (usize, usize, larql_compute::QuantFormat) {
         let e = q4k_manifest.iter().find(|e|
             e.get("key").and_then(|k| k.as_str()).is_some_and(|k| k.contains("layers.0") && k.contains(key_needle))
         ).unwrap_or_else(|| panic!("missing q4k {key_needle}"));
         let offset = e["offset"].as_u64().unwrap() as usize;
         let length = e["length"].as_u64().unwrap() as usize;
-        let format = e.get("format").and_then(|v| v.as_str()).unwrap_or("Q4_K");
-        let _ = format;
-        (offset, length, "")
+        let format = match e.get("format").and_then(|v| v.as_str()) {
+            Some("Q6_K") => larql_compute::QuantFormat::Q6_K,
+            Some("Q4_KF") | Some("Q4_K_GGUF") => larql_compute::QuantFormat::Q4_KF,
+            _ => larql_compute::QuantFormat::Q4_K,
+        };
+        (offset, length, format)
     };
-    let (q_off, q_len, _) = find_q4k("q_proj");
-    let (k_off, k_len, _) = find_q4k("k_proj");
-    let (v_off, v_len, _) = find_q4k("v_proj");
-    let (o_off, o_len, _) = find_q4k("o_proj");
+    let (q_off, q_len, q_fmt) = find_q4k("q_proj");
+    let (k_off, k_len, k_fmt) = find_q4k("k_proj");
+    let (v_off, v_len, v_fmt) = find_q4k("v_proj");
+    let (o_off, o_len, o_fmt) = find_q4k("o_proj");
     let wq_bytes = &attn_mmap[q_off..q_off + q_len];
     let wk_bytes = &attn_mmap[k_off..k_off + k_len];
     let wv_bytes = &attn_mmap[v_off..v_off + v_len];
@@ -2061,31 +2064,42 @@ fn decode_token_real_layer0_produces_finite() {
     println!("Q4K attn layer 0: q={}B k={}B v={}B o={}B", q_len, k_len, v_len, o_len);
 
     // ── 3. Layer 0 FFN weights from interleaved_q4k.bin ──
-    // Per-layer layout: [gate Q4_K | up Q4_K | down Q6_K]. Sizes computed from dims.
-    let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 148; // Q4_K = 148B/256vals
-    let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210; // Q6_K = 210B/256vals
-    // Layer size: gate + up (Q4_K) + down (Q6_K)
-    let layer_bytes = 2 * q4k_bytes_per_matrix + q6k_bytes_per_matrix;
-
+    // Detect layout from file size (Q4_K 148 B, Q4_KF 144 B, Q6_K 210 B per 256 vals).
     let inter_file = std::fs::File::open(dir.join("interleaved_q4k.bin")).unwrap();
     let inter_mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&inter_file).unwrap() });
+    let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 148;
+    let q4kf_bytes_per_matrix = (inter * hidden).div_ceil(256) * 144;
+    let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210;
+    let num_layers_in_file = 34;
+    let file_per_layer = inter_mmap.len() / num_layers_in_file;
+    let (gate_bytes_per, up_bytes_per, down_bytes_per, layer_gate_fmt, layer_up_fmt) =
+        if file_per_layer == 2 * q4kf_bytes_per_matrix + q6k_bytes_per_matrix {
+            (q4kf_bytes_per_matrix, q4kf_bytes_per_matrix, q6k_bytes_per_matrix,
+             larql_compute::QuantFormat::Q4_KF, larql_compute::QuantFormat::Q4_KF)
+        } else if file_per_layer == 2 * q4k_bytes_per_matrix + q6k_bytes_per_matrix {
+            (q4k_bytes_per_matrix, q4k_bytes_per_matrix, q6k_bytes_per_matrix,
+             larql_compute::QuantFormat::Q4_K, larql_compute::QuantFormat::Q4_K)
+        } else {
+            panic!("unknown FFN layout file_per_layer={file_per_layer}")
+        };
+    let layer_bytes = gate_bytes_per + up_bytes_per + down_bytes_per;
     let inter_total = inter_mmap.len();
     println!("interleaved_q4k.bin: {}B total, layer 0 computed bytes={}B", inter_total, layer_bytes);
 
     // Layer 0 offsets
-    let gate_bytes = &inter_mmap[0..q4k_bytes_per_matrix];
-    let up_bytes = &inter_mmap[q4k_bytes_per_matrix..2*q4k_bytes_per_matrix];
-    let down_bytes = &inter_mmap[2*q4k_bytes_per_matrix..2*q4k_bytes_per_matrix + q6k_bytes_per_matrix];
+    let gate_bytes = &inter_mmap[0..gate_bytes_per];
+    let up_bytes = &inter_mmap[gate_bytes_per..gate_bytes_per + up_bytes_per];
+    let down_bytes = &inter_mmap[gate_bytes_per + up_bytes_per..layer_bytes];
 
     // ── 4. Construct FullPipelineLayer (Gemma 3 config) ──
     let (_q8_x, q8_scales) = q4::quantize_to_q8(&vec![0.01f32; hidden]);
     let layer = larql_compute::FullPipelineLayer {
-        wq: larql_compute::QuantWeight { data: wq_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
-        wk: larql_compute::QuantWeight { data: wk_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
-        wv: larql_compute::QuantWeight { data: wv_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q6_K },
-        wo: larql_compute::QuantWeight { data: wo_bytes, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
-        gate: larql_compute::QuantWeight { data: gate_bytes, scales: None, format: larql_compute::QuantFormat::Q4_K },
-        up: larql_compute::QuantWeight { data: up_bytes, scales: None, format: larql_compute::QuantFormat::Q4_K },
+        wq: larql_compute::QuantWeight { data: wq_bytes, scales: Some(&q8_scales), format: q_fmt },
+        wk: larql_compute::QuantWeight { data: wk_bytes, scales: Some(&q8_scales), format: k_fmt },
+        wv: larql_compute::QuantWeight { data: wv_bytes, scales: Some(&q8_scales), format: v_fmt },
+        wo: larql_compute::QuantWeight { data: wo_bytes, scales: Some(&q8_scales), format: o_fmt },
+        gate: larql_compute::QuantWeight { data: gate_bytes, scales: None, format: layer_gate_fmt },
+        up: larql_compute::QuantWeight { data: up_bytes, scales: None, format: layer_up_fmt },
         down: larql_compute::QuantWeight { data: down_bytes, scales: None, format: larql_compute::QuantFormat::Q6_K },
         input_norm: &input_norm,
         post_attn_norm: &post_attn_norm,
@@ -2680,6 +2694,145 @@ fn decode_token_real_layer0_produces_finite() {
     let _ = metal_raw;
 }
 
+/// Q4_KF (GGUF) parity on REAL Gemma 3 L0 q_proj bytes (rebuilt to Q4_KF).
+/// Reproduces the exact dispatch decode_token performs in gpuprefill.
+#[test]
+#[ignore]
+fn q4kf_gguf_real_q_proj_metal_matches_cpu() {
+    let vindex_path = std::env::var("LARQL_VINDEX_PATH").expect("set LARQL_VINDEX_PATH");
+    let dir = std::path::Path::new(&vindex_path);
+
+    // Load Q4_KF manifest entry for layer 0 q_proj.
+    let q4k_manifest: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("attn_weights_q4k_manifest.json")).unwrap()
+    ).unwrap();
+    let entry = q4k_manifest.iter().find(|e|
+        e.get("key").and_then(|k| k.as_str()).is_some_and(|k| k.contains("layers.0.self_attn.q_proj"))
+    ).unwrap();
+    assert_eq!(entry.get("format").and_then(|v| v.as_str()), Some("Q4_KF"));
+    let offset = entry["offset"].as_u64().unwrap() as usize;
+    let length = entry["length"].as_u64().unwrap() as usize;
+    let shape = entry["shape"].as_array().unwrap();
+    let n = shape[0].as_u64().unwrap() as usize; // rows = q_dim
+    let k = shape[1].as_u64().unwrap() as usize; // cols = hidden
+
+    let attn_file = std::fs::File::open(dir.join("attn_weights_q4k.bin")).unwrap();
+    let attn_mmap = unsafe { memmap2::Mmap::map(&attn_file).unwrap() };
+    let w_bytes = &attn_mmap[offset..offset + length];
+    println!("[q4kf-real] q_proj: n={n} k={k} length={length}");
+
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.007).sin() * 20.0).collect();
+
+    // CPU reference
+    let cpu_out = larql_compute::cpu::ops::q4k_matvec::dispatch_gguf(w_bytes, &x, n, k);
+
+    // Metal q4kf_proj
+    let device = metal::Device::system_default().expect("metal");
+    let src = larql_compute::metal::shaders::all_shaders();
+    let lib = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
+    let pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("q4kf_proj", None).unwrap()
+    ).unwrap();
+    let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+    let buf_w = device.new_buffer_with_data(
+        w_bytes.as_ptr() as *const std::ffi::c_void,
+        w_bytes.len() as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let buf_x = bufs.transient_from_f32(&x);
+    let buf_out = bufs.output((n * 4) as u64);
+    let n_val = n as u32;
+    let k_val = k as u32;
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&buf_w), 0);
+    enc.set_buffer(1, Some(&buf_x), 0);
+    enc.set_buffer(2, Some(&buf_out), 0);
+    enc.set_bytes(3, 4, &n_val as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
+    let n_tgs = (n as u64).div_ceil(4);
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(n_tgs, 1, 1),
+        metal::MTLSize::new(64, 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+    let metal_out = larql_compute::metal::buffers::read_buffer_f32(&buf_out, n);
+    let nnan = metal_out.iter().filter(|v| !v.is_finite()).count();
+    let cpu_amax = cpu_out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let metal_amax = metal_out.iter().filter(|v| v.is_finite()).map(|v| v.abs()).fold(0.0f32, f32::max);
+    let diff = cpu_out.iter().zip(metal_out.iter()).filter(|(_, m)| m.is_finite())
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    println!("[q4kf-real] cpu_amax={cpu_amax:.3} metal_amax={metal_amax:.3} max_diff={diff:.5} nnan={nnan}");
+}
+
+/// Q4_KF (GGUF) parity: Metal q4kf_proj vs CPU dispatch_gguf on synthetic weights.
+/// Catches any encoding/decoding mismatch between quantize_q4_k_gguf and the
+/// Metal shader before we run the whole 34-layer pipeline with it.
+#[test]
+fn q4kf_gguf_metal_matches_cpu() {
+    let device = metal::Device::system_default().expect("metal");
+    let src = larql_compute::metal::shaders::all_shaders();
+    let lib = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
+    let pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("q4kf_proj", None).unwrap()
+    ).unwrap();
+    let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+
+    let n = 2048; // Gemma 3 q_dim
+    let k = 2560; // Gemma 3 hidden (10 super-blocks per row)
+    let w: Vec<f32> = (0..n * k).map(|i| {
+        let t = i as f32 * 0.0013;
+        0.05 * t.sin() + if i % 37 == 0 { 0.25 * t.cos().signum() } else { 0.0 }
+    }).collect();
+    let w_gguf = larql_compute::cpu::ops::q4_common::quantize_q4_k_gguf(&w);
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.007).sin() * 20.0).collect();
+
+    let cpu_out = larql_compute::cpu::ops::q4k_matvec::dispatch_gguf(&w_gguf, &x, n, k);
+
+    let buf_w = device.new_buffer_with_data(
+        w_gguf.as_ptr() as *const std::ffi::c_void,
+        w_gguf.len() as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let buf_x = bufs.transient_from_f32(&x);
+    let buf_out = bufs.output((n * 4) as u64);
+    let n_val = n as u32;
+    let k_val = k as u32;
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&buf_w), 0);
+    enc.set_buffer(1, Some(&buf_x), 0);
+    enc.set_buffer(2, Some(&buf_out), 0);
+    enc.set_bytes(3, 4, &n_val as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
+    let n_tgs = (n as u64).div_ceil(4); // q4kf_qkv_proj: 4 rows/TG, 64 threads/TG
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(n_tgs, 1, 1),
+        metal::MTLSize::new(64, 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let metal_out = larql_compute::metal::buffers::read_buffer_f32(&buf_out, n);
+    let n_nan = metal_out.iter().filter(|v| !v.is_finite()).count();
+    let cpu_amax = cpu_out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let metal_amax = metal_out.iter().filter(|v| v.is_finite()).map(|v| v.abs()).fold(0.0f32, f32::max);
+    let diff = cpu_out.iter().zip(metal_out.iter())
+        .filter(|(_, m)| m.is_finite())
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    println!("[q4kf-parity] cpu_amax={cpu_amax:.3} metal_amax={metal_amax:.3} max_diff={diff:.5} metal_nonfinite={n_nan}");
+    assert_eq!(n_nan, 0, "Metal q4kf_proj produced {n_nan} non-finite values");
+    assert!(diff < 0.01 * cpu_amax.max(1.0),
+        "Metal q4kf_proj diverges from CPU dispatch_gguf: max_diff={diff:.5}");
+}
+
 /// Load all 34 real Gemma 3 layers and run decode_token vs a CPU-backend-ops
 /// reference on the same BOS-like synthetic input. First divergent layer
 /// pinpoints which per-layer variable (rope_base, sliding_window, weight
@@ -2761,38 +2914,50 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
     ).unwrap();
     let attn_file = std::fs::File::open(dir.join("attn_weights_q4k.bin")).unwrap();
     let attn_mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&attn_file).unwrap() });
-    let find_attn = |l: usize, key: &str| -> (usize, usize) {
+    let find_attn = |l: usize, key: &str| -> (usize, usize, larql_compute::QuantFormat) {
         let prefix = format!("layers.{l}.");
         let e = q4k_manifest.iter().find(|e|
             e.get("key").and_then(|k| k.as_str())
                 .is_some_and(|k| k.starts_with(&prefix) && k.contains(key))
         ).unwrap_or_else(|| panic!("missing q4k L{l} {key}"));
-        (e["offset"].as_u64().unwrap() as usize, e["length"].as_u64().unwrap() as usize)
+        let format = match e.get("format").and_then(|v| v.as_str()) {
+            Some("Q6_K") => larql_compute::QuantFormat::Q6_K,
+            Some("Q4_KF") | Some("Q4_K_GGUF") => larql_compute::QuantFormat::Q4_KF,
+            _ => larql_compute::QuantFormat::Q4_K,
+        };
+        (e["offset"].as_u64().unwrap() as usize,
+         e["length"].as_u64().unwrap() as usize, format)
     };
-    let mut wq_offs: Vec<(usize, usize)> = (0..num_layers).map(|l| find_attn(l, "q_proj")).collect();
-    let mut wk_offs: Vec<(usize, usize)> = (0..num_layers).map(|l| find_attn(l, "k_proj")).collect();
-    let mut wv_offs: Vec<(usize, usize)> = (0..num_layers).map(|l| find_attn(l, "v_proj")).collect();
-    let mut wo_offs: Vec<(usize, usize)> = (0..num_layers).map(|l| find_attn(l, "o_proj")).collect();
+    let mut wq_offs: Vec<(usize, usize, larql_compute::QuantFormat)> = (0..num_layers).map(|l| find_attn(l, "q_proj")).collect();
+    let mut wk_offs: Vec<(usize, usize, larql_compute::QuantFormat)> = (0..num_layers).map(|l| find_attn(l, "k_proj")).collect();
+    let mut wv_offs: Vec<(usize, usize, larql_compute::QuantFormat)> = (0..num_layers).map(|l| find_attn(l, "v_proj")).collect();
+    let mut wo_offs: Vec<(usize, usize, larql_compute::QuantFormat)> = (0..num_layers).map(|l| find_attn(l, "o_proj")).collect();
 
     // FFN interleaved weights per layer. Detect FFN layout from file size.
     let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 148;
+    let q4kf_bytes_per_matrix = (inter * hidden).div_ceil(256) * 144;
     let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210;
     let inter_file = std::fs::File::open(dir.join("interleaved_q4k.bin")).unwrap();
     let inter_mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&inter_file).unwrap() });
     let file_per_layer = inter_mmap.len() / num_layers;
-    let all_q6k = file_per_layer == q6k_bytes_per_matrix * 3;
-    let mixed = file_per_layer == 2 * q4k_bytes_per_matrix + q6k_bytes_per_matrix;
-    let (gate_bytes_per, up_bytes_per, down_bytes_per, gate_format, up_format) = if all_q6k {
-        (q6k_bytes_per_matrix, q6k_bytes_per_matrix, q6k_bytes_per_matrix,
-         larql_compute::QuantFormat::Q6_K, larql_compute::QuantFormat::Q6_K)
-    } else if mixed {
-        (q4k_bytes_per_matrix, q4k_bytes_per_matrix, q6k_bytes_per_matrix,
-         larql_compute::QuantFormat::Q4_K, larql_compute::QuantFormat::Q4_K)
-    } else {
-        panic!("unknown FFN layout: file_per_layer={file_per_layer}");
-    };
+    let (gate_bytes_per, up_bytes_per, down_bytes_per, gate_format, up_format) =
+        if file_per_layer == 2 * q4kf_bytes_per_matrix + q6k_bytes_per_matrix {
+            (q4kf_bytes_per_matrix, q4kf_bytes_per_matrix, q6k_bytes_per_matrix,
+             larql_compute::QuantFormat::Q4_KF, larql_compute::QuantFormat::Q4_KF)
+        } else if file_per_layer == q4kf_bytes_per_matrix * 3 {
+            (q4kf_bytes_per_matrix, q4kf_bytes_per_matrix, q4kf_bytes_per_matrix,
+             larql_compute::QuantFormat::Q4_KF, larql_compute::QuantFormat::Q4_KF)
+        } else if file_per_layer == q6k_bytes_per_matrix * 3 {
+            (q6k_bytes_per_matrix, q6k_bytes_per_matrix, q6k_bytes_per_matrix,
+             larql_compute::QuantFormat::Q6_K, larql_compute::QuantFormat::Q6_K)
+        } else if file_per_layer == 2 * q4k_bytes_per_matrix + q6k_bytes_per_matrix {
+            (q4k_bytes_per_matrix, q4k_bytes_per_matrix, q6k_bytes_per_matrix,
+             larql_compute::QuantFormat::Q4_K, larql_compute::QuantFormat::Q4_K)
+        } else {
+            panic!("unknown FFN layout: file_per_layer={file_per_layer}");
+        };
     let per_layer = gate_bytes_per + up_bytes_per + down_bytes_per;
-    println!("FFN layout: gate={}B up={}B down={}B per_layer={}B (all_q6k={all_q6k})",
+    println!("FFN layout: gate={}B up={}B down={}B per_layer={}B gate_fmt={gate_format:?}",
         gate_bytes_per, up_bytes_per, down_bytes_per, per_layer);
 
     // Gemma 3 per-layer rope_base: layers where (l+1) % 6 == 0 are full attention
@@ -2805,10 +2970,10 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
 
     // Construct FullPipelineLayer for each of the 34 layers.
     let layers: Vec<larql_compute::FullPipelineLayer<'_>> = (0..num_layers).map(|l| {
-        let (q_off, q_len) = wq_offs[l];
-        let (k_off, k_len) = wk_offs[l];
-        let (v_off, v_len) = wv_offs[l];
-        let (o_off, o_len) = wo_offs[l];
+        let (q_off, q_len, q_fmt) = wq_offs[l];
+        let (k_off, k_len, k_fmt) = wk_offs[l];
+        let (v_off, v_len, v_fmt) = wv_offs[l];
+        let (o_off, o_len, o_fmt) = wo_offs[l];
         let wq = &attn_mmap[q_off..q_off + q_len];
         let wk = &attn_mmap[k_off..k_off + k_len];
         let wv = &attn_mmap[v_off..v_off + v_len];
@@ -2818,10 +2983,10 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
         let up = &inter_mmap[base + gate_bytes_per..base + gate_bytes_per + up_bytes_per];
         let down = &inter_mmap[base + gate_bytes_per + up_bytes_per..base + per_layer];
         larql_compute::FullPipelineLayer {
-            wq: larql_compute::QuantWeight { data: wq, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
-            wk: larql_compute::QuantWeight { data: wk, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
-            wv: larql_compute::QuantWeight { data: wv, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q6_K },
-            wo: larql_compute::QuantWeight { data: wo, scales: Some(&q8_scales), format: larql_compute::QuantFormat::Q4_K },
+            wq: larql_compute::QuantWeight { data: wq, scales: Some(&q8_scales), format: q_fmt },
+            wk: larql_compute::QuantWeight { data: wk, scales: Some(&q8_scales), format: k_fmt },
+            wv: larql_compute::QuantWeight { data: wv, scales: Some(&q8_scales), format: v_fmt },
+            wo: larql_compute::QuantWeight { data: wo, scales: Some(&q8_scales), format: o_fmt },
             gate: larql_compute::QuantWeight { data: gate, scales: None, format: gate_format },
             up: larql_compute::QuantWeight { data: up, scales: None, format: up_format },
             down: larql_compute::QuantWeight { data: down, scales: None, format: larql_compute::QuantFormat::Q6_K },
@@ -2889,12 +3054,19 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
     let cpu_ref: &dyn ComputeBackend = &cpu_be;
     let mut h: Vec<f32> = x.clone();
     let mut max_abs_diff_so_far: f32 = 0.0;
-    // Dispatch matvec based on QuantFormat (Q4_K / Q6_K).
+    // Dispatch matvec based on QuantFormat (Q4_K / Q4_KF (GGUF) / Q6_K).
     fn matvec(be: &dyn ComputeBackend, w: &larql_compute::QuantWeight<'_>,
               x: &[f32], rows: usize, k: usize) -> Vec<f32> {
+        let _ = be;
         match w.format {
-            larql_compute::QuantFormat::Q6_K => be.q6k_matvec(w.data, x, rows, k).unwrap(),
-            _ => be.q4k_matvec(w.data, x, rows, k).unwrap(),
+            larql_compute::QuantFormat::Q6_K => {
+                // Scalar Q6_K reference.
+                larql_compute::cpu::ops::q6k_matvec::dispatch(w.data, x, rows, k)
+            }
+            larql_compute::QuantFormat::Q4_KF => {
+                larql_compute::cpu::ops::q4k_matvec::dispatch_gguf(w.data, x, rows, k)
+            }
+            _ => larql_compute::cpu::ops::q4k_matvec::dispatch(w.data, x, rows, k),
         }
     }
     for (l, layer) in layers.iter().enumerate() {

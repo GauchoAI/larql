@@ -157,6 +157,56 @@ fn q4k_dequant_vs_original_accuracy() {
 
 #[test]
 #[ignore]
+fn q4k_gguf_dequant_vs_original_accuracy() {
+    // Compares a *fresh* GGUF Q4_K quantisation of the real f16 q_proj against
+    // the source. If rel max err is ~1-2% we've matched llama.cpp Q4_K_M quality;
+    // if it's 3-5% we're still limited by the iterative search or packing.
+    let vindex = std::env::var("LARQL_VINDEX_PATH").expect("set LARQL_VINDEX_PATH");
+    let dir = std::path::Path::new(&vindex);
+
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("weight_manifest.json")).unwrap()
+    ).unwrap();
+    let entry = manifest.iter().find(|e|
+        e.get("file").and_then(|f| f.as_str()) == Some("attn_weights.bin")
+            && e.get("key").and_then(|k| k.as_str()).is_some_and(|k| k.contains("layers.0.self_attn.q_proj"))
+    ).unwrap();
+    let offset = entry["offset"].as_u64().unwrap() as usize;
+    let length = entry["length"].as_u64().unwrap() as usize;
+    let shape = entry["shape"].as_array().unwrap();
+    let rows = shape[0].as_u64().unwrap() as usize;
+    let cols = shape[1].as_u64().unwrap() as usize;
+    let src_file = std::fs::File::open(dir.join("attn_weights.bin")).unwrap();
+    let src_mmap = unsafe { memmap2::Mmap::map(&src_file).unwrap() };
+    let orig_f32: Vec<f32> = larql_models::quant::half::decode_f16(&src_mmap[offset..offset + length]);
+
+    // Quantise fresh (no disk roundtrip needed — this tests the quantiser/dequantiser pair).
+    let q_bytes = larql_compute::cpu::ops::q4_common::quantize_q4_k_gguf(&orig_f32);
+
+    // Recover each column via one-hot CPU dispatch_gguf and compare to source.
+    let mut max_abs_err = 0.0f32;
+    let mut sum_sq = 0.0f64;
+    let mut n = 0usize;
+    for &col in &[0usize, 1, 100, 500, 1000, 2000, 2559] {
+        if col >= cols { continue; }
+        let mut xv = vec![0.0f32; cols];
+        xv[col] = 1.0;
+        let o = larql_compute::cpu::ops::q4k_matvec::dispatch_gguf(&q_bytes, &xv, rows, cols);
+        for r in 0..rows {
+            let err = (orig_f32[r * cols + col] - o[r]).abs();
+            max_abs_err = max_abs_err.max(err);
+            sum_sq += (err as f64).powi(2);
+            n += 1;
+        }
+    }
+    let rms = (sum_sq / n as f64).sqrt() as f32;
+    let amax = orig_f32.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    println!("q_proj L0 GGUF Q4K: amax={amax:.4}  max_err={max_abs_err:.4}  rms={rms:.6}  rel_max={:.2}%",
+        100.0 * max_abs_err / amax.max(1e-6));
+}
+
+#[test]
+#[ignore]
 fn q6k_dequant_vs_original_accuracy() {
     // Same as q4k_dequant test but for v_proj layer 0 (Q6_K).
     let vindex = std::env::var("LARQL_VINDEX_PATH").expect("set LARQL_VINDEX_PATH");

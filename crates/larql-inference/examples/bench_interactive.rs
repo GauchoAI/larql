@@ -160,6 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let text = parse_quoted(rest);
                 let enc = tokenizer.encode(text.as_str(), true).map_err(|e| e.to_string())?;
                 let ids: Vec<u32> = enc.get_ids().to_vec();
+                eprintln!("[cpupredict] input token IDs: {:?}", ids);
                 let t = Instant::now();
                 let r = larql_inference::predict(weights, tokenizer, &ids, 5);
                 let ms = t.elapsed().as_secs_f64() * 1000.0;

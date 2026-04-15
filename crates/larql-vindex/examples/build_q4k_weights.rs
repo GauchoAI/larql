@@ -81,14 +81,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 f32_data.to_vec()
             };
 
-            // V → Q6_K, others → Q4_KF (llama.cpp 144-byte GGUF layout).
-            let is_v = key.contains("v_proj") || key.contains("attn_v");
-            let (q_data, format) = if is_v {
-                (quantize_q6_k(&padded), "Q6_K")
-            } else {
-                (quantize_q4_k_gguf(&padded), "Q4_KF")
-            };
-            let _ = quantize_q4_k as fn(&[f32]) -> Vec<u8>;
+            // All attention → Q6_K (1% max dequant error). Highest-precision
+            // attention quantisation we have; model fidelity test.
+            let (q_data, format) = (quantize_q6_k(&padded), "Q6_K");
+            let _ = (key, quantize_q4_k as fn(&[f32]) -> Vec<u8>, quantize_q4_k_gguf as fn(&[f32]) -> Vec<u8>);
 
             out.write_all(&q_data)?;
             q4k_manifest.push(serde_json::json!({
@@ -152,13 +148,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         f32_data.to_vec()
                     };
 
-                    // Q4_KF (llama.cpp GGUF) for gate/up, Q6_K for down.
-                    let q_data = if *name == "down" {
-                        quantize_q6_k(&padded)
-                    } else {
-                        quantize_q4_k_gguf(&padded)
-                    };
-                    let _ = quantize_q4_k as fn(&[f32]) -> Vec<u8>;
+                    // All FFN → Q6_K.
+                    let q_data = quantize_q6_k(&padded);
+                    let _ = (name, quantize_q4_k as fn(&[f32]) -> Vec<u8>, quantize_q4_k_gguf as fn(&[f32]) -> Vec<u8>);
 
                     out.write_all(&q_data)?;
                     total_bytes += q_data.len();

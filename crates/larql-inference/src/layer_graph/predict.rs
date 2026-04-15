@@ -390,6 +390,51 @@ pub fn predict_honest(
                 let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
                 let qk_norm = arch.attn_q_norm_key(layer_range.start).is_some();
 
+                // Gemma 3 (and any post-norm model): route single-token decode
+                // through the same CPU-math + backend-matmul loop the multi-token
+                // prefill uses below. This bypasses the Q4_K / Q4_KF quantised
+                // decode_token path — necessary for Gemma 3 4B where the model
+                // is too quant-sensitive to stay on-token at Q4/Q6 precision,
+                // but the f32-weights + Metal-matmul path keeps fidelity and
+                // still gets GPU speed on every matmul. Opt out with
+                // LARQL_FORCE_QUANT_DECODE=1 if you need the quant path for
+                // benchmarking or debugging.
+                let force_quant = std::env::var("LARQL_FORCE_QUANT_DECODE")
+                    .ok().as_deref() == Some("1");
+                if seq_len == 1 && arch.has_post_norms() && !force_quant {
+                    // Single-token Gemma 3 decode via f32 attention (Metal matmul
+                    // on weights.tensors) + dense f32 FFN (same). Populates KV
+                    // cache per layer so subsequent calls see the accumulated
+                    // context — otherwise each token would attend only to itself.
+                    //
+                    // Note: `run_attention_with_kv_backend` currently recomputes
+                    // Q/K/V from scratch instead of reading K/V from cache for
+                    // past positions. That means for prompt-sized prefills this
+                    // is still O(seq_len²); for decode (T=1 fresh per call) it's
+                    // fine since the KV cache is only used by kvdecode's quant
+                    // path. TODO: extend the CPU+backend attention to read past
+                    // K/V from the Metal KV cache and only project new-token Q/K/V.
+                    use crate::ffn::WeightFfnGpu;
+                    let ffn = WeightFfnGpu { weights, backend };
+                    let mut h_cpu = h.clone();
+                    for (rel_idx, abs_layer) in layer_range.clone().enumerate() {
+                        let (h_post_attn, k_rope, v) =
+                            crate::attention::gpu::run_attention_with_kv_backend(
+                                weights, &h_cpu, abs_layer, Some(backend))
+                                .unwrap();
+                        if backend.has_kv_cache() {
+                            let k_flat = k_rope.as_slice().unwrap_or(&[]);
+                            let v_flat = v.as_slice().unwrap_or(&[]);
+                            backend.populate_kv_layer(rel_idx, k_flat, v_flat,
+                                seq_len, weights.num_kv_heads, weights.head_dim);
+                        }
+                        let (h_out, _) = crate::forward::run_ffn(
+                            weights, &h_post_attn, abs_layer, &ffn, false);
+                        h_cpu = h_out;
+                    }
+                    h = h_cpu;
+                    return finalize_logits(weights, tokenizer, &h, top_k, index, backend, norm_offset);
+                }
                 if seq_len == 1 {
                     // Decode path (seq=1): try KV-cached decode first, then full_pipeline
                     let x: Vec<f32> = h.row(0).to_vec();

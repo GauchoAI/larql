@@ -146,15 +146,16 @@ fn make_qkx2_quants(
     assert_eq!(l_out.len(), n);
     let nmax_f = nmax as f32;
 
-    // Importance weights (x² — as in llama.cpp `use_mad=false` branch).
-    // A uniform weight would work too but biases small-value channels; x²
-    // mirrors the downstream matmul where large values contribute more.
+    // Importance weights — llama.cpp's Q4_K quantiser uses |x|, not x². Using
+    // x² over-biases the spike channels and leaves the smooth background
+    // under-represented, producing systematically biased output at rms time
+    // (we saw 5% max with x², vs. ~1% with |x| which is what llama.cpp gets).
     let mut sum_w = 0.0f32;
     let mut sum_x = 0.0f32;
     let mut x_min = f32::INFINITY;
     let mut x_max = f32::NEG_INFINITY;
     let weights: Vec<f32> = x.iter().map(|v| {
-        let w = *v * *v;
+        let w = v.abs();
         sum_w += w;
         sum_x += w * v;
         if *v < x_min { x_min = *v; }
@@ -404,11 +405,26 @@ pub fn quantize_q6_k(data: &[f32]) -> Vec<u8> {
 
 /// Quantize f32 to GGUF Q4_K format (144 bytes per 256 values).
 ///
-/// GGUF layout: half d, half dmin, scales[12] (packed 6-bit scales+mins), qs[128].
-/// Scales and mins are packed into the SAME 12-byte array:
-///   bytes 0-3: lower 6 bits of scales 0-3
-///   bytes 4-7: lower 6 bits of scales 4-7
-///   bytes 8-11: upper 2 bits of scales + lower 4 bits of mins
+/// This is llama.cpp's `block_q4_K` byte layout — matches ggml-quants.c exactly.
+/// Our older 148-byte Q4_K layout (Ollama convention with 4-bit mins) is kept in
+/// `quantize_q4_k` for backward compatibility; this GGUF form is preferred for
+/// any model (e.g. Gemma 3) where the token distribution needs the extra 2 bits
+/// of min resolution to stay on-token against the f32 reference.
+///
+/// Layout (144 bytes):
+///   [0..1]    half d
+///   [2..3]    half dmin
+///   [4..15]   12 bytes: scales (0..3, 4..7) and mins (0..3, 4..7) each 6-bit, packed per llama.cpp
+///   [16..143] 128 bytes: 256 × 4-bit nibbles
+///
+/// Scale+min packing (see llama.cpp ggml-quants.c `quantize_row_q4_K_ref`):
+///   scales_bytes[0..3]:  bits 0-5 = low 6 of ls[0..3],  bits 6-7 = high 2 of ls[4..7]
+///   scales_bytes[4..7]:  bits 0-5 = low 6 of lm[0..3],  bits 6-7 = high 2 of lm[4..7]
+///   scales_bytes[8..11]: nibble 0 = low 4 of ls[4..7],  nibble 1 = low 4 of lm[4..7]
+///
+/// Per sub-block: iterative `make_qkx2_quants` refinement (same as `quantize_q4_k`),
+/// but with the 6-bit dmin (max=63) giving the needed extra precision over Q4_K's
+/// 4-bit mins (max=15).
 pub fn quantize_q4_k_gguf(data: &[f32]) -> Vec<u8> {
     assert!(data.len().is_multiple_of(256));
     let n_superblocks = data.len() / 256;
@@ -417,64 +433,112 @@ pub fn quantize_q4_k_gguf(data: &[f32]) -> Vec<u8> {
     for sb in 0..n_superblocks {
         let block = &data[sb * 256..(sb + 1) * 256];
 
-        // Per-sub-block min/max
+        // Per sub-block: iterative (scale, min) refinement — same algorithm
+        // the 148-byte quantize_q4_k uses.
+        let mut sub_scales = [0.0f32; 8];
         let mut sub_mins = [0.0f32; 8];
-        let mut sub_maxs = [0.0f32; 8];
+        let mut l_all = [0u8; 256];
         for j in 0..8 {
             let sub = &block[j * 32..(j + 1) * 32];
-            sub_mins[j] = sub.iter().copied().fold(f32::INFINITY, f32::min);
-            sub_maxs[j] = sub.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let (sc, mn) = make_qkx2_quants(
+                sub, 15, -1.0, 0.1, 20, &mut l_all[j * 32..(j + 1) * 32]);
+            sub_scales[j] = sc;
+            sub_mins[j] = mn;
         }
 
-        let global_max_range = sub_maxs.iter().zip(&sub_mins).map(|(a, b)| a - b).fold(0.0f32, f32::max);
-        let global_min = sub_mins.iter().copied().fold(f32::INFINITY, f32::min);
+        // Super-block d / dmin pack sub-block (scale, min) into 6-bit / 6-bit
+        // (both max 63, unlike Q4_K's 6/4 split).
+        let max_scale = sub_scales.iter().cloned().fold(0.0f32, f32::max);
+        let max_min = sub_mins.iter().cloned().fold(0.0f32, f32::max);
+        let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+        let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
+        let d = if inv_scale > 0.0 { 1.0 / inv_scale } else { 0.0 };
+        let dmin = if inv_min > 0.0 { 1.0 / inv_min } else { 0.0 };
 
-        let d = if global_max_range > 0.0 { global_max_range / 63.0 } else { 0.0 };
-        let dmin = if global_min < 0.0 { -global_min / 63.0 } else { 0.0 };
-
-        // Quantize scales and mins to 6-bit each
-        let mut q_scales = [0u8; 8];
-        let mut q_mins = [0u8; 8];
+        let mut ls = [0u8; 8];
+        let mut lm = [0u8; 8];
         for j in 0..8 {
-            let range = sub_maxs[j] - sub_mins[j];
-            q_scales[j] = if d > 0.0 { (range / d).round().clamp(0.0, 63.0) as u8 } else { 0 };
-            q_mins[j] = if dmin > 0.0 { (-sub_mins[j] / dmin).round().clamp(0.0, 63.0) as u8 } else { 0 };
+            ls[j] = (sub_scales[j] * inv_scale).round().clamp(0.0, 63.0) as u8;
+            lm[j] = (sub_mins[j] * inv_min).round().clamp(0.0, 63.0) as u8;
         }
 
-        // Write d, dmin as f16
+        // Write d, dmin as f16.
         out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
         out.extend_from_slice(&f32_to_f16(dmin).to_le_bytes());
 
-        // Pack scales[12]: GGUF format
-        // bytes 0-3: (scales[0..4] & 0x3F) | (mins[0..4] << 6)  — lower 6 of scale + lower 2 of min
-        // bytes 4-7: (scales[4..8] & 0x3F) | (mins[4..8] << 6)
-        // bytes 8-11: upper 4 bits of mins packed
+        // Pack 12-byte scales array — llama.cpp's exact encoding.
         let mut packed = [0u8; 12];
         for j in 0..4 {
-            packed[j] = (q_scales[j] & 0x3F) | ((q_mins[j] & 0x03) << 6);
-            packed[j + 4] = (q_scales[j + 4] & 0x3F) | ((q_mins[j + 4] & 0x03) << 6);
+            // scales 0..3: low 6 bits of ls[j], upper 2 bits of ls[j+4] in bits 6-7
+            packed[j] = (ls[j] & 0x3F) | ((ls[j + 4] >> 4) << 6);
+            // scales 4..7: low 6 bits of lm[j], upper 2 bits of lm[j+4] in bits 6-7
+            packed[j + 4] = (lm[j] & 0x3F) | ((lm[j + 4] >> 4) << 6);
+            // scales 8..11: low 4 bits of ls[j+4] in nibble 0, low 4 bits of lm[j+4] in nibble 1
+            packed[j + 8] = (ls[j + 4] & 0x0F) | ((lm[j + 4] & 0x0F) << 4);
         }
-        // bytes 8-11: pack upper bits of mins
-        packed[8] = ((q_mins[0] >> 2) & 0x0F) | (((q_mins[1] >> 2) & 0x0F) << 4);
-        packed[9] = ((q_mins[2] >> 2) & 0x0F) | (((q_mins[3] >> 2) & 0x0F) << 4);
-        packed[10] = ((q_mins[4] >> 2) & 0x0F) | (((q_mins[5] >> 2) & 0x0F) << 4);
-        packed[11] = ((q_mins[6] >> 2) & 0x0F) | (((q_mins[7] >> 2) & 0x0F) << 4);
         out.extend_from_slice(&packed);
 
-        // Quantize 256 values to 4-bit nibbles
+        // Quantize each value with the encoded (d·ls[j], dmin·lm[j]) scales.
+        // Collect 256 4-bit codes indexed by absolute position k = j*32 + i in
+        // the super-block, then pack them using llama.cpp's Q4_K qs layout:
+        //
+        //   qs[j/2 + l] = L[j+l] | (L[j+l+32] << 4)   for j in {0, 64}, l in [0..32)
+        //
+        // i.e. low nibble holds value k, high nibble holds value k+32. This pairs
+        // together positions from sub-blocks (0,1), (2,3), (4,5), (6,7). Our old
+        // layout paired consecutive values (0,1), (2,3), ..., within a sub-block
+        // — a different byte order that the Metal `q4kf_proj` shader doesn't
+        // accept.
+        let mut l_codes = [0u8; 256];
         for j in 0..8 {
-            let sc = d * q_scales[j] as f32;
-            let mn = dmin * q_mins[j] as f32;
-            let inv_sc = if sc > 0.0 { 1.0 / sc } else { 0.0 };
+            let sc = d * ls[j] as f32;
+            let mn = dmin * lm[j] as f32;
+            let inv_sc = if sc > 1e-30 { 1.0 / sc } else { 0.0 };
             let sub = &block[j * 32..(j + 1) * 32];
-            for i in 0..16 {
-                let v0 = ((sub[i * 2] + mn) * inv_sc).round().clamp(0.0, 15.0) as u8;
-                let v1 = ((sub[i * 2 + 1] + mn) * inv_sc).round().clamp(0.0, 15.0) as u8;
-                out.push(v0 | (v1 << 4));
+            for i in 0..32 {
+                l_codes[j * 32 + i] =
+                    ((sub[i] + mn) * inv_sc).round().clamp(0.0, 15.0) as u8;
             }
         }
+        // llama.cpp qs packing: 128 bytes, interleaving pairs of sub-blocks.
+        for sb_pair_start in [0usize, 64].iter() {
+            let j = *sb_pair_start;
+            for l in 0..32 {
+                let b = (l_codes[j + l] & 0x0F) | ((l_codes[j + l + 32] & 0x0F) << 4);
+                out.push(b);
+            }
+        }
+        // Sub-blocks (4,5) and (6,7) — another 64 bytes.
+        for sb_pair_start in [128usize, 192].iter() {
+            let j = *sb_pair_start;
+            for l in 0..32 {
+                let b = (l_codes[j + l] & 0x0F) | ((l_codes[j + l + 32] & 0x0F) << 4);
+                out.push(b);
+            }
+        }
+        let _ = l_all;
     }
     out
+}
+
+/// Dequantise one value from a GGUF Q4_K super-block. CPU reference used by the
+/// scalar matvec in `q4k_matvec_gguf`, the new-format dequant test, and the
+/// per-block diagnostics below.
+#[inline]
+pub fn gguf_q4k_unpack_scales_mins(scales: &[u8]) -> ([u8; 8], [u8; 8]) {
+    let mut ls = [0u8; 8];
+    let mut lm = [0u8; 8];
+    for j in 0..4 {
+        // ls[0..3]: low 6 bits of scales[0..3]
+        ls[j] = scales[j] & 0x3F;
+        // lm[0..3]: low 6 bits of scales[4..7]
+        lm[j] = scales[j + 4] & 0x3F;
+        // ls[4..7]: (scales[j] >> 6) upper 2 bits << 4 | (scales[j+8] low nibble) low 4 bits
+        ls[j + 4] = ((scales[j] >> 6) << 4) | (scales[j + 8] & 0x0F);
+        // lm[4..7]: (scales[j+4] >> 6) upper 2 bits << 4 | (scales[j+8] high nibble) low 4 bits
+        lm[j + 4] = ((scales[j + 4] >> 6) << 4) | ((scales[j + 8] >> 4) & 0x0F);
+    }
+    (ls, lm)
 }
 
 /// Convert Q4_K (148 bytes/block) to GGUF Q4_K (144 bytes/block) for fast GPU inference.

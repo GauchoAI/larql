@@ -99,7 +99,11 @@ pub fn resolve_attn_weights<'a>(
     layer: usize,
 ) -> Option<(QuantWeight<'a>, QuantWeight<'a>, QuantWeight<'a>, QuantWeight<'a>)> {
     fn to_format(s: &str) -> QuantFormat {
-        match s { "Q6_K" => QuantFormat::Q6_K, _ => QuantFormat::Q4_K }
+        match s {
+            "Q6_K" => QuantFormat::Q6_K,
+            "Q4_KF" | "Q4_K_GGUF" => QuantFormat::Q4_KF,
+            _ => QuantFormat::Q4_K,
+        }
     }
 
     if let Some([q, k, v, o]) = index.attn_q4k_layer_data(layer) {
@@ -165,20 +169,29 @@ pub fn build_pipeline_layers<'a>(
     ffn_format: QuantFormat,
 ) -> Vec<FullPipelineLayer<'a>> {
     let num_layers_in_file = weights.num_layers;
-    // Three supported FFN layouts, detected from the per-layer byte count:
-    //   uniform Q4K:  per_layer = 3 × q4_per_matrix (148 B × 256 vals each)
-    //   Q4K+Q4K+Q6K:  per_layer = 2 × q4_per_matrix + q6_per_matrix (Ollama)
-    //   all Q6K:      per_layer = 3 × q6_per_matrix (Gemma 3 hi-precision)
-    // q4_ffn_per_matrix is always the Q4K size; q6_per_matrix is inferred as
-    // q4 × (210/148). We compare per_layer against each candidate to pick.
+    // Supported FFN layouts (per-layer byte counts per 256 values × superblocks):
+    //   uniform Q4K Ollama (148 B): per_layer = 3 × q4_per_matrix
+    //   Q4K + Q4K + Q6K (Ollama):   per_layer = 2 × q4_per_matrix + q6_per_matrix
+    //   all Q6K:                    per_layer = 3 × q6_per_matrix
+    //   Q4KF + Q4KF + Q6K:          per_layer = 2 × q4kf_per_matrix + q6_per_matrix (llama.cpp)
+    //   uniform Q4KF:               per_layer = 3 × q4kf_per_matrix
+    // q4_ffn_per_matrix is the Ollama Q4K size (148). Q4KF (GGUF) is 144, ratio 144/148.
+    // q6_per_matrix is 210/148 × q4_per_matrix.
+    let q4kf_per_matrix = q4_ffn_per_matrix * 144 / 148;
     let q6_per_matrix = q4_ffn_per_matrix * 210 / 148;
     let uniform_q4_per_layer = q4_ffn_per_matrix * 3;
     let mixed_q4q6_per_layer = 2 * q4_ffn_per_matrix + q6_per_matrix;
     let uniform_q6_per_layer = q6_per_matrix * 3;
+    let mixed_q4kf_q6_per_layer = 2 * q4kf_per_matrix + q6_per_matrix;
+    let uniform_q4kf_per_layer = q4kf_per_matrix * 3;
     let actual_per_layer = q4_ffn_mmap.len() / num_layers_in_file.max(1);
     // Choose the layout whose per-layer size matches actual.
     let (gate_bytes, gate_format, up_bytes, up_format, down_bytes, down_format) =
-        if actual_per_layer == uniform_q6_per_layer {
+        if actual_per_layer == mixed_q4kf_q6_per_layer {
+            (q4kf_per_matrix, QuantFormat::Q4_KF, q4kf_per_matrix, QuantFormat::Q4_KF, q6_per_matrix, QuantFormat::Q6_K)
+        } else if actual_per_layer == uniform_q4kf_per_layer {
+            (q4kf_per_matrix, QuantFormat::Q4_KF, q4kf_per_matrix, QuantFormat::Q4_KF, q4kf_per_matrix, QuantFormat::Q4_KF)
+        } else if actual_per_layer == uniform_q6_per_layer {
             (q6_per_matrix, QuantFormat::Q6_K, q6_per_matrix, QuantFormat::Q6_K, q6_per_matrix, QuantFormat::Q6_K)
         } else if actual_per_layer == mixed_q4q6_per_layer {
             (q4_ffn_per_matrix, ffn_format, q4_ffn_per_matrix, ffn_format, q6_per_matrix, QuantFormat::Q6_K)

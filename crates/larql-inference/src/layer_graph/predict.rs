@@ -402,35 +402,28 @@ pub fn predict_honest(
                 let force_quant = std::env::var("LARQL_FORCE_QUANT_DECODE")
                     .ok().as_deref() == Some("1");
                 if seq_len == 1 && arch.has_post_norms() && !force_quant {
-                    // Single-token Gemma 3 decode via f32 attention (Metal matmul
-                    // on weights.tensors) + dense f32 FFN (same). Populates KV
-                    // cache per layer so subsequent calls see the accumulated
-                    // context — otherwise each token would attend only to itself.
-                    //
-                    // Note: `run_attention_with_kv_backend` currently recomputes
-                    // Q/K/V from scratch instead of reading K/V from cache for
-                    // past positions. That means for prompt-sized prefills this
-                    // is still O(seq_len²); for decode (T=1 fresh per call) it's
-                    // fine since the KV cache is only used by kvdecode's quant
-                    // path. TODO: extend the CPU+backend attention to read past
-                    // K/V from the Metal KV cache and only project new-token Q/K/V.
+                    // Single-token Gemma 3 decode via f32 attention + Metal matmul
+                    // + dense f32 FFN. Reads past K/V from the Metal KV cache and
+                    // appends the current token so subsequent calls see the full
+                    // accumulated context.
                     use crate::ffn::WeightFfnGpu;
                     let ffn = WeightFfnGpu { weights, backend };
                     let mut h_cpu = h.clone();
+                    let trace = std::env::var("LARQL_TRACE_LAYERS").ok().as_deref() == Some("1");
                     for (rel_idx, abs_layer) in layer_range.clone().enumerate() {
-                        let (h_post_attn, k_rope, v) =
-                            crate::attention::gpu::run_attention_with_kv_backend(
-                                weights, &h_cpu, abs_layer, Some(backend))
+                        let (h_post_attn, _past_len_after) =
+                            crate::attention::gpu::run_attention_kv_cached_f32(
+                                weights, &h_cpu, abs_layer, rel_idx, backend)
                                 .unwrap();
-                        if backend.has_kv_cache() {
-                            let k_flat = k_rope.as_slice().unwrap_or(&[]);
-                            let v_flat = v.as_slice().unwrap_or(&[]);
-                            backend.populate_kv_layer(rel_idx, k_flat, v_flat,
-                                seq_len, weights.num_kv_heads, weights.head_dim);
-                        }
                         let (h_out, _) = crate::forward::run_ffn(
                             weights, &h_post_attn, abs_layer, &ffn, false);
                         h_cpu = h_out;
+                        if trace {
+                            let pa_amax = h_post_attn.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                            let amax = h_cpu.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                            let nnan = h_cpu.iter().filter(|v| !v.is_finite()).count();
+                            eprintln!("[kvdec-L{abs_layer:02}] h_post_attn={pa_amax:.2} h_out={amax:.2} nnan={nnan}");
+                        }
                     }
                     h = h_cpu;
                     return finalize_logits(weights, tokenizer, &h, top_k, index, backend, norm_offset);

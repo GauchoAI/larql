@@ -73,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stdout.flush().ok();
 
     let mut last_prompt_tokens: Vec<u32> = Vec::new();
+    let mut last_prediction: Option<u32> = None;
 
     for line in stdin.lock().lines() {
         let line = match line { Ok(l) => l, Err(_) => break };
@@ -170,35 +171,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  cpupredict: {:.1}ms  ({} tokens, CPU forward::predict)", ms, ids.len());
             }
             "gpuprefill" => {
-                // Prefill-via-decode-loop: reset cache, then call decode_token once per
-                // prompt token in sequence. This keeps the entire forward pass in
-                // Q4K-quantized space (matching subsequent kvdecode) instead of the
-                // CPU-f16 mismatch that kvprefill creates.
+                // Full-prompt prefill in a SINGLE predict_honest call. For Gemma 3
+                // (post-norm) this routes through the CPU+backend-matmul multi-token
+                // path which handles cross-token attention correctly; for other
+                // models it goes through prefill_q4 (Q4_K GPU prefill).
+                // Populates the Metal KV cache for subsequent kvdecode calls.
                 backend.reset_kv_cache();
                 let text = parse_quoted(rest);
                 let enc = tokenizer.encode(text.as_str(), true).map_err(|e| e.to_string())?;
                 let ids: Vec<u32> = enc.get_ids().to_vec();
                 let cache = CachedLayerGraph::build(weights, &ids, &empty_cache_layers, &dense_ffn);
                 let t = Instant::now();
-                let mut last_preds: Vec<(String, f64)> = Vec::new();
-                let mut last_raw: Vec<(u32, f32, f64)> = Vec::new();
-                for (i, &tid) in ids.iter().enumerate() {
-                    let t_step = Instant::now();
-                    let r = larql_inference::layer_graph::predict::predict_honest(
-                        weights, tokenizer, &[tid], 5, &index, &*backend, &cache, 0..num_layers,
-                    );
-                    let ms = t_step.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("[gpuprefill tok {i}/{}  id={}  {:.1}ms]", ids.len(), tid, ms);
-                    last_preds = r.predictions.clone();
-                    last_raw = r.raw_predictions.clone();
-                }
+                let r = larql_inference::layer_graph::predict::predict_honest(
+                    weights, tokenizer, &ids, 5, &index, &*backend, &cache, 0..num_layers,
+                );
                 let total_ms = t.elapsed().as_secs_f64() * 1000.0;
-                for (i, (s, p)) in last_preds.iter().take(5).enumerate() {
+                for (i, (s, p)) in r.predictions.iter().take(5).enumerate() {
                     println!("  {:>2}. {:?}  {:.2}%", i+1, s, p * 100.0);
                 }
-                println!("  gpuprefill total: {:.1}ms  ({} tokens, KV populated via decode loop)", total_ms, ids.len());
+                println!("  gpuprefill total: {:.1}ms  ({} input tokens)", total_ms, ids.len());
                 last_prompt_tokens = ids;
-                let _ = last_raw;
+                last_prediction = r.raw_predictions.first().map(|&(tid, _, _)| tid);
             }
             "kvprefill" => {
                 let text = parse_quoted(rest);
@@ -223,7 +216,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     let mut per: Vec<f64> = Vec::with_capacity(n);
                     let cache = CachedLayerGraph::build(weights, &last_prompt_tokens, &empty_cache_layers, &dense_ffn);
-                    let mut next: u32 = last_prompt_tokens.last().copied().unwrap_or(1);
+                    // Start from the PREDICTED next token (from prompt/gpuprefill), not
+                    // the last prompt input. That way kvdecode continues the sentence
+                    // instead of re-processing the last input token.
+                    let mut next: u32 = last_prediction.unwrap_or_else(||
+                        last_prompt_tokens.last().copied().unwrap_or(1));
+                    eprintln!("[kvdecode] starting with next={next}, last_prompt_len={}",
+                        last_prompt_tokens.len());
                     for step in 0..n {
                         let input = vec![next];
                         let t = Instant::now();
@@ -234,7 +233,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         per.push(ms);
                         if let Some(&(tid, _, _)) = r.raw_predictions.first() {
                             let s = r.predictions.first().map(|(s,_)| s.clone()).unwrap_or_default();
-                            println!("  step {:>3}: tid={:>6} {:?} {:.0}ms", step+1, tid, s, ms);
+                            let top5: Vec<String> = r.predictions.iter().take(5)
+                                .map(|(t, p)| format!("{t:?} {:.1}%", p * 100.0)).collect();
+                            println!("  step {:>3}: tid={:>6} {:?} {:.0}ms  top5=[{}]",
+                                step+1, tid, s, ms, top5.join(", "));
                             next = tid;
                         } else {
                             println!("  step {:>3}: empty, stopping", step+1);

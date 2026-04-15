@@ -2694,6 +2694,197 @@ fn decode_token_real_layer0_produces_finite() {
     let _ = metal_raw;
 }
 
+/// Minimal 3-step repro: does input_norm + q4kf_proj + f16-read-back produce
+/// NaN in sequence on the same encoder, even when the two kernels separately
+/// don't? If this reproduces the NaN from decode_token's integration, the bug
+/// is in the dispatch-chain (e.g. buffer aliasing, threadgroup-state carry).
+#[test]
+#[ignore]
+fn inputnorm_then_q4kf_proj_same_encoder() {
+    let vindex_path = std::env::var("LARQL_VINDEX_PATH").expect("set LARQL_VINDEX_PATH");
+    let dir = std::path::Path::new(&vindex_path);
+
+    let hidden = 2560usize;
+    let q_dim = 2048usize;
+
+    // Load layer 0 input_norm weight (f16) and q_proj Q4_KF bytes.
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("weight_manifest.json")).unwrap()
+    ).unwrap();
+    fn decode_f16_inline(raw: &[u8]) -> Vec<f32> {
+        raw.chunks_exact(2).map(|b| {
+            let bits = u16::from_le_bytes([b[0], b[1]]);
+            let sign = (bits >> 15) & 0x1;
+            let exp = (bits >> 10) & 0x1F;
+            let mant = (bits & 0x3FF) as u32;
+            let f32_bits = if exp == 0 {
+                if mant == 0 { (sign as u32) << 31 } else {
+                    let mut m = mant; let mut e: i32 = -14;
+                    while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+                    let exp32 = (e + 127) as u32;
+                    ((sign as u32) << 31) | (exp32 << 23) | ((m & 0x3FF) << 13)
+                }
+            } else if exp == 0x1F {
+                ((sign as u32) << 31) | (0xFF << 23) | (mant << 13)
+            } else {
+                let exp32 = (exp as i32 - 15 + 127) as u32;
+                ((sign as u32) << 31) | (exp32 << 23) | (mant << 13)
+            };
+            f32::from_bits(f32_bits)
+        }).collect()
+    }
+    let find_vec = |key: &str| {
+        let e = manifest.iter().find(|e|
+            e.get("key").and_then(|k| k.as_str()) == Some(key)
+        ).unwrap();
+        let offset = e["offset"].as_u64().unwrap() as usize;
+        let length = e["length"].as_u64().unwrap() as usize;
+        let file_name = e["file"].as_str().unwrap();
+        let file = std::fs::File::open(dir.join(file_name)).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        decode_f16_inline(&mmap[offset..offset + length])
+    };
+    let input_norm = find_vec("layers.0.input_layernorm.weight");
+
+    let q4k_manifest: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("attn_weights_q4k_manifest.json")).unwrap()
+    ).unwrap();
+    let find_weight = |key: &str| {
+        let e = q4k_manifest.iter().find(|e|
+            e.get("key").and_then(|k| k.as_str()).is_some_and(|k| k.contains("layers.0") && k.contains(key))
+        ).unwrap();
+        let off = e["offset"].as_u64().unwrap() as usize;
+        let len = e["length"].as_u64().unwrap() as usize;
+        let fmt = e.get("format").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+        (off, len, fmt)
+    };
+    let (q_off, q_len, q_fmt) = find_weight("q_proj");
+    let (k_off_, k_len_, k_fmt) = find_weight("k_proj");
+    let (v_off_, v_len_, v_fmt) = find_weight("v_proj");
+    println!("[repro] q_proj format={q_fmt} k_proj format={k_fmt} v_proj format={v_fmt}");
+    let attn_file = std::fs::File::open(dir.join("attn_weights_q4k.bin")).unwrap();
+    let attn_mmap = unsafe { memmap2::Mmap::map(&attn_file).unwrap() };
+    let wq_bytes = &attn_mmap[q_off..q_off + q_len];
+    let wk_bytes = &attn_mmap[k_off_..k_off_ + k_len_];
+    let wv_bytes = &attn_mmap[v_off_..v_off_ + v_len_];
+
+    let x: Vec<f32> = (0..hidden).map(|i| ((i as f32 * 0.003).sin() * 20.0)).collect();
+
+    let device = metal::Device::system_default().unwrap();
+    let src = larql_compute::metal::shaders::all_shaders();
+    let lib = device.new_library_with_source(&src, &metal::CompileOptions::new()).unwrap();
+    let rms_pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("rms_norm", None).unwrap()
+    ).unwrap();
+    let proj_pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("q4kf_proj", None).unwrap()
+    ).unwrap();
+    let bufs = larql_compute::metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+
+    let buf_x = bufs.transient_from_f32(&x);
+    let buf_w_norm = bufs.transient_from_f32(&input_norm);
+    let buf_norm_out = bufs.output((hidden * 4) as u64);
+    let make_w = |bytes: &[u8]| device.new_buffer_with_data(
+        bytes.as_ptr() as *const std::ffi::c_void,
+        bytes.len() as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let buf_wq = make_w(wq_bytes);
+    let buf_wk = make_w(wk_bytes);
+    let buf_wv = make_w(wv_bytes);
+    let kv_dim = 1024usize;
+    let buf_q_out = bufs.output((q_dim * 4) as u64);
+    let buf_k_out = bufs.output((kv_dim * 4) as u64);
+    let buf_v_out = bufs.output((kv_dim * 4) as u64);
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+
+    // Step 1: input_norm(x, w) → norm_out
+    let hidden_u32 = hidden as u32;
+    let eps = 1e-6f32;
+    let offset_val = 1.0f32;
+    enc.set_compute_pipeline_state(&rms_pipeline);
+    enc.set_buffer(0, Some(&buf_x), 0);
+    enc.set_buffer(1, Some(&buf_w_norm), 0);
+    enc.set_buffer(2, Some(&buf_norm_out), 0);
+    enc.set_bytes(3, 4, &hidden_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &offset_val as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1),
+        metal::MTLSize::new(256u64.min(hidden as u64), 1, 1));
+
+    // Step 2-4: Q/K/V projections on SAME encoder as input_norm.
+    let q6k_pipeline = device.new_compute_pipeline_state_with_function(
+        &lib.get_function("q6k_matvec", None).unwrap()
+    ).unwrap();
+    // Q: q4kf_proj
+    let q_rows = q_dim as u32;
+    let k_val = hidden as u32;
+    enc.set_compute_pipeline_state(&proj_pipeline);
+    enc.set_buffer(0, Some(&buf_wq), 0);
+    enc.set_buffer(1, Some(&buf_norm_out), 0);
+    enc.set_buffer(2, Some(&buf_q_out), 0);
+    enc.set_bytes(3, 4, &q_rows as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
+    let n_tgs_q = (q_dim as u64).div_ceil(4);
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(n_tgs_q, 1, 1),
+        metal::MTLSize::new(64, 1, 1),
+    );
+    // K: q4kf_proj
+    let k_rows = kv_dim as u32;
+    enc.set_compute_pipeline_state(&proj_pipeline);
+    enc.set_buffer(0, Some(&buf_wk), 0);
+    enc.set_buffer(1, Some(&buf_norm_out), 0);
+    enc.set_buffer(2, Some(&buf_k_out), 0);
+    enc.set_bytes(3, 4, &k_rows as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
+    let n_tgs_k = (kv_dim as u64).div_ceil(4);
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(n_tgs_k, 1, 1),
+        metal::MTLSize::new(64, 1, 1),
+    );
+    // V: q6k_matvec
+    let v_rows = kv_dim as u32;
+    enc.set_compute_pipeline_state(&q6k_pipeline);
+    enc.set_buffer(0, Some(&buf_wv), 0);
+    enc.set_buffer(1, Some(&buf_norm_out), 0);
+    enc.set_buffer(2, Some(&buf_v_out), 0);
+    enc.set_bytes(3, 4, &v_rows as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
+    let n_tgs_v = (kv_dim as u64).div_ceil(4);
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(n_tgs_v, 1, 1),
+        metal::MTLSize::new(128, 1, 1),
+    );
+
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let norm_out = larql_compute::metal::buffers::read_buffer_f32(&buf_norm_out, hidden);
+    let q_out = larql_compute::metal::buffers::read_buffer_f32(&buf_q_out, q_dim);
+    let k_out_ = larql_compute::metal::buffers::read_buffer_f32(&buf_k_out, kv_dim);
+    let v_out_ = larql_compute::metal::buffers::read_buffer_f32(&buf_v_out, kv_dim);
+    let count = |slice: &[f32]| -> (usize, f32) {
+        let nan = slice.iter().filter(|v| !v.is_finite()).count();
+        let amax = slice.iter().filter(|v| v.is_finite()).map(|v| v.abs()).fold(0.0f32, f32::max);
+        (nan, amax)
+    };
+    let (norm_nan, norm_amax) = count(&norm_out);
+    let (q_nan, q_amax) = count(&q_out);
+    let (k_nan, k_amax) = count(&k_out_);
+    let (v_nan, v_amax) = count(&v_out_);
+    println!("[repro] norm_out nan={norm_nan}/{hidden} amax={norm_amax:.2}");
+    println!("[repro] q_out    nan={q_nan}/{q_dim} amax={q_amax:.2}");
+    println!("[repro] k_out    nan={k_nan}/{kv_dim} amax={k_amax:.2}");
+    println!("[repro] v_out    nan={v_nan}/{kv_dim} amax={v_amax:.2}");
+    assert_eq!(norm_nan + q_nan + k_nan + v_nan, 0,
+        "NaN in some projection: norm={norm_nan} q={q_nan} k={k_nan} v={v_nan}");
+}
+
 /// Q4_KF (GGUF) parity on REAL Gemma 3 L0 q_proj bytes (rebuilt to Q4_KF).
 /// Reproduces the exact dispatch decode_token performs in gpuprefill.
 #[test]

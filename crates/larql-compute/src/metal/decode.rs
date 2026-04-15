@@ -577,7 +577,23 @@ impl MetalBackend {
                     // Q4_KF (GGUF) FFN path: llama.cpp-exact kernel
                     use crate::metal::shaders::q4kf_qkv_proj as q4kf;
                     use crate::metal::shaders::q4kf_ffn_gate_up as q4kf_gu;
-                    let n_tgs_down = (hidden as u64).div_ceil(q4kf::ROWS_PER_TG);
+                    use crate::metal::shaders::q6k_matvec as q6k_mv;
+                    // Down format may differ from gate/up (Q4_KF gate+up + Q6_K down
+                    // is the standard Gemma 3 llama.cpp layout). Pick the down
+                    // pipeline + dims by down.format; the old code unconditionally
+                    // used q4kf_proj which produced garbage / NaN on Q6_K bytes.
+                    let down_is_q6k = layer.down.format == crate::QuantFormat::Q6_K;
+                    let n_tgs_down = if down_is_q6k {
+                        (hidden as u64).div_ceil(q6k_mv::ROWS_PER_TG)
+                    } else {
+                        (hidden as u64).div_ceil(q4kf::ROWS_PER_TG)
+                    };
+                    let down_threads = if down_is_q6k { q6k_mv::THREADS_PER_TG } else { q4kf::THREADS_PER_TG };
+                    let down_pipeline = if down_is_q6k {
+                        &self.q6k_matvec_pipeline
+                    } else {
+                        &self.q4kf_proj_pipeline
+                    };
 
                     if layer.is_gated() {
                         let gate_out = &gate_out_scratch;
@@ -606,14 +622,14 @@ impl MetalBackend {
                         enc.set_buffer(2, Some(&act_buf), 0);
                         enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
                         enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
-                        // Down
-                        enc.set_compute_pipeline_state(&self.q4kf_proj_pipeline);
+                        // Down — format-aware dispatch.
+                        enc.set_compute_pipeline_state(down_pipeline);
                         enc.set_buffer(0, Some(&down_bufs[l]), 0);
                         enc.set_buffer(1, Some(&act_buf), 0);
                         enc.set_buffer(2, Some(&down_out), 0);
                         enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
                         enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
-                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_down, 1, 1), MTLSize::new(q4kf::THREADS_PER_TG, 1, 1));
+                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_down, 1, 1), MTLSize::new(down_threads, 1, 1));
                     } else {
                         let n_tgs_up = (inter as u64).div_ceil(q4kf::ROWS_PER_TG);
                         enc.set_compute_pipeline_state(&self.q4kf_proj_pipeline);

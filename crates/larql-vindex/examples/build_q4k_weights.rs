@@ -81,17 +81,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 f32_data.to_vec()
             };
 
-            // V projection → Q6_K, others → Q4_K (148-byte Ollama layout).
-            // Temporarily reverted from Q4_KF (144-byte GGUF, 6-bit mins) while
-            // we debug the decode_token NaN regression that only shows up when
-            // Q4_KF attention bytes hit the encode_single_proj path.
+            // V → Q6_K, others → Q4_KF (llama.cpp 144-byte GGUF layout).
             let is_v = key.contains("v_proj") || key.contains("attn_v");
             let (q_data, format) = if is_v {
                 (quantize_q6_k(&padded), "Q6_K")
             } else {
-                (quantize_q4_k(&padded), "Q4_K")
+                (quantize_q4_k_gguf(&padded), "Q4_KF")
             };
-            let _ = quantize_q4_k_gguf as fn(&[f32]) -> Vec<u8>;
+            let _ = quantize_q4_k as fn(&[f32]) -> Vec<u8>;
 
             out.write_all(&q_data)?;
             q4k_manifest.push(serde_json::json!({
@@ -155,12 +152,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         f32_data.to_vec()
                     };
 
-                    // Ollama strategy: Q4_K for gate/up, Q6_K for down.
+                    // Q4_KF (llama.cpp GGUF) for gate/up, Q6_K for down.
                     let q_data = if *name == "down" {
                         quantize_q6_k(&padded)
                     } else {
-                        quantize_q4_k(&padded)
+                        quantize_q4_k_gguf(&padded)
                     };
+                    let _ = quantize_q4_k as fn(&[f32]) -> Vec<u8>;
 
                     out.write_all(&q_data)?;
                     total_bytes += q_data.len();

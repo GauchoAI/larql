@@ -754,9 +754,10 @@ pub fn predict_honest_with_knn_ffn(
                         true
                     } else { false }
                 } else if !arch.has_post_norms() {
-                    // Prefill path (seq>1): GPU Q4 pipeline for pre-norm models (Llama, Mistral)
-                    // Post-norm models (Gemma3) fall through to CPU — prefill.rs post-norm
-                    // handling needs further work (see ADR-009).
+                    // Prefill path (seq>1): GPU Q4 pipeline for pre-norm models.
+                    // Post-norm (Gemma 3): dispatch_full_pipeline's post-norm handling
+                    // produces NaN (different code path from decode_token which works).
+                    // Falls through to CPU prefill below — 800ms one-time cost, correct.
                     let x: Vec<f32> = h.as_slice().unwrap_or(&[]).to_vec();
 
                     if let Some(result) = backend.prefill_q4(
@@ -764,15 +765,29 @@ pub fn predict_honest_with_knn_ffn(
                         seq_len, weights.num_q_heads, weights.num_kv_heads, weights.head_dim,
                         rope, qk_norm, softcap,
                     ) {
-                        // Copy result back to h matrix (all positions)
-                        for s in 0..seq_len {
-                            let mut row = h.row_mut(s);
-                            for j in 0..hidden { row[j] = result[s * hidden + j]; }
+                        // GPU prefill may return all positions (seq_len * hidden)
+                        // or just the last position (hidden). Either way, copy
+                        // the final position into h for the next decode step.
+                        let n_positions = result.len() / hidden;
+                        if n_positions >= seq_len {
+                            for s in 0..seq_len {
+                                let mut row = h.row_mut(s);
+                                for j in 0..hidden { row[j] = result[s * hidden + j]; }
+                            }
+                        } else {
+                            // Last position only — sufficient for decode continuation.
+                            let last = result.len().saturating_sub(hidden);
+                            let mut row = h.row_mut(seq_len - 1);
+                            for j in 0..hidden { row[j] = result[last + j]; }
                         }
 
-                        // Populate KV cache via CPU for subsequent decode
-                        // (lightweight: just QKV projection + RoPE, no FFN)
-                        prefill_kv_cache_cpu(weights, token_ids, index, backend, &layer_range);
+                        // GPU prefill already populated the KV cache internally via
+                        // Metal RoPE + kv_cache_append. Skip CPU re-population when
+                        // FFN weights aren't loaded (SKIP_FFN_LOAD walk-only mode).
+                        // For non-walk-only, CPU re-population gives f32 precision.
+                        if !force_quant_early {
+                            prefill_kv_cache_cpu(weights, token_ids, index, backend, &layer_range);
+                        }
 
                         true
                     } else { false }

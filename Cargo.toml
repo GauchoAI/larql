@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/larql-tui",
     "crates/larql-models",
     "crates/larql-compute",
     "crates/larql-core",
@@ -13,6 +14,7 @@ members = [
     "crates/kv-cache-benchmark",
 ]
 default-members = [
+    "crates/larql-tui",
     "crates/larql-models",
     "crates/larql-compute",
     "crates/larql-core",

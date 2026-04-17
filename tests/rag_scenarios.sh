@@ -16,14 +16,15 @@ curl -s "$SERVER/v1/health" | grep -q ok || { echo "Server not reachable"; exit 
 echo "=== Seeding key facts ==="
 for fact in \
   "We cloned the chrishayuk/larql repository as the first step" \
-  "The model is Gemma 3 4B IT running inference" \
-  "GPU decode runs at 35-41 tok/s on Metal M4 Pro" \
-  "The server default port is 3000" \
-  "The TUI is built with ratatui and gc-markdown in Rust" \
-  "The project name is larql which means LLM as a Database" \
-  "Metal GPU tanh overflow was fixed by clamping to [-10,10]" \
-  "Speculative decoding gave zero speedup because GPU is compute-bound" \
-  "KNN overlay at layer 26 overrides token predictions at inference time" \
+  "The model we are running is Gemma 3 4B IT" \
+  "The decode speed is 35 to 41 tokens per second" \
+  "The server port is 3000" \
+  "The TUI is built with ratatui" \
+  "The project is larql" \
+  "We fixed a tanh overflow bug in Metal GPU shaders" \
+  "Speculative decoding gave zero speedup" \
+  "The KNN overlay at layer 26 overrides predictions" \
+  "The GPU we use is Apple Metal on M4 Pro" \
   "The vindex has 348160 features across 34 layers"; do
   curl -s --max-time 2 "$SERVER/v1/rag/insert" -H "Content-Type: application/json" \
     -d "{\"fact\":\"$fact\",\"category\":\"key\"}" > /dev/null

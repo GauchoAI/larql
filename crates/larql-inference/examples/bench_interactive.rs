@@ -259,13 +259,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 eprintln!("[insert] capturing residual for \"{prompt}\" at L{install_layer} ...");
                 let t = Instant::now();
-                // Preserve user's current KV cache state — capture resets and repopulates.
                 backend.reset_kv_cache();
-                // Use walk FFN override for walk-only mode (dense FFN tensors are dropped).
-                let key = larql_inference::capture_residual_post_attn_norm_ffn(
-                    weights, &prompt_ids, install_layer, &*backend,
-                    if walk_only { Some(&walk_ffn as &dyn larql_inference::ffn::FfnBackend) } else { None },
-                );
+
+                // Capture via GPU decode path (works with SKIP_FFN_LOAD).
+                // Run sequential decode_token_with_probe for each prompt token,
+                // probing h_post_attn at the install layer. The last token's
+                // probe output IS the residual we need for KNN INSERT.
+                let key = if walk_only {
+                    // Build pipeline layers for decode_token
+                    let gi: &dyn larql_vindex::GateIndex = &index;
+                    let ins_mmap = gi.interleaved_q4k_real_mmap_ref()
+                        .or_else(|| gi.interleaved_q4k_mmap_ref())
+                        .unwrap_or(&[][..]);
+                    let ins_inter = gi.num_features(0);
+                    let ins_q4_per = (ins_inter * weights.hidden_size).div_ceil(256) * 148;
+                    if ins_mmap.is_empty() || ins_inter == 0 {
+                        None
+                    } else {
+                        let ins_layers = larql_inference::layer_graph::pipeline_layer::build_pipeline_layers(
+                            weights, &index, 0..num_layers,
+                            ins_mmap, ins_q4_per, larql_compute::QuantFormat::Q4_K,
+                        );
+                        let embeds = larql_inference::forward::embed_tokens_pub(weights, &prompt_ids);
+                        let mut probe_h = None;
+                        let rope = weights.arch.rope_base_for_layer(0) as f32;
+                        for p in 0..prompt_ids.len() {
+                            let x: Vec<f32> = embeds.row(p).to_vec();
+                            let (_h, ph) = backend.decode_token_with_probe(
+                                &ins_layers, &x, weights.hidden_size, ins_inter,
+                                weights.num_q_heads * weights.head_dim,
+                                weights.num_kv_heads * weights.head_dim,
+                                weights.num_q_heads, weights.num_kv_heads,
+                                weights.head_dim, rope,
+                                Some(install_layer),
+                            ).unwrap_or((vec![], None));
+                            if ph.is_some() { probe_h = ph; }
+                        }
+                        // Apply pre_ffn_norm to the probed h_post_attn (same
+                        // normalization the KNN check uses at query time).
+                        probe_h.map(|ph| {
+                            let norm_offset = weights.arch.norm_weight_offset();
+                            let ph_arr = ndarray::Array2::from_shape_vec(
+                                (1, weights.hidden_size), ph).unwrap();
+                            let pre_ffn_key = weights.arch.pre_feedforward_layernorm_key(install_layer);
+                            let normed = match pre_ffn_key {
+                                Some(key) => larql_inference::forward::apply_norm(
+                                    weights, &ph_arr, &key, norm_offset),
+                                None => ph_arr,
+                            };
+                            normed.row(0).to_vec()
+                        })
+                    }
+                } else {
+                    larql_inference::capture_residual_post_attn_norm(
+                        weights, &prompt_ids, install_layer, &*backend,
+                    )
+                };
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 match key {
                     Some(k) => {

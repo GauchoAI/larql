@@ -155,10 +155,18 @@ impl Backend {
 }
 
 fn find_binary() -> io::Result<String> {
-    // Look relative to the TUI binary, or in common locations
+    // Resolve relative to the TUI binary's own location (not CWD).
+    let exe = std::env::current_exe().unwrap_or_default();
+    let exe_dir = exe.parent().unwrap_or(std::path::Path::new("."));
+    // The TUI binary is at target/release/larql, bench_interactive is at
+    // target/release/examples/bench_interactive — same target dir.
+    let sibling = exe_dir.join("examples/bench_interactive");
+    if sibling.exists() {
+        return Ok(sibling.to_string_lossy().into_owned());
+    }
+    // Fallback: search relative to CWD
     let candidates = [
         "target/release/examples/bench_interactive",
-        "../target/release/examples/bench_interactive",
         "larql/target/release/examples/bench_interactive",
     ];
     for c in &candidates {
@@ -604,12 +612,49 @@ fn execute_tool_calls(text: &str, messages: &mut Vec<Message>) {
         }
     }
 
-    // Also detect markdown code blocks as implicit write_file
-    if text.contains("```") && !text.contains("<tool>") {
-        messages.push(Message::ToolUse {
-            tool: "code".into(),
-            detail: "code block in response (use write_file to save)".into(),
-        });
+    // Auto-save markdown code blocks to workspace files
+    let mut in_block = false;
+    let mut lang = String::new();
+    let mut code = String::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") && !in_block {
+            in_block = true;
+            lang = line.trim_start().trim_start_matches('`').trim().to_string();
+            code.clear();
+        } else if line.trim_start().starts_with("```") && in_block {
+            in_block = false;
+            if !code.trim().is_empty() {
+                let ext = match lang.as_str() {
+                    "python" | "py" => "py",
+                    "javascript" | "js" => "js",
+                    "rust" | "rs" => "rs",
+                    "html" => "html",
+                    "css" => "css",
+                    "sh" | "bash" => "sh",
+                    _ => "txt",
+                };
+                let filename = format!("output.{ext}");
+                let workspace = std::env::current_dir().unwrap_or_default();
+                let path = workspace.join(&filename);
+                match std::fs::write(&path, &code) {
+                    Ok(()) => {
+                        messages.push(Message::ToolUse {
+                            tool: "write_file".into(),
+                            detail: format!("✓ saved {} ({} bytes)", path.display(), code.len()),
+                        });
+                    }
+                    Err(e) => {
+                        messages.push(Message::ToolUse {
+                            tool: "write_file".into(),
+                            detail: format!("✗ {e}"),
+                        });
+                    }
+                }
+            }
+        } else if in_block {
+            code.push_str(line);
+            code.push('\n');
+        }
     }
 }
 

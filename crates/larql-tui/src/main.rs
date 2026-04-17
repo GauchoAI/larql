@@ -377,7 +377,7 @@ async fn load_session_into_rag(server_url: &str, session_id: &str) -> Result<usi
                 let content = obj.pointer("/message/content")
                     .and_then(|v| v.as_str()).unwrap_or("");
                 if content.len() > 20 && !content.starts_with("<task") {
-                    Some(format!("[{}] User: {}", ts_short, &content[..content.len().min(300)]))
+                    Some(format!("[{}] User: {}", ts_short, &content[..content.char_indices().take(300).last().map(|(i,c)| i + c.len_utf8()).unwrap_or(0)]))
                 } else { None }
             }
             "assistant" => {
@@ -393,7 +393,7 @@ async fn load_session_into_rag(server_url: &str, session_id: &str) -> Result<usi
                         .collect::<Vec<_>>()
                         .join(" ");
                     if text.len() > 30 {
-                        Some(format!("[{}] Assistant: {}", ts_short, &text[..text.len().min(300)]))
+                        Some(format!("[{}] Assistant: {}", ts_short, &text[..text.char_indices().take(300).last().map(|(i,c)| i + c.len_utf8()).unwrap_or(0)]))
                     } else { None }
                 } else { None }
             }
@@ -516,7 +516,7 @@ async fn main() -> io::Result<()> {
                             if !user_msg.is_empty() {
                                 let _ = client.post(format!("{url}/v1/rag/insert"))
                                     .json(&serde_json::json!({
-                                        "fact": format!("User asked: {}", &user_msg[..user_msg.len().min(300)]),
+                                        "fact": format!("User asked: {}", user_msg.chars().take(300).collect::<String>()),
                                         "category": "conversation",
                                     }))
                                     .send().await;
@@ -525,7 +525,7 @@ async fn main() -> io::Result<()> {
                             if !asst_msg.is_empty() {
                                 let _ = client.post(format!("{url}/v1/rag/insert"))
                                     .json(&serde_json::json!({
-                                        "fact": format!("Assistant answered: {}", &asst_msg[..asst_msg.len().min(300)]),
+                                        "fact": format!("Assistant answered: {}", asst_msg.chars().take(300).collect::<String>()),
                                         "category": "conversation",
                                     }))
                                     .send().await;

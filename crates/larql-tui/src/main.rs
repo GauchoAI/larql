@@ -827,6 +827,71 @@ fn process_stderr_line(line: &str, state: &mut AppState) {
 /// Execute tool calls found in the response. Returns bash output if a bash
 /// block was executed (for feeding back to the model).
 fn execute_tool_calls(text: &str, messages: &mut Vec<Message>) -> Option<String> {
+    let mut bash_result: Option<String> = None;
+
+    // ── Skill tool calls: ```tool\nname args\n``` ──
+    // The model outputs a ```tool``` block with the skill name and args.
+    // We find the skill's tool.sh, execute it, parse the structured output,
+    // route each block type: summary → LLM, chartjs → TUI, raw → log.
+    if let Some(tool_block) = extract_fenced_block(text, "tool") {
+        let parts: Vec<&str> = tool_block.trim().splitn(2, char::is_whitespace).collect();
+        let skill_name = parts.first().unwrap_or(&"");
+        let skill_args = parts.get(1).unwrap_or(&"");
+
+        // Find the tool executable
+        let skills_dirs = [
+            std::env::current_dir().unwrap_or_default().join("tests/fixtures/skills"),
+            std::env::current_dir().unwrap_or_default().join("skills"),
+        ];
+        let mut tool_path = None;
+        for dir in &skills_dirs {
+            let candidate = dir.join(skill_name).join("tool.sh");
+            if candidate.exists() {
+                tool_path = Some(candidate);
+                break;
+            }
+        }
+
+        if let Some(path) = tool_path {
+            messages.push(Message::ToolUse {
+                tool: format!("skill:{skill_name}"),
+                detail: format!("running tool.sh {skill_args}"),
+            });
+
+            match std::process::Command::new("bash")
+                .arg(&path)
+                .args(skill_args.split_whitespace())
+                .output()
+            {
+                Ok(output) => {
+                    let tool_output = String::from_utf8_lossy(&output.stdout).to_string();
+
+                    // Route each block type
+                    if let Some(raw) = extract_fenced_block(&tool_output, "raw") {
+                        tui_log(&format!("[raw] {raw}"));
+                        // raw goes to log only, not shown in TUI
+                    }
+                    if let Some(summary) = extract_fenced_block(&tool_output, "summary") {
+                        messages.push(Message::System(summary.clone()));
+                        bash_result = Some(summary); // feed back to LLM
+                    }
+                    if let Some(chart) = extract_fenced_block(&tool_output, "chartjs") {
+                        messages.push(Message::ToolUse {
+                            tool: "chartjs".into(),
+                            detail: chart[..chart.len().min(80)].to_string(),
+                        });
+                        // TUI would render this as a chart widget
+                    }
+                }
+                Err(e) => {
+                    messages.push(Message::System(format!("skill error: {e}")));
+                }
+            }
+        } else {
+            messages.push(Message::System(format!("skill '{skill_name}' not found")));
+        }
+    }
+
     // Parse <tool>write_file</tool> <path>...</path> <content>...</content>
     if let Some(tool_start) = text.find("<tool>") {
         let after_tool = &text[tool_start + 6..];
@@ -905,7 +970,7 @@ fn execute_tool_calls(text: &str, messages: &mut Vec<Message>) -> Option<String>
     let mut in_block = false;
     let mut lang = String::new();
     let mut code = String::new();
-    let mut bash_result: Option<String> = None;
+    // bash_result already set by skill tool call above (or None)
     for line in text.lines() {
         if line.trim_start().starts_with("```") && !in_block {
             in_block = true;
@@ -976,6 +1041,20 @@ fn execute_tool_calls(text: &str, messages: &mut Vec<Message>) -> Option<String>
         }
     }
     bash_result
+}
+
+/// Extract content from a fenced code block with a specific language tag.
+/// e.g., extract_fenced_block(text, "tool") finds ```tool\n...\n```
+fn extract_fenced_block(text: &str, lang: &str) -> Option<String> {
+    let open = format!("```{lang}");
+    let start_pos = text.find(&open)?;
+    let after_open = &text[start_pos + open.len()..];
+    // Skip to the next line after the opening fence
+    let content_start = after_open.find('\n').map(|i| i + 1).unwrap_or(0);
+    let content = &after_open[content_start..];
+    // Find the closing ```
+    let end = content.find("```")?;
+    Some(content[..end].to_string())
 }
 
 fn extract_tag(text: &str, tag: &str) -> Option<String> {

@@ -468,13 +468,19 @@ const DAEMON_FIFO_ERR: &str = "/tmp/larql-daemon.stderr";
 fn is_daemon_running() -> bool {
     if let Ok(pid_str) = std::fs::read_to_string(DAEMON_PID_FILE) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            // Check if process is alive
             let status = std::process::Command::new("kill")
                 .args(["-0", &pid.to_string()])
                 .output();
-            return status.map(|o| o.status.success()).unwrap_or(false);
+            if status.map(|o| o.status.success()).unwrap_or(false) {
+                return true;
+            }
         }
     }
+    // Clean up stale FIFOs if daemon is not actually running
+    let _ = std::fs::remove_file(DAEMON_PID_FILE);
+    let _ = std::fs::remove_file(DAEMON_FIFO_IN);
+    let _ = std::fs::remove_file(DAEMON_FIFO_OUT);
+    let _ = std::fs::remove_file(DAEMON_FIFO_ERR);
     false
 }
 

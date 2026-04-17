@@ -336,6 +336,7 @@ async fn main() -> Result<(), BoxError> {
         api_key: cli.api_key.clone(),
         sessions: SessionManager::new(3600),
         describe_cache: DescribeCache::new(cli.cache_ttl),
+        rag_store: routes::rag::RagStore::new(),
     });
 
     if cli.cache_ttl > 0 {

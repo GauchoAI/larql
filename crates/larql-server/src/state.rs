@@ -87,6 +87,8 @@ pub struct AppState {
     pub sessions: SessionManager,
     /// DESCRIBE result cache.
     pub describe_cache: DescribeCache,
+    /// RAG fact store for conversation-as-knowledge.
+    pub rag_store: crate::routes::rag::RagStore,
 }
 
 impl AppState {

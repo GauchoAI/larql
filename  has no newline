@@ -1,0 +1,2 @@
+[main f38bb4e] fix: flush stdout reader on prompt detection —
+ 1 file changed, 28 insertions(+), 11 deletions(-)

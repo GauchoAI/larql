@@ -25,7 +25,9 @@ for fact in \
   "Speculative decoding gave zero speedup" \
   "The KNN overlay at layer 26 overrides predictions" \
   "The GPU we use is Apple Metal on M4 Pro" \
-  "The vindex has 348160 features across 34 layers"; do
+  "The vindex has 348160 features across 34 layers" \
+  "The speed of decoding is 35 to 41 tok/s" \
+  "The port the server runs on is 3000"; do
   curl -s --max-time 2 "$SERVER/v1/rag/insert" -H "Content-Type: application/json" \
     -d "{\"fact\":\"$fact\",\"category\":\"key\"}" > /dev/null
 done

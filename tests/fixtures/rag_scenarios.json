@@ -16,7 +16,7 @@
     },
     {
       "query": "how fast is the decode speed?",
-      "expect_contains": ["tok/s"],
+      "expect_contains": ["tokens per second"],
       "expect_not_contains": [],
       "description": "recalls throughput metric"
     },

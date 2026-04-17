@@ -374,21 +374,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (text_raw, n_raw) = split_trailing_int(rest);
                 let user_text = parse_quoted(text_raw);
                 let n: usize = n_raw.parse().unwrap_or(200);
-                // Gemma 3 chat template with tool-use system prompt
-                let system = "You are a helpful coding assistant. You have access to tools.\n\n\
-                    Available tools:\n\
-                    - write_file(path, content): Write content to a file. Use this when asked to create code, configs, or any file.\n\
-                    - bash(command): Run a shell command. Use this to execute code, install packages, or check results.\n\n\
-                    When you need to use a tool, output it exactly like this:\n\
-                    <tool>write_file</tool>\n\
-                    <path>filename.py</path>\n\
-                    <content>\n\
-                    ...file content here...\n\
-                    </content>\n\n\
-                    Or for bash:\n\
-                    <tool>bash</tool>\n\
-                    <command>ls -la</command>\n\n\
-                    Always use tools when asked to write code or run commands. After using a tool, explain what you did.";
+                // Concise system prompt — Gemma 3 4B works best with short instructions
+                let system = "You are a helpful coding assistant. When writing code, use markdown code blocks.";
                 let chat_prompt = format!(
                     "<start_of_turn>system\n{system}<end_of_turn>\n\
                      <start_of_turn>user\n{user_text}<end_of_turn>\n\

@@ -723,12 +723,20 @@ fn match_skills(input: &str) -> String {
             let matches = input_lower.contains(&skill_name) || match skill_name.as_str() {
                 "list" => input_lower.contains("list") || input_lower.contains("files")
                     || input_lower.contains("directory") || input_lower.contains("folder")
-                    || input_lower.contains("ls"),
+                    || input_lower.contains("ls") || input_lower.contains("what's here")
+                    || input_lower.contains("show me"),
                 "search" => input_lower.contains("search") || input_lower.contains("find")
-                    || input_lower.contains("grep") || input_lower.contains("look for"),
+                    || input_lower.contains("grep") || input_lower.contains("look for")
+                    || input_lower.contains("where is"),
                 "stats" => input_lower.contains("stats") || input_lower.contains("statistics")
                     || input_lower.contains("metrics") || input_lower.contains("how many")
-                    || input_lower.contains("count"),
+                    || input_lower.contains("count") || input_lower.contains("overview"),
+                "du" => input_lower.contains("disk") || input_lower.contains("space")
+                    || input_lower.contains("storage") || input_lower.contains("size")
+                    || input_lower.contains("how big") || input_lower.contains("usage"),
+                "git" => input_lower.contains("git") || input_lower.contains("commit")
+                    || input_lower.contains("branch") || input_lower.contains("changes")
+                    || input_lower.contains("diff") || input_lower.contains("status"),
                 _ => false,
             };
 

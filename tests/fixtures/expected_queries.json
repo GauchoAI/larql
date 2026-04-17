@@ -1,0 +1,73 @@
+{
+  "scenario_1_docs": {
+    "description": "Project documentation — architecture, deployment, API reference",
+    "queries": [
+      {
+        "question": "What port does the API Gateway run on?",
+        "expected_contains": "8080"
+      },
+      {
+        "question": "How do I rollback a deployment?",
+        "expected_contains": "kubectl rollout undo"
+      },
+      {
+        "question": "What is the token expiry time?",
+        "expected_contains": "24"
+      },
+      {
+        "question": "What database does the platform use?",
+        "expected_contains": "PostgreSQL"
+      },
+      {
+        "question": "What is the staging URL?",
+        "expected_contains": "staging.gaucho.dev"
+      }
+    ]
+  },
+  "scenario_2_codebase": {
+    "description": "Python codebase — auth module, deployment module",
+    "queries": [
+      {
+        "question": "What algorithm does the JWT token use?",
+        "expected_contains": "RS256"
+      },
+      {
+        "question": "What is the maximum pool size?",
+        "expected_contains": "20"
+      },
+      {
+        "question": "What is the production URL?",
+        "expected_contains": "app.gaucho.io"
+      },
+      {
+        "question": "How do I build Docker images?",
+        "expected_contains": "make docker-build"
+      }
+    ]
+  },
+  "scenario_3_skills": {
+    "description": "Nested knowledge base — onboarding, troubleshooting, runbooks",
+    "queries": [
+      {
+        "question": "Who is the Tech Lead?",
+        "expected_contains": "Sarah Chen"
+      },
+      {
+        "question": "What do I do when the connection pool is exhausted?",
+        "expected_contains": "pg_stat_activity"
+      },
+      {
+        "question": "What is the SEV1 response time?",
+        "expected_contains": "5 minutes"
+      },
+      {
+        "question": "How do I restore a database backup?",
+        "expected_contains": "restore-db.sh"
+      },
+      {
+        "question": "What Python version is required?",
+        "expected_contains": "3.11"
+      }
+    ]
+  }
+}

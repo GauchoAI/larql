@@ -1,0 +1,72 @@
+{
+  "description": "RAG conversation memory scenarios — INSERT session facts, then verify recall",
+  "facts_source": "tests/fixtures/session_transcript.json",
+  "scenarios": [
+    {
+      "query": "what was the first thing we did in this project?",
+      "expect_contains": ["clone", "larql"],
+      "expect_not_contains": [],
+      "description": "recalls project start — cloning larql repo"
+    },
+    {
+      "query": "what model are we running?",
+      "expect_contains": ["Gemma"],
+      "expect_not_contains": [],
+      "description": "recalls model name"
+    },
+    {
+      "query": "how fast is the decode speed?",
+      "expect_contains": ["tok/s"],
+      "expect_not_contains": [],
+      "description": "recalls throughput metric"
+    },
+    {
+      "query": "what did we do about speculative decoding?",
+      "expect_contains": ["speculative"],
+      "expect_not_contains": [],
+      "description": "recalls speculative decoding work"
+    },
+    {
+      "query": "what port does the server run on?",
+      "expect_contains": ["3000"],
+      "expect_not_contains": [],
+      "description": "recalls server port"
+    },
+    {
+      "query": "what is the KNN overlay?",
+      "expect_contains": ["KNN"],
+      "expect_not_contains": [],
+      "description": "recalls KNN mechanism"
+    },
+    {
+      "query": "what GPU are we using?",
+      "expect_contains": ["Metal"],
+      "expect_not_contains": [],
+      "description": "recalls Metal GPU backend"
+    },
+    {
+      "query": "what bugs did we fix with tanh?",
+      "expect_contains": ["tanh"],
+      "expect_not_contains": [],
+      "description": "recalls tanh overflow fix"
+    },
+    {
+      "query": "what is the TUI built with?",
+      "expect_contains": ["ratatui"],
+      "expect_not_contains": [],
+      "description": "recalls TUI framework"
+    },
+    {
+      "query": "what is 2+2?",
+      "expect_contains": ["4"],
+      "expect_not_contains": ["larql", "Metal", "KNN"],
+      "description": "unrelated query must not leak project context"
+    },
+    {
+      "query": "tell me a joke",
+      "expect_contains": [],
+      "expect_not_contains": ["larql", "Gemma", "Metal"],
+      "description": "unrelated query must not leak project context"
+    }
+  ]
+}

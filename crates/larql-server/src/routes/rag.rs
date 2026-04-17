@@ -181,18 +181,18 @@ pub fn retrieve_context(
     if state.rag_store.len() == 0 { return None; }
 
     let query_embed = sentence_embedding(&model.tokenizer, &model.embeddings, user_msg)?;
-    let results = state.rag_store.query(&query_embed, 8, threshold);
+    let results = state.rag_store.query(&query_embed, 3, threshold);
 
     if results.is_empty() { return None; }
 
     let facts: Vec<String> = results.iter()
-        .map(|(e, cos)| format!("- {} (relevance: {:.0}%)", e.fact, cos * 100.0))
+        .map(|(e, _cos)| {
+            // Cap each fact to ~200 chars, strip code fences
+            let clean: String = e.fact.replace("```", "")
+                .chars().take(200).collect();
+            format!("- {clean}")
+        })
         .collect();
 
-    // Strip code fences from facts to prevent the model from echoing
-    // them as tool calls (which would trigger execute_skill_tool loops).
-    let clean_facts: Vec<String> = facts.iter()
-        .map(|f| f.replace("```", ""))
-        .collect();
-    Some(format!("Relevant context:\n{}", clean_facts.join("\n")))
+    Some(format!("Context:\n{}", facts.join("\n")))
 }

@@ -671,7 +671,14 @@ pub fn predict_honest_with_knn_ffn(
                 // LARQL_FORCE_QUANT_DECODE=1 if you need the quant path for
                 // benchmarking or debugging.
                 let force_quant = force_quant_early;
-                if seq_len == 1 && arch.has_post_norms() && !force_quant {
+                // Force per-layer path when value-injection KNN entries exist,
+                // since decode_token can't inject mid-pipeline.
+                let has_value_inject = knn_store.map(|s|
+                    s.entries().values().any(|entries|
+                        entries.iter().any(|e| e.value_vector.is_some())
+                    )
+                ).unwrap_or(false);
+                if seq_len == 1 && arch.has_post_norms() && (!force_quant || has_value_inject) {
                     // Single-token Gemma 3 decode via f32 attention + Metal matmul
                     // + (either dense or walk) FFN. Reads past K/V from the Metal
                     // KV cache and appends the current token so subsequent calls
@@ -689,20 +696,35 @@ pub fn predict_honest_with_knn_ffn(
                     let mut t_attn_total_us = 0u128;
                     let mut t_ffn_total_us = 0u128;
                     let mut t_knn_total_us = 0u128;
-                    // KNN overlay layers — precompute set (small, typically 1 layer).
                     let knn_layers: Vec<usize> = knn_store.map(|s| s.layers()).unwrap_or_default();
                     const KNN_COSINE_THRESHOLD: f32 = 0.75;
+                    // Pending value injection: (value_vector, value_layer, label)
+                    let mut pending_inject: Option<(Vec<f32>, usize, String)> = None;
                     for (rel_idx, abs_layer) in layer_range.clone().enumerate() {
                         let t_a = std::time::Instant::now();
-                        let (h_post_attn, _past_len_after) =
+                        let (mut h_post_attn, _past_len_after) =
                             crate::attention::gpu::run_attention_kv_cached_f32_opt(
                                 weights, &h_cpu, abs_layer, rel_idx, backend,
                                 Some(index as &dyn larql_vindex::GateIndex))
                                 .unwrap();
                         if measure { t_attn_total_us += t_a.elapsed().as_micros(); }
 
-                        // KNN overlay consult at the same residual stage the walk
-                        // path captured: pre_ffn_norm(h_post_attn).
+                        // Value injection: blend stored vector into residual at value_layer
+                        if let Some((ref vv, vl, ref label)) = pending_inject {
+                            if abs_layer == vl {
+                                let hidden = h_post_attn.shape()[1];
+                                let mut row = h_post_attn.row_mut(0);
+                                for j in 0..hidden.min(vv.len()) {
+                                    row[j] = 0.5 * row[j] + 0.5 * vv[j]; // blend=0.5
+                                }
+                                if std::env::var("LARQL_TRACE_KNN").ok().as_deref() == Some("1") {
+                                    eprintln!("[knn-inject L{}] value injected for: {}", vl, label);
+                                }
+                                pending_inject = None;
+                            }
+                        }
+
+                        // KNN overlay: query matching + token override / value injection setup
                         if !knn_layers.is_empty() && knn_layers.contains(&abs_layer) {
                             if let Some(store) = knn_store {
                                 let pre_ffn_key = if arch.has_post_norms() {
@@ -717,19 +739,29 @@ pub fn predict_honest_with_knn_ffn(
                                 let residual: Vec<f32> = h_ffn.row(0).to_vec();
                                 if let Some((entry, cosine)) = store.query_top1(abs_layer, &residual) {
                                     if std::env::var("LARQL_TRACE_KNN").ok().as_deref() == Some("1") {
-                                        eprintln!("[knn-decode L{}] top1={} cos={:.4} (threshold={})",
-                                            abs_layer, entry.target_token, cosine, KNN_COSINE_THRESHOLD);
+                                        eprintln!("[knn-decode L{}] top1={} cos={:.4} (threshold={}) mode={}",
+                                            abs_layer, entry.target_token, cosine, KNN_COSINE_THRESHOLD,
+                                            if entry.value_vector.is_some() { "inject" } else { "override" });
                                     }
                                     if cosine > KNN_COSINE_THRESHOLD {
-                                        let label = format!(
-                                            "{} (KNN override, cos={:.2}, L{})",
-                                            entry.target_token, cosine, abs_layer,
-                                        );
-                                        return crate::forward::PredictResult {
-                                            predictions: vec![(label, cosine as f64)],
-                                            raw_predictions: vec![(entry.target_id, cosine, cosine as f64)],
-                                            knn_override: Some(entry.target_token.clone()),
-                                        };
+                                        // Value injection mode: schedule injection at value_layer
+                                        if let (Some(vv), Some(vl)) = (&entry.value_vector, entry.value_layer) {
+                                            pending_inject = Some((
+                                                vv.clone(), vl, entry.target_token.clone(),
+                                            ));
+                                            // Don't return — continue the layer loop
+                                        } else {
+                                            // Token override mode (existing)
+                                            let label = format!(
+                                                "{} (KNN override, cos={:.2}, L{})",
+                                                entry.target_token, cosine, abs_layer,
+                                            );
+                                            return crate::forward::PredictResult {
+                                                predictions: vec![(label, cosine as f64)],
+                                                raw_predictions: vec![(entry.target_id, cosine, cosine as f64)],
+                                                knn_override: Some(entry.target_token.clone()),
+                                            };
+                                        }
                                     }
                                 }
                             }

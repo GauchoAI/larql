@@ -445,7 +445,9 @@ fn main() -> io::Result<()> {
 
         // Tool-result feedback: if bash was executed, feed output back to model
         if let Some(result) = state.pending_tool_result.take() {
-            let feedback = format!("The command output was:\n{result}\n\nPlease continue based on this output.");
+            // Flatten to single line — bench_interactive reads one command per line
+            let flat_result = result.replace('\n', " | ");
+            let feedback = format!("The command ran successfully. Output: {flat_result}");
             state.messages.push(Message::User(format!("[tool result]")));
             state.echo_stripped = true;
             state.assistant_buf.clear();

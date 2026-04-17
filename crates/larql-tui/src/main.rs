@@ -42,6 +42,9 @@ struct AppState {
     tok_s: f64,
     total_tokens: usize,
     knn_entries: usize,
+    last_prompt: String,      // for echo stripping
+    echo_stripped: bool,       // whether we've stripped the echo for this query
+    assistant_buf: String,     // accumulate streaming tokens
 }
 
 impl AppState {
@@ -57,6 +60,9 @@ impl AppState {
             tok_s: 0.0,
             total_tokens: 0,
             knn_entries: 0,
+            last_prompt: String::new(),
+            echo_stripped: false,
+            assistant_buf: String::new(),
         }
     }
 }
@@ -92,13 +98,24 @@ impl Backend {
         let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
         let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
 
-        // Read stdout in background
+        // Read stdout CHAR-BY-CHAR for real-time streaming.
+        // Accumulate into chunks separated by small time gaps or newlines.
         std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    let _ = stdout_tx.send(line);
+            use std::io::Read;
+            let mut reader = BufReader::new(stdout);
+            let mut buf = [0u8; 1];
+            let mut line_buf = String::new();
+            while reader.read(&mut buf).unwrap_or(0) == 1 {
+                let c = buf[0] as char;
+                line_buf.push(c);
+                // Send on newline or when we have accumulated text
+                if c == '\n' || line_buf.len() > 80 {
+                    let _ = stdout_tx.send(line_buf.clone());
+                    line_buf.clear();
                 }
+            }
+            if !line_buf.is_empty() {
+                let _ = stdout_tx.send(line_buf);
             }
         });
 
@@ -370,7 +387,16 @@ fn main() -> io::Result<()> {
                             break;
                         } else {
                             state.messages.push(Message::User(input.clone()));
-                            be.send(&format!("ask {input}"))?;
+                            // Wrap in Gemma 3 chat template for proper instruction following.
+                            // System prompt enables tool use (file writing).
+                            let chat_prompt = format!(
+                                "<start_of_turn>user\n{input}<end_of_turn>\n<start_of_turn>model\n"
+                            );
+                            state.last_prompt = input.clone();
+                            state.echo_stripped = false;
+                            state.assistant_buf.clear();
+                            // Request 200 tokens for full responses
+                            be.send(&format!("ask \"{chat_prompt}\" 200"))?;
                             state.is_generating = true;
                             state.tok_s = 0.0;
                         }
@@ -408,14 +434,32 @@ fn main() -> io::Result<()> {
 }
 
 fn process_stdout_line(line: &str, state: &mut AppState) {
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed == ">" { return; }
+    let trimmed = line.trim_end();
+    if trimmed.is_empty() || trimmed == ">" || trimmed == "> " { return; }
 
     // Strip leading "> " prompt marker
     let content = if trimmed.starts_with("> ") { &trimmed[2..] } else { trimmed };
 
-    // Timing line
-    if content.contains("tok/s") && content.contains("prefill") {
+    // Timing line — finalize the current response
+    if content.contains("tok/s") && (content.contains("prefill") || content.contains("decode")) {
+        // Flush accumulated assistant text
+        if !state.assistant_buf.is_empty() {
+            let text = state.assistant_buf.clone();
+            state.messages.push(Message::Assistant(text));
+            state.assistant_buf.clear();
+
+            // Check for code blocks in the response — show as tool use
+            if let Some(last) = state.messages.last() {
+                if let Message::Assistant(ref text) = last {
+                    if text.contains("```") {
+                        state.messages.push(Message::ToolUse {
+                            tool: "code".into(),
+                            detail: "code block generated (copy to use)".into(),
+                        });
+                    }
+                }
+            }
+        }
         if let Some(tok_s) = extract_tok_s(content) {
             state.tok_s = tok_s;
             if let Some(prefill) = extract_prefill_ms(content) {
@@ -429,9 +473,10 @@ fn process_stdout_line(line: &str, state: &mut AppState) {
     // KNN override
     if content.contains("KNN override") {
         state.messages.push(Message::ToolUse {
-            tool: "KNN override".into(),
+            tool: "⚡ KNN override".into(),
             detail: content.to_string(),
         });
+        state.is_generating = false;
         return;
     }
 
@@ -443,23 +488,47 @@ fn process_stdout_line(line: &str, state: &mut AppState) {
         return;
     }
 
-    if content.contains("KNN overlay now:") {
-        return; // skip meta line
-    }
-
-    if content.contains("KNN override, no decode") {
-        state.is_generating = false;
+    if content.contains("KNN overlay now:") || content.contains("KNN override, no decode") {
+        if content.contains("no decode") { state.is_generating = false; }
         return;
     }
 
-    // Regular assistant text — append to last assistant message or create new
-    if let Some(Message::Assistant(ref mut text)) = state.messages.last_mut() {
-        text.push_str(content);
-        text.push('\n');
+    // Skip metadata lines
+    if content.starts_with("[insert]") || content.starts_with("[spec]") { return; }
+
+    // ── Echo stripping ──
+    // bench_interactive prints the prompt text before the model output.
+    // We strip it by checking if the accumulated text starts with the prompt.
+    if !state.echo_stripped && !state.last_prompt.is_empty() {
+        state.assistant_buf.push_str(content);
+        // Check if we've accumulated enough to compare with the prompt
+        let clean = state.assistant_buf.trim();
+        if clean.starts_with(&state.last_prompt) || state.last_prompt.starts_with(clean) {
+            // Still accumulating the echo OR echo matches exactly
+            if state.assistant_buf.len() >= state.last_prompt.len() {
+                // Strip the echo prefix
+                let after_echo = state.assistant_buf[state.last_prompt.len()..].trim_start().to_string();
+                state.assistant_buf = after_echo;
+                state.echo_stripped = true;
+            }
+            return;
+        }
+        // Content doesn't match the prompt — not an echo, treat as real output
+        state.echo_stripped = true;
     } else {
-        state.messages.push(Message::Assistant(content.to_string() + "\n"));
+        state.assistant_buf.push_str(content);
     }
-    state.total_tokens += content.split_whitespace().count();
+
+    // Update the live assistant message for streaming feel
+    let display = state.assistant_buf.clone();
+    if !display.trim().is_empty() {
+        // Remove previous live assistant message and replace
+        if let Some(Message::Assistant(_)) = state.messages.last() {
+            state.messages.pop();
+        }
+        state.messages.push(Message::Assistant(display));
+        state.total_tokens += 1;
+    }
 }
 
 fn process_stderr_line(line: &str, state: &mut AppState) {

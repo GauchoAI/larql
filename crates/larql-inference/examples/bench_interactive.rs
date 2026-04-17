@@ -367,6 +367,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => println!("  save failed: {e}"),
                 }
             }
+            "chatml" => {
+                // Multi-line chat: reads lines until ---END--- marker.
+                // Used by TUI for tool-result feedback containing newlines.
+                let mut ml_text = String::new();
+                loop {
+                    let mut ml_line = String::new();
+                    if std::io::stdin().read_line(&mut ml_line).unwrap_or(0) == 0 { break; }
+                    let trimmed = ml_line.trim_end();
+                    if trimmed == "---END---" { break; }
+                    ml_text.push_str(trimmed);
+                    ml_text.push('\n');
+                }
+                let user_text = ml_text.trim().to_string();
+                let n: usize = 4096;
+                let system = "You are a local coding assistant running directly on the user's machine. You have full access to their filesystem and can run bash commands. When asked to list files, create files, or run code — do it directly using bash commands in code blocks. Do not say you cannot access files. You are local. Always give complete answers with working code.";
+                let chat_prompt = format!(
+                    "<start_of_turn>system\n{system}<end_of_turn>\n\
+                     <start_of_turn>user\n{user_text}<end_of_turn>\n\
+                     <start_of_turn>model\n"
+                );
+                let enc = tokenizer.encode(chat_prompt.as_str(), true).map_err(|e| e.to_string())?;
+                let ids: Vec<u32> = enc.get_ids().to_vec();
+                if walk_only {
+                    backend.reset_kv_cache();
+                    let walk = WalkFfn::new_with_backend(weights, &index, 1024, &*backend);
+                    let cache = CachedLayerGraph::from_residuals(Vec::new());
+                    let mut sampler = build_sampler();
+                    let t0 = Instant::now();
+                    let r = larql_inference::predict_honest_with_knn_ffn(
+                        weights, tokenizer, &ids, 20, &index, &*backend, &cache,
+                        0..num_layers, knn_ref(&knn_store), Some(&walk),
+                    );
+                    let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    let first_label = r.predictions.first().map(|(s,_)| s.as_str()).unwrap_or("");
+                    if first_label.contains("KNN override") {
+                        if let Some((s, _)) = r.predictions.first() { println!("{s}"); }
+                        println!("  walk-only prefill: {:.0}ms (KNN override, no decode)", prefill_ms);
+                        print!("> "); stdout.flush().ok(); continue;
+                    }
+                    let mut next = match sampler.sample(&r.raw_predictions) {
+                        Some(tid) => { let tok = tokenizer.decode(&[tid], true).unwrap_or_default(); print!("{tok}"); stdout.flush().ok(); tid }
+                        None => { println!(); print!("> "); stdout.flush().ok(); continue; }
+                    };
+                    let mut per: Vec<f64> = Vec::with_capacity(n);
+                    let mut stopped = false;
+                    for _ in 0..n {
+                        let input = vec![next];
+                        let t = Instant::now();
+                        let r = larql_inference::predict_honest_with_knn_ffn(
+                            weights, tokenizer, &input, 20, &index, &*backend, &cache,
+                            0..num_layers, knn_ref(&knn_store), Some(&walk),
+                        );
+                        per.push(t.elapsed().as_secs_f64() * 1000.0);
+                        let tid = match sampler.sample(&r.raw_predictions) { Some(t) => t, None => break };
+                        let tok_raw = tokenizer.decode(&[tid], false).unwrap_or_default();
+                        let is_eos = tok_raw.contains("<end_of_turn>") || tok_raw.contains("<eos>") || tok_raw.contains("</s>") || tid <= 1;
+                        if is_eos { stopped = true; break; }
+                        let tok = tokenizer.decode(&[tid], true).unwrap_or_default();
+                        print!("{tok}"); stdout.flush().ok();
+                        next = tid;
+                    }
+                    println!();
+                    let avg = if per.is_empty() { 0.0 } else { per.iter().sum::<f64>() / per.len() as f64 };
+                    println!("  prefill: {:.0}ms  decode: {:.0}ms/tok ({:.2} tok/s) over {} tokens{}",
+                        prefill_ms, avg, if avg>0.0 {1000.0/avg} else {0.0}, per.len(),
+                        if stopped { "  [stopped on EOS]" } else { "" });
+                }
+                print!("> "); stdout.flush().ok(); continue;
+            }
             "chat" => {
                 // Chat mode: wrap in Gemma 3 chat template for instruction following.
                 // Usage: chat Hello there!

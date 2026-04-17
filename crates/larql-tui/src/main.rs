@@ -445,14 +445,18 @@ fn main() -> io::Result<()> {
 
         // Tool-result feedback: if bash was executed, feed output back to model
         if let Some(result) = state.pending_tool_result.take() {
-            // Flatten to single line — bench_interactive reads one command per line
-            let flat_result = result.replace('\n', " | ");
-            let feedback = format!("The command ran successfully. Output: {flat_result}");
-            state.messages.push(Message::User(format!("[tool result]")));
+            // Use chatml (multi-line) to send tool output with real newlines
+            let feedback = format!("The command ran successfully. Here is the output:\n{result}\n\nBriefly describe what you see.");
+            state.messages.push(Message::User("[tool result]".into()));
             state.echo_stripped = true;
             state.assistant_buf.clear();
             state.last_output_time = Instant::now();
-            be.send(&format!("chat {feedback}"))?;
+            // Send as chatml with ---END--- delimiter
+            be.send("chatml")?;
+            for line in feedback.lines() {
+                be.send(line)?;
+            }
+            be.send("---END---")?;
             state.is_generating = true;
             new_output = true;
         }

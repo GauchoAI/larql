@@ -736,18 +736,25 @@ fn match_skills(input: &str) -> String {
     let input_lower = input.to_lowercase();
     let mut context = String::new();
 
-    // Resolve skills paths relative to binary location AND CWD
+    // Resolve skills paths: CWD, home, and project root (binary at target/release/larql)
     let exe = std::env::current_exe().unwrap_or_default();
     let exe_dir = exe.parent().unwrap_or(std::path::Path::new("."));
-    // Binary is at target/release/larql, project root is 3 levels up
-    let project_root = exe_dir.join("../../..").canonicalize().unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_default();
 
-    let skills_dirs = [
-        std::env::current_dir().unwrap_or_default().join(".skills"),
+    let mut skills_dirs = vec![
+        cwd.join(".skills"),
         dirs_fallback().join(".skills"),
-        project_root.join("tests/fixtures/skills"),
-        project_root.join(".skills"),
     ];
+    // Walk up from exe to find project root (look for Cargo.toml)
+    let mut dir = exe_dir.to_path_buf();
+    for _ in 0..5 {
+        if dir.join("Cargo.toml").exists() {
+            skills_dirs.push(dir.join("tests/fixtures/skills"));
+            skills_dirs.push(dir.join(".skills"));
+            break;
+        }
+        dir = match dir.parent() { Some(p) => p.to_path_buf(), None => break };
+    }
 
     for dir in &skills_dirs {
         if !dir.is_dir() { continue; }
@@ -934,13 +941,20 @@ fn execute_tool_calls(text: &str, messages: &mut Vec<Message>) -> Option<String>
         // Find the tool executable
         let exe = std::env::current_exe().unwrap_or_default();
         let exe_dir = exe.parent().unwrap_or(std::path::Path::new("."));
-        let project_root = exe_dir.join("../../..").canonicalize().unwrap_or_default();
-        let skills_dirs = [
-            std::env::current_dir().unwrap_or_default().join(".skills"),
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let mut skills_dirs = vec![
+            cwd.join(".skills"),
             dirs_fallback().join(".skills"),
-            project_root.join("tests/fixtures/skills"),
-            project_root.join(".skills"),
         ];
+        let mut dir = exe_dir.to_path_buf();
+        for _ in 0..5 {
+            if dir.join("Cargo.toml").exists() {
+                skills_dirs.push(dir.join("tests/fixtures/skills"));
+                skills_dirs.push(dir.join(".skills"));
+                break;
+            }
+            dir = match dir.parent() { Some(p) => p.to_path_buf(), None => break };
+        }
         let mut tool_path = None;
         for dir in &skills_dirs {
             let candidate = dir.join(skill_name).join("tool.sh");

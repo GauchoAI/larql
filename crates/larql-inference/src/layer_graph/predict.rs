@@ -693,6 +693,9 @@ pub fn predict_honest_with_knn_ffn(
                     // Zero speed penalty — GPU never breaks to CPU mid-pipeline.
                     let knn_probe_layer: Option<usize> = knn_store
                         .and_then(|s| s.layers().into_iter().next());
+                    // Decode-time probe threshold: keep high (0.75) to avoid
+                    // false positives during generation. The prefill KNN check
+                    // (separate path) uses a lower threshold for Q4_K captures.
                     const KNN_COSINE_THRESHOLD_GPU: f32 = 0.75;
 
                     if let Some((result, probe_h)) = backend.decode_token_with_probe(
@@ -808,13 +811,51 @@ pub fn predict_honest_with_knn_ffn(
                     let embeds = crate::forward::embed_tokens_pub(weights, token_ids);
                     let t_prefill = std::time::Instant::now();
                     let mut last_h = vec![0.0f32; hidden];
+                    // KNN probe: on the LAST token, use decode_token_with_probe
+                    // to capture h_post_attn at the KNN layer for override check.
+                    let knn_probe_layer_prefill: Option<usize> = knn_store
+                        .and_then(|s| s.layers().into_iter().next());
+                    let mut prefill_probe: Option<Vec<f32>> = None;
                     for p in 0..seq_len {
                         let x: Vec<f32> = embeds.row(p).to_vec();
-                        if let Some(result) = backend.decode_token(
+                        let is_last = p == seq_len - 1;
+                        let probe = if is_last { knn_probe_layer_prefill } else { None };
+                        if let Some((result, ph)) = backend.decode_token_with_probe(
                             &layers, &x, hidden, intermediate, q_dim, kv_dim,
                             weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+                            probe,
                         ) {
                             last_h = result;
+                            if ph.is_some() { prefill_probe = ph; }
+                        }
+                    }
+                    // KNN override check on prefill probe
+                    if let (Some(probe), Some(store), Some(pl)) = (&prefill_probe, knn_store, knn_probe_layer_prefill) {
+                        let probe_arr = ndarray::Array2::from_shape_vec((1, hidden), probe.clone()).unwrap();
+                        let pre_ffn_key = if arch.has_post_norms() {
+                            arch.pre_feedforward_layernorm_key(pl)
+                        } else { Some(arch.post_attention_layernorm_key(pl)) };
+                        let h_ffn = match pre_ffn_key {
+                            Some(key) => crate::forward::apply_norm(weights, &probe_arr, &key, norm_offset),
+                            None => probe_arr,
+                        };
+                        let residual: Vec<f32> = h_ffn.row(0).to_vec();
+                        const KNN_PREFILL_THRESHOLD: f32 = 0.70;
+                        if let Some((entry, cosine)) = store.query_top1(pl, &residual) {
+                            if std::env::var("LARQL_TRACE_KNN").ok().as_deref() == Some("1") {
+                                eprintln!("[knn-gpu-prefill L{}] top1={} cos={:.4} (threshold={})",
+                                    pl, entry.target_token, cosine, KNN_PREFILL_THRESHOLD);
+                            }
+                            if cosine > KNN_PREFILL_THRESHOLD {
+                                let label = format!(
+                                    "{} (KNN override, cos={:.2}, L{}, GPU prefill)",
+                                    entry.target_token, cosine, pl,
+                                );
+                                return crate::forward::PredictResult {
+                                    predictions: vec![(label, cosine as f64)],
+                                    raw_predictions: vec![(entry.target_id, cosine, cosine as f64)],
+                                };
+                            }
                         }
                     }
                     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;

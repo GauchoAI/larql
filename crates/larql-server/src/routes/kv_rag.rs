@@ -17,8 +17,10 @@ use crate::state::AppState;
 /// Which attention head to use for retrieval.
 /// For Gemma 3 4B: layer 26, kv_head 0 is a reasonable starting point.
 /// Chuk-lazurus uses layer 29, head 4 for Gemma 4B.
-const RETRIEVAL_LAYER: usize = 26;
-const RETRIEVAL_KV_HEAD: usize = 0;
+/// Best retrieval config from head sweep (4/5 hits, gap=+0.022):
+/// L24 H2 — discriminates Miguel, Gemma, port 3000, ratatui.
+const RETRIEVAL_LAYER: usize = 24;
+const RETRIEVAL_KV_HEAD: usize = 2;
 
 #[derive(Deserialize)]
 pub struct KvRagInsertRequest {

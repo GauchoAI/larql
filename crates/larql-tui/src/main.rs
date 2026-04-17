@@ -541,13 +541,35 @@ fn main() -> io::Result<()> {
 
     let mut state = AppState::new();
 
-    // Connect to daemon if running, otherwise spawn subprocess
+    // Connect to daemon if running, auto-start if not
     let mut be = if is_daemon_running() {
-        state.messages.push(Message::System("Connecting to daemon (model already loaded)...".into()));
+        state.messages.push(Message::System("Connecting to daemon...".into()));
         Backend::connect_daemon()?
     } else {
-        state.messages.push(Message::System("Starting model (first time — subsequent launches will be instant)...".into()));
-        Backend::spawn()?
+        // Try to start daemon first for persistence across TUI sessions
+        state.messages.push(Message::System("Starting daemon (first time only)...".into()));
+        draw(&mut terminal, &state);
+        match start_daemon() {
+            Ok(()) => {
+                // Wait for FIFOs to be ready (daemon needs a moment to start)
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                // Give the daemon up to 30s to become ready
+                let deadline = Instant::now() + std::time::Duration::from_secs(30);
+                while !is_daemon_running() && Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                if is_daemon_running() {
+                    Backend::connect_daemon()?
+                } else {
+                    // Fallback to subprocess
+                    Backend::spawn()?
+                }
+            }
+            Err(_) => {
+                // Fallback to subprocess if daemon fails
+                Backend::spawn()?
+            }
+        }
     };
     state.status = "loading model...".into();
     draw(&mut terminal, &state);

@@ -714,11 +714,17 @@ fn match_skills(input: &str) -> String {
     let input_lower = input.to_lowercase();
     let mut context = String::new();
 
+    // Resolve skills paths relative to binary location AND CWD
+    let exe = std::env::current_exe().unwrap_or_default();
+    let exe_dir = exe.parent().unwrap_or(std::path::Path::new("."));
+    // Binary is at target/release/larql, project root is 3 levels up
+    let project_root = exe_dir.join("../../..").canonicalize().unwrap_or_default();
+
     let skills_dirs = [
         std::env::current_dir().unwrap_or_default().join(".skills"),
         dirs_fallback().join(".skills"),
-        // Also check test fixtures during development
-        std::env::current_dir().unwrap_or_default().join("tests/fixtures/skills"),
+        project_root.join("tests/fixtures/skills"),
+        project_root.join(".skills"),
     ];
 
     for dir in &skills_dirs {
@@ -904,9 +910,14 @@ fn execute_tool_calls(text: &str, messages: &mut Vec<Message>) -> Option<String>
         let skill_args = parts.get(1).unwrap_or(&"");
 
         // Find the tool executable
+        let exe = std::env::current_exe().unwrap_or_default();
+        let exe_dir = exe.parent().unwrap_or(std::path::Path::new("."));
+        let project_root = exe_dir.join("../../..").canonicalize().unwrap_or_default();
         let skills_dirs = [
-            std::env::current_dir().unwrap_or_default().join("tests/fixtures/skills"),
-            std::env::current_dir().unwrap_or_default().join("skills"),
+            std::env::current_dir().unwrap_or_default().join(".skills"),
+            dirs_fallback().join(".skills"),
+            project_root.join("tests/fixtures/skills"),
+            project_root.join(".skills"),
         ];
         let mut tool_path = None;
         for dir in &skills_dirs {

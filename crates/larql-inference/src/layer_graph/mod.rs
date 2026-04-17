@@ -22,6 +22,8 @@ pub mod logits;
 pub mod generate;
 pub mod hybrid;
 pub mod predict;
+pub mod ngram_cache;
+pub mod speculative;
 
 use ndarray::Array2;
 

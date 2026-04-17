@@ -57,7 +57,7 @@ pub fn finalize_logits(
         }
     }
 
-    crate::forward::PredictResult { predictions, raw_predictions }
+    crate::forward::PredictResult { predictions, raw_predictions, knn_override: None }
 }
 
 /// Softmax probability of a single score within a set of hits.

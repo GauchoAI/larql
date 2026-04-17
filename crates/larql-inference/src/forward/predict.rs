@@ -75,7 +75,7 @@ pub(super) fn logits_to_predictions(
         }
     }
 
-    PredictResult { predictions, raw_predictions }
+    PredictResult { predictions, raw_predictions, knn_override: None }
 }
 
 /// Run a full forward pass and return the top-k next token predictions.

@@ -1,0 +1,10 @@
+# KNN Override Negative File — false positives that MUST NOT happen
+# Format: TEST_PROMPT\tMUST_NOT_CONTAIN\tDESCRIPTION
+#
+# Run AFTER all golden INSERTs. These prompts must not be contaminated.
+
+what is 2+2?	list	math must not trigger list override
+tell me a joke	list	jokes must not trigger list override
+what are decorators	list	coding question must not trigger list override
+what is 2+2?	Rome	math must not trigger Rome override
+write hello world in rust	Rome	code task must not trigger Rome override

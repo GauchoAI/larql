@@ -33,7 +33,7 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default = "default_true")]
     pub stream: bool,
-    #[serde(default)]
+    #[serde(default = "default_temperature")]
     pub temperature: f32,
     #[serde(default = "default_one")]
     pub top_p: f32,
@@ -49,6 +49,7 @@ pub struct ChatMessage {
 
 fn default_true() -> bool { true }
 fn default_one() -> f32 { 1.0 }
+fn default_temperature() -> f32 { 0.7 }
 
 /// Convert OpenAI messages to Gemma 3 chat template.
 fn messages_to_gemma3_prompt(messages: &[ChatMessage]) -> String {
@@ -95,6 +96,13 @@ pub async fn handle_chat_completions(
     let chat_prompt = messages_to_gemma3_prompt(&req.messages);
     let request_id = format!("chatcmpl-{}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+
+    let prompt_preview: String = req.messages.last()
+        .map(|m| m.content.chars().take(80).collect())
+        .unwrap_or_default();
+    tracing::info!("[chat] {} max_tokens={} prompt=\"{}{}\"",
+        request_id, max_tokens, prompt_preview,
+        if req.messages.last().map(|m| m.content.len()).unwrap_or(0) > 80 { "..." } else { "" });
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
 
@@ -175,6 +183,8 @@ pub async fn handle_chat_completions(
         if tx.blocking_send(Ok(oai_chunk(&req_id, &first_tok))).is_err() { return; }
 
         // Decode loop
+        let t_decode = std::time::Instant::now();
+        let mut token_count = 1usize; // first token already sent
         for _step in 1..max_tokens {
             let input = vec![next];
             let r = larql_inference::predict_honest_with_knn_ffn(
@@ -183,21 +193,59 @@ pub async fn handle_chat_completions(
                 0..weights.num_layers, knn_opt, ffn_override,
             );
 
+            // Multi-token KNN override: when the predict returns a full
+            // target string (e.g. "tool list ."), tokenize it and force-
+            // inject ALL tokens. Each forced token is fed through decode
+            // to maintain the KV cache.
+            if let Some(ref knn_target) = r.knn_override {
+                let target_enc = model_cl.tokenizer.encode(
+                    format!(" {}", knn_target).as_str(), false
+                ).ok();
+                let target_ids: Vec<u32> = target_enc
+                    .map(|e| e.get_ids().to_vec())
+                    .unwrap_or_default();
+                tracing::info!("[chat] {} KNN multi-token override: {:?} ({} tokens)",
+                    req_id, knn_target, target_ids.len());
+                for &forced_tid in &target_ids {
+                    let tok = model_cl.tokenizer.decode(&[forced_tid], true).unwrap_or_default();
+                    if tx.blocking_send(Ok(oai_chunk(&req_id, &tok))).is_err() {
+                        tracing::warn!("[chat] {} client disconnected during KNN inject", req_id);
+                        return;
+                    }
+                    // Feed forced token through decode to update KV cache
+                    let _r = larql_inference::predict_honest_with_knn_ffn(
+                        weights, &model_cl.tokenizer, &[forced_tid], 1,
+                        patched.base(), &**backend, &cache,
+                        0..weights.num_layers, knn_opt, ffn_override,
+                    );
+                    next = forced_tid;
+                    token_count += 1;
+                }
+                continue;
+            }
+
             match sampler.sample(&r.raw_predictions) {
                 Some(tid) => {
-                    // EOS detection (decode WITHOUT skip_special to see <end_of_turn>)
                     let tok_raw = model_cl.tokenizer.decode(&[tid], false).unwrap_or_default();
                     if tok_raw.contains("<end_of_turn>") || tok_raw.contains("<eos>")
                         || tok_raw.contains("</s>") || tid <= 1 {
                         break;
                     }
                     let tok = model_cl.tokenizer.decode(&[tid], true).unwrap_or_default();
-                    if tx.blocking_send(Ok(oai_chunk(&req_id, &tok))).is_err() { return; }
+                    if tx.blocking_send(Ok(oai_chunk(&req_id, &tok))).is_err() {
+                        tracing::warn!("[chat] {} client disconnected at token {}", req_id, token_count);
+                        return;
+                    }
                     next = tid;
+                    token_count += 1;
                 }
                 None => break,
             }
         }
+        let decode_s = t_decode.elapsed().as_secs_f64();
+        let tok_s = if decode_s > 0.0 { token_count as f64 / decode_s } else { 0.0 };
+        tracing::info!("[chat] {} done: {} tokens in {:.1}s ({:.1} tok/s)",
+            req_id, token_count, decode_s, tok_s);
         let _ = tx.blocking_send(Ok(oai_done()));
     });
 

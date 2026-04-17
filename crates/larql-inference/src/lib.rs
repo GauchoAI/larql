@@ -74,7 +74,7 @@ pub use layer_graph::{
     predict_with_graph, predict_with_graph_vindex_logits, predict_pipeline,
     predict_split_pass, predict_split_cached, predict_honest, predict_honest_with_knn,
     predict_honest_with_knn_ffn, capture_residual_post_attn_norm,
-    capture_residual_post_attn_norm_ffn, capture_knn_key_gpu,
+    capture_residual_post_attn_norm_ffn, capture_knn_key_gpu, capture_knn_key_perlayer,
     generate, GenerateResult, AttentionCache,
     hybrid::predict_hybrid,
     trace_with_graph, build_adaptive_graph,

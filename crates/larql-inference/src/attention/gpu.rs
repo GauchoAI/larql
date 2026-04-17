@@ -329,12 +329,13 @@ pub fn run_attention_kv_cached_f32_opt(
     let h_norm = apply_norm(weights, h, &arch.input_layernorm_key(layer), norm_off);
     let norm_us = if measure_attn { t_norm.elapsed().as_micros() } else { 0 };
 
-    // Idea 1: attn QKV via mmap'd Q6_K bytes when LARQL_ATTN_Q6K=1 AND the
-    // vindex exposes attn_q4k data. Otherwise fall back to owned f32 tensors.
-    let use_q6k_attn = std::env::var("LARQL_ATTN_Q6K").ok().as_deref() == Some("1");
-    let q6k_data = if use_q6k_attn {
+    // Use quantized attention (Q4_K/Q6_K) when available — matches the GPU
+    // decode_token path so KNN residuals are compatible. Fall back to f32
+    // when no quantized weights exist. Opt OUT with LARQL_ATTN_F32=1.
+    let force_f32 = std::env::var("LARQL_ATTN_F32").ok().as_deref() == Some("1");
+    let q6k_data = if force_f32 { None } else {
         attn_q4k_index.and_then(|idx| idx.attn_q4k_layer_data(layer))
-    } else { None };
+    };
 
     let hidden = h_norm.shape()[1];
     let q_dim = nq * hd;

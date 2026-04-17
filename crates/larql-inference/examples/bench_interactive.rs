@@ -367,10 +367,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => println!("  save failed: {e}"),
                 }
             }
+            "chat" => {
+                // Chat mode: wrap in Gemma 3 chat template for instruction following.
+                // Usage: chat Hello there!
+                // Or: chat "Write a Python chess game" 200
+                let (text_raw, n_raw) = split_trailing_int(rest);
+                let user_text = parse_quoted(text_raw);
+                let n: usize = n_raw.parse().unwrap_or(200);
+                // Gemma 3 chat template
+                let chat_prompt = format!(
+                    "<start_of_turn>user\n{user_text}<end_of_turn>\n<start_of_turn>model\n"
+                );
+                let enc = tokenizer.encode(chat_prompt.as_str(), true).map_err(|e| e.to_string())?;
+                let mut ids: Vec<u32> = enc.get_ids().to_vec();
+                // Delegate to the same ask logic below
+                // (fall through by rewriting cmd — Rust doesn't allow, so inline)
+                if walk_only {
+                    backend.reset_kv_cache();
+                    let walk = WalkFfn::new_with_backend(weights, &index, 1024, &*backend);
+                    let cache = CachedLayerGraph::from_residuals(Vec::new());
+                    let mut sampler = build_sampler();
+
+                    let t0 = Instant::now();
+                    let r = larql_inference::predict_honest_with_knn_ffn(
+                        weights, tokenizer, &ids, 20, &index, &*backend, &cache,
+                        0..num_layers, knn_ref(&knn_store), Some(&walk),
+                    );
+                    let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+                    // Don't echo the prompt (TUI handles display)
+                    let first_label = r.predictions.first().map(|(s,_)| s.as_str()).unwrap_or("");
+                    let knn_hit = first_label.contains("KNN override");
+                    if knn_hit {
+                        if let Some((s, _)) = r.predictions.first() { println!("{s}"); }
+                        println!("  walk-only prefill: {:.0}ms (KNN override, no decode)", prefill_ms);
+                        print!("> "); stdout.flush().ok();
+                        continue;
+                    }
+
+                    let mut next = match sampler.sample(&r.raw_predictions) {
+                        Some(tid) => {
+                            let tok = tokenizer.decode(&[tid], true).unwrap_or_default();
+                            print!("{tok}"); stdout.flush().ok();
+                            tid
+                        }
+                        None => { println!(); print!("> "); stdout.flush().ok(); continue; }
+                    };
+
+                    let mut per: Vec<f64> = Vec::with_capacity(n);
+                    let mut stopped = false;
+                    for _ in 0..n {
+                        let input = vec![next];
+                        let t = Instant::now();
+                        let r = larql_inference::predict_honest_with_knn_ffn(
+                            weights, tokenizer, &input, 20, &index, &*backend, &cache,
+                            0..num_layers, knn_ref(&knn_store), Some(&walk),
+                        );
+                        let ms = t.elapsed().as_secs_f64() * 1000.0;
+                        per.push(ms);
+                        let tid = match sampler.sample(&r.raw_predictions) {
+                            Some(t) => t,
+                            None => break,
+                        };
+                        let tok = tokenizer.decode(&[tid], true).unwrap_or_default();
+                        let is_eos = tok.trim() == "<eos>" || tok.trim() == "</s>"
+                            || tok.trim() == "<end_of_turn>" || tok.trim() == "<|endoftext|>";
+                        if is_eos { stopped = true; break; }
+                        print!("{tok}"); stdout.flush().ok();
+                        next = tid;
+                    }
+                    println!();
+                    let avg = if per.is_empty() { 0.0 } else { per.iter().sum::<f64>() / per.len() as f64 };
+                    println!("  prefill: {:.0}ms  decode: {:.0}ms/tok ({:.2} tok/s) over {} tokens{}",
+                        prefill_ms, avg, if avg>0.0 {1000.0/avg} else {0.0}, per.len(),
+                        if stopped { "  [stopped on EOS]" } else { "" });
+                }
+                print!("> "); stdout.flush().ok();
+                continue;
+            }
             "ask" => {
-                // Ollama-like one-shot: prefill + decode + print. KNN overlay
-                // consulted at each layer — if a fact lands, the answer is
-                // returned immediately without running the remaining layers.
+                // Raw text completion: prefill + decode + print. KNN overlay consulted.
                 let (text_raw, n_raw) = split_trailing_int(rest);
                 let text = parse_quoted(text_raw);
                 let n: usize = n_raw.parse().unwrap_or(20);

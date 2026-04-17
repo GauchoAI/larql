@@ -387,16 +387,12 @@ fn main() -> io::Result<()> {
                             break;
                         } else {
                             state.messages.push(Message::User(input.clone()));
-                            // Wrap in Gemma 3 chat template for proper instruction following.
-                            // System prompt enables tool use (file writing).
-                            let chat_prompt = format!(
-                                "<start_of_turn>user\n{input}<end_of_turn>\n<start_of_turn>model\n"
-                            );
+                            // Use the `chat` command which wraps in Gemma 3
+                            // chat template internally. No echo of prompt.
                             state.last_prompt = input.clone();
-                            state.echo_stripped = false;
+                            state.echo_stripped = true; // chat cmd doesn't echo
                             state.assistant_buf.clear();
-                            // Request 200 tokens for full responses
-                            be.send(&format!("ask \"{chat_prompt}\" 200"))?;
+                            be.send(&format!("chat {input}"))?;
                             state.is_generating = true;
                             state.tok_s = 0.0;
                         }

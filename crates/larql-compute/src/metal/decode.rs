@@ -1046,28 +1046,385 @@ impl MetalBackend {
         inter: usize,
         q_dim: usize,
         kv_dim: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
         rope_base: f32,
     ) -> Vec<f32> {
-        // For now: sequential within one method (each decode_token_inner creates
-        // its own cmd buffer). The batched Metal shaders are ready
-        // (kv_attention_batched, kv_cache_append_batch) and registered;
-        // the true one-cmd-buffer implementation will replace this loop
-        // by dispatching K × (norm+QKV+RoPE+O+FFN) per layer then ONE
-        // batched KV attend per layer. Until then, the sequential path
-        // gives correct results at K × decode_token cost.
-        let mut results = Vec::with_capacity(batch_size * hidden);
-        for bi in 0..batch_size {
-            let x = &x_batch[bi * hidden..(bi + 1) * hidden];
-            let (h, _) = self.decode_token_inner(
-                kv_cache, layers, x, hidden, inter,
-                q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base,
-                None,
-            );
-            results.extend_from_slice(&h);
+        use crate::metal::shaders::q4k_matvec as q4k;
+        use crate::metal::shaders::q6k_matvec as q6k;
+        use crate::metal::shaders::q4k_geglu_down as q4k_gd;
+        use crate::metal::shaders::q4k_ffn_gate_up as q4k_gu;
+        use crate::metal::ops::full_pipeline::{encode_rms_norm, encode_residual_add};
+
+        let k = batch_size;
+        let num_layers = layers.len();
+        if num_layers == 0 || k == 0 {
+            return x_batch.to_vec();
         }
-        results
+
+        // ── Pre-cache weight buffers (shared across batch positions) ──
+        let wq_bufs: Vec<_> = layers.iter().map(|l| self.bufs.get_bytes(l.wq.data)).collect();
+        let wk_bufs: Vec<_> = layers.iter().map(|l| self.bufs.get_bytes(l.wk.data)).collect();
+        let wv_bufs: Vec<_> = layers.iter().map(|l| self.bufs.get_bytes(l.wv.data)).collect();
+        let wo_bufs: Vec<_> = layers.iter().map(|l| self.bufs.get_bytes(l.wo.data)).collect();
+        let gate_bufs: Vec<_> = layers.iter().map(|l| self.bufs.get_bytes(l.gate.data)).collect();
+        let up_bufs: Vec<_> = layers.iter().map(|l| self.bufs.get_bytes(l.up.data)).collect();
+        let down_bufs: Vec<_> = layers.iter().map(|l| self.bufs.get_bytes(l.down.data)).collect();
+        let input_norm_bufs: Vec<_> = layers.iter().map(|l| self.bufs.transient_from_f32(l.input_norm)).collect();
+        let post_attn_norm_bufs: Vec<_> = layers.iter().map(|l| self.bufs.transient_from_f32(l.post_attn_norm)).collect();
+        let q_norm_bufs: Vec<_> = layers.iter().map(|l| self.bufs.transient_from_f32(l.q_norm_weight.unwrap_or(&[]))).collect();
+        let k_norm_bufs: Vec<_> = layers.iter().map(|l| self.bufs.transient_from_f32(l.k_norm_weight.unwrap_or(&[]))).collect();
+
+        // ── K-sized batch buffers ──
+        let b = |n: usize| self.bufs.output((k as u64) * (n as u64) * 4);
+        let h_init = self.bufs.transient_from_f32(x_batch);
+        let h_a = b(hidden);
+        let h_b = b(hidden);
+        let mut h_buf = &h_init;
+        let norm_buf = b(hidden);
+        let q_out = b(q_dim);
+        let k_out = b(kv_dim);
+        let v_out = b(kv_dim);
+        let attn_out = b(q_dim);
+        let o_out = b(hidden);
+        let h_post_attn = b(hidden);
+        let ffn_norm_out = b(hidden);
+        let normed_scratch = b(hidden);
+        let gate_out = b(inter);
+        let up_out = b(inter);
+        let down_out = b(hidden);
+
+        let hidden_val = hidden as u32;
+        let inter_val = inter as u32;
+
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+
+        for l in 0..num_layers {
+            let layer = &layers[l];
+            let norm_offset = layer.norm_offset;
+            let eps = layer.eps;
+            let scale = layer.attn_scale;
+            let layer_hd = layer.head_dim;
+            let layer_nq = layer.num_q_heads;
+            let layer_nkv = layer.num_kv_heads;
+            let layer_rope = layer.rope_base;
+            let layer_rotary_dim = if layer.rotary_dim > 0 { layer.rotary_dim } else { layer_hd };
+            let layer_q_dim = layer_nq * layer_hd;
+            let window_size = layer.sliding_window as u32;
+
+            let new_h = if l % 2 == 0 { &h_a } else { &h_b };
+
+            // ── Per-position dispatches (loop over K) ──
+            for bi in 0..k {
+                let h_off = (bi * hidden * 4) as u64;
+                let norm_off_bi = (bi * hidden * 4) as u64;
+                let q_off = (bi * q_dim * 4) as u64;
+                let k_off = (bi * kv_dim * 4) as u64;
+                let v_off = (bi * kv_dim * 4) as u64;
+
+                // Step 1: Input norm (direct dispatch with per-position offsets)
+                let len_val = hidden as u32;
+                enc.set_compute_pipeline_state(&self.rms_norm_pipeline);
+                enc.set_buffer(0, Some(h_buf), h_off);
+                enc.set_buffer(1, Some(&input_norm_bufs[l]), 0);
+                enc.set_buffer(2, Some(&norm_buf), norm_off_bi);
+                enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+
+                // Step 2: QKV projection — format-aware (Q4_K or Q6_K)
+                let k_val = hidden as u32;
+                let dispatch_proj = |enc: &metal::ComputeCommandEncoderRef,
+                                      w_buf: &metal::Buffer, in_buf: &metal::Buffer, in_off: u64,
+                                      out_buf: &metal::Buffer, out_off: u64,
+                                      rows: usize, fmt: crate::QuantFormat| {
+                    let n_val = rows as u32;
+                    let (pipeline, rows_per_tg, threads_per_tg) = match fmt {
+                        crate::QuantFormat::Q6_K => (&self.q6k_matvec_pipeline, q6k::ROWS_PER_TG, q6k::THREADS_PER_TG),
+                        _ => (&self.q4k_matvec_pipeline, q4k::ROWS_PER_TG, q4k::THREADS_PER_TG),
+                    };
+                    let n_tgs = (rows as u64).div_ceil(rows_per_tg);
+                    enc.set_compute_pipeline_state(pipeline);
+                    enc.set_buffer(0, Some(w_buf), 0);
+                    enc.set_buffer(1, Some(in_buf), in_off);
+                    enc.set_buffer(2, Some(out_buf), out_off);
+                    enc.set_bytes(3, 4, &n_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_thread_groups(MTLSize::new(n_tgs, 1, 1), MTLSize::new(threads_per_tg, 1, 1));
+                };
+                dispatch_proj(enc, &wq_bufs[l], &norm_buf, norm_off_bi, &q_out, q_off, layer_q_dim, layer.wq.format);
+                dispatch_proj(enc, &wk_bufs[l], &norm_buf, norm_off_bi, &k_out, k_off, kv_dim, layer.wk.format);
+                dispatch_proj(enc, &wv_bufs[l], &norm_buf, norm_off_bi, &v_out, v_off, kv_dim, layer.wv.format);
+
+                // Step 3: QK-norm (Gemma 3)
+                if layer.q_norm_weight.is_some() {
+                    let hd_val = layer_hd as u32;
+                    let qk_off_val = layer.qk_norm_offset;
+                    let tg_threads = 256u64.min(layer_hd as u64);
+                    enc.set_compute_pipeline_state(&self.rms_norm_pipeline);
+                    enc.set_bytes(3, 4, &hd_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+                    enc.set_bytes(5, 4, &qk_off_val as *const f32 as *const std::ffi::c_void);
+                    enc.set_buffer(1, Some(&q_norm_bufs[l]), 0);
+                    for head in 0..layer_nq {
+                        let off = q_off + (head * layer_hd * 4) as u64;
+                        enc.set_buffer(0, Some(&q_out), off);
+                        enc.set_buffer(2, Some(&q_out), off);
+                        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tg_threads, 1, 1));
+                    }
+                    enc.set_buffer(1, Some(&k_norm_bufs[l]), 0);
+                    for head in 0..layer_nkv {
+                        let off = k_off + (head * layer_hd * 4) as u64;
+                        enc.set_buffer(0, Some(&k_out), off);
+                        enc.set_buffer(2, Some(&k_out), off);
+                        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tg_threads, 1, 1));
+                    }
+                }
+
+                // Step 4: RoPE
+                {
+                    let pos = (kv_cache.layers[l].current_len + bi) as u32;
+                    let hd = layer_hd as u32;
+                    let rdim = layer_rotary_dim as u32;
+                    let rope_pairs = (layer_rotary_dim / 2) as u64;
+                    let num_q = layer_nq as u32;
+                    let num_kv = layer_nkv as u32;
+                    enc.set_compute_pipeline_state(&self.rope_at_pos_batched_pipeline);
+                    enc.set_buffer(0, Some(&q_out), q_off);
+                    enc.set_bytes(1, 4, &hd as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(2, 4, &layer_rope as *const f32 as *const std::ffi::c_void);
+                    enc.set_bytes(3, 4, &pos as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(4, 4, &rdim as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(5, 4, &num_q as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_threads(
+                        MTLSize::new(rope_pairs, layer_nq as u64, 1),
+                        MTLSize::new(rope_pairs.min(256), 1, 1),
+                    );
+                    enc.set_buffer(0, Some(&k_out), k_off);
+                    enc.set_bytes(5, 4, &num_kv as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_threads(
+                        MTLSize::new(rope_pairs, layer_nkv as u64, 1),
+                        MTLSize::new(rope_pairs.min(256), 1, 1),
+                    );
+                }
+
+                // Step 5: V-norm (if needed)
+                if layer.has_v_norm {
+                    let hd_val = layer_hd as u32;
+                    let num_kv = layer_nkv as u32;
+                    enc.set_compute_pipeline_state(&self.v_norm_batched_pipeline);
+                    enc.set_buffer(0, Some(&v_out), v_off);
+                    enc.set_buffer(1, Some(&v_out), v_off);
+                    enc.set_bytes(2, 4, &hd_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(3, 4, &eps as *const f32 as *const std::ffi::c_void);
+                    enc.set_bytes(4, 4, &num_kv as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_threads(
+                        MTLSize::new(layer_hd as u64, layer_nkv as u64, 1),
+                        MTLSize::new((layer_hd as u64).min(256), 1, 1),
+                    );
+                }
+            }
+
+            // ── Step 6: Batched KV append + attend (ONE dispatch for all K) ──
+            let cache_len_before = kv_cache.layers[l].current_len;
+            ops::kv_cache::encode_kv_append_batch(
+                enc, &kv_cache.layers[l],
+                &self.kv_append_batch_pipeline,
+                &k_out, &v_out, k,
+            );
+            ops::kv_cache::encode_kv_attend_batch(
+                enc, &kv_cache.layers[l],
+                &self.kv_attend_batched_pipeline,
+                &q_out, &attn_out, k, cache_len_before,
+                layer_nq, scale, window_size, layer.softcap,
+            );
+            kv_cache.layers[l].current_len += k;
+
+            // ── Per-position dispatches (O projection through post-FFN) ──
+            for bi in 0..k {
+                let attn_off = (bi * q_dim * 4) as u64;
+                let o_off = (bi * hidden * 4) as u64;
+                let h_off = (bi * hidden * 4) as u64;
+                let ffn_off = (bi * hidden * 4) as u64;
+                let gate_off_bi = (bi * inter * 4) as u64;
+                let down_off = (bi * hidden * 4) as u64;
+
+                // Step 7: O projection (format-aware)
+                let o_k_val = layer_q_dim as u32;
+                {
+                    let (o_pipeline, o_rpt, o_tpt) = match layer.wo.format {
+                        crate::QuantFormat::Q6_K => (&self.q6k_matvec_pipeline, q6k::ROWS_PER_TG, q6k::THREADS_PER_TG),
+                        _ => (&self.q4k_matvec_pipeline, q4k::ROWS_PER_TG, q4k::THREADS_PER_TG),
+                    };
+                    let n_tgs_o = (hidden as u64).div_ceil(o_rpt);
+                    enc.set_compute_pipeline_state(o_pipeline);
+                    enc.set_buffer(0, Some(&wo_bufs[l]), 0);
+                    enc.set_buffer(1, Some(&attn_out), attn_off);
+                    enc.set_buffer(2, Some(&o_out), o_off);
+                    enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(4, 4, &o_k_val as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_thread_groups(MTLSize::new(n_tgs_o, 1, 1), MTLSize::new(o_tpt, 1, 1));
+                }
+
+                // Step 8: Post-attn norm + residual (Gemma 3 post-norm)
+                if layer.has_post_norms {
+                    let normed_o_off = (bi * hidden * 4) as u64;
+                    let len_val = hidden as u32;
+
+                    // rms_norm(o_out) → normed_scratch
+                    enc.set_compute_pipeline_state(&self.rms_norm_pipeline);
+                    enc.set_buffer(0, Some(&o_out), o_off);
+                    enc.set_buffer(1, Some(&post_attn_norm_bufs[l]), 0);
+                    enc.set_buffer(2, Some(&normed_scratch), normed_o_off);
+                    enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+                    enc.set_bytes(5, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+
+                    // pre_ffn_norm(h + normed_o) → ffn_norm_out (fused residual_norm)
+                    let pre_ffn_buf = if let Some(pfn) = layer.pre_ffn_norm {
+                        self.bufs.transient_from_f32(pfn)
+                    } else {
+                        post_attn_norm_bufs[l].clone()
+                    };
+                    enc.set_compute_pipeline_state(&self.residual_norm_pipeline);
+                    enc.set_buffer(0, Some(h_buf), h_off);
+                    enc.set_buffer(1, Some(&normed_scratch), normed_o_off);
+                    enc.set_buffer(2, Some(&pre_ffn_buf), 0);
+                    enc.set_buffer(3, Some(&ffn_norm_out), ffn_off);
+                    enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
+                    enc.set_bytes(6, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+
+                    // h_post_attn = h + normed_o (direct dispatch with offsets)
+                    enc.set_compute_pipeline_state(&self.residual_add_pipeline);
+                    enc.set_buffer(0, Some(h_buf), h_off);
+                    enc.set_buffer(1, Some(&normed_scratch), normed_o_off);
+                    enc.set_buffer(2, Some(&h_post_attn), h_off);
+                    enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+                }
+
+                // Step 9: FFN — fused GEGLU+down (Q4_K path)
+                let down_is_q6k = layer.down.format == crate::QuantFormat::Q6_K;
+                if !down_is_q6k && layer.is_gated() {
+                    // Gate + Up (separate dispatches for now)
+                    let n_tgs_inter = (inter as u64).div_ceil(q4k::ROWS_PER_TG);
+                    enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline);
+                    enc.set_buffer(0, Some(&gate_bufs[l]), 0);
+                    enc.set_buffer(1, Some(&ffn_norm_out), ffn_off);
+                    enc.set_buffer(2, Some(&gate_out), gate_off_bi);
+                    enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_thread_groups(MTLSize::new(n_tgs_inter, 1, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
+
+                    enc.set_buffer(0, Some(&up_bufs[l]), 0);
+                    enc.set_buffer(2, Some(&up_out), gate_off_bi);
+                    enc.dispatch_thread_groups(MTLSize::new(n_tgs_inter, 1, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
+
+                    // Fused GEGLU + down
+                    let geglu_down = match layer.activation {
+                        crate::Activation::GeluTanh => &self.q4k_geglu_gelu_tanh_down_pipeline,
+                        _ => &self.q4k_geglu_silu_down_pipeline,
+                    };
+                    let n_tgs_geglu = (hidden as u64).div_ceil(q4k_gd::ROWS_PER_TG);
+                    enc.set_compute_pipeline_state(geglu_down);
+                    enc.set_buffer(0, Some(&down_bufs[l]), 0);
+                    enc.set_buffer(1, Some(&gate_out), gate_off_bi);
+                    enc.set_buffer(2, Some(&up_out), gate_off_bi);
+                    enc.set_buffer(3, Some(&down_out), down_off);
+                    enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(5, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(n_tgs_geglu, 1, 1),
+                        MTLSize::new(q4k_gd::THREADS_PER_TG, 1, 1),
+                    );
+                } else {
+                    // Fallback: separate GEGLU + down (Q6_K or non-gated)
+                    let n_tgs_inter = (inter as u64).div_ceil(if down_is_q6k { q6k::ROWS_PER_TG } else { q4k::ROWS_PER_TG });
+                    let pipeline = if down_is_q6k { &self.q6k_matvec_pipeline } else { &self.q4k_matvec_pipeline };
+                    let threads = if down_is_q6k { q6k::THREADS_PER_TG } else { q4k::THREADS_PER_TG };
+
+                    enc.set_compute_pipeline_state(pipeline);
+                    enc.set_buffer(0, Some(&gate_bufs[l]), 0);
+                    enc.set_buffer(1, Some(&ffn_norm_out), ffn_off);
+                    enc.set_buffer(2, Some(&gate_out), gate_off_bi);
+                    enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_thread_groups(MTLSize::new(n_tgs_inter, 1, 1), MTLSize::new(threads, 1, 1));
+
+                    enc.set_buffer(0, Some(&up_bufs[l]), 0);
+                    enc.set_buffer(2, Some(&up_out), gate_off_bi);
+                    enc.dispatch_thread_groups(MTLSize::new(n_tgs_inter, 1, 1), MTLSize::new(threads, 1, 1));
+
+                    let geglu = match layer.activation {
+                        crate::Activation::GeluTanh => &self.geglu_gelu_tanh_pipeline,
+                        _ => &self.geglu_pipeline,
+                    };
+                    enc.set_compute_pipeline_state(geglu);
+                    enc.set_buffer(0, Some(&gate_out), gate_off_bi);
+                    enc.set_buffer(1, Some(&up_out), gate_off_bi);
+                    enc.set_buffer(2, Some(&up_out), gate_off_bi); // reuse as act_buf
+                    enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
+
+                    let n_tgs_down = (hidden as u64).div_ceil(if down_is_q6k { q6k::ROWS_PER_TG } else { q4k::ROWS_PER_TG });
+                    enc.set_compute_pipeline_state(pipeline);
+                    enc.set_buffer(0, Some(&down_bufs[l]), 0);
+                    enc.set_buffer(1, Some(&up_out), gate_off_bi);
+                    enc.set_buffer(2, Some(&down_out), down_off);
+                    enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_thread_groups(MTLSize::new(n_tgs_down, 1, 1), MTLSize::new(threads, 1, 1));
+                }
+
+                // Step 10: Post-FFN norm + residual → new_h
+                let len_val_h = hidden as u32;
+                if layer.has_post_norms {
+                    if let Some(post_ffn) = layer.post_ffn_norm {
+                        let post_ffn_buf = self.bufs.transient_from_f32(post_ffn);
+                        let normed_ffn_off = (bi * hidden * 4) as u64;
+
+                        // rms_norm(down_out) → normed_scratch
+                        enc.set_compute_pipeline_state(&self.rms_norm_pipeline);
+                        enc.set_buffer(0, Some(&down_out), down_off);
+                        enc.set_buffer(1, Some(&post_ffn_buf), 0);
+                        enc.set_buffer(2, Some(&normed_scratch), normed_ffn_off);
+                        enc.set_bytes(3, 4, &len_val_h as *const u32 as *const std::ffi::c_void);
+                        enc.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+                        enc.set_bytes(5, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+                        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+
+                        // new_h = h_post_attn + normed_ffn
+                        enc.set_compute_pipeline_state(&self.residual_add_pipeline);
+                        enc.set_buffer(0, Some(&h_post_attn), h_off);
+                        enc.set_buffer(1, Some(&normed_scratch), normed_ffn_off);
+                        enc.set_buffer(2, Some(new_h), h_off);
+                        enc.set_bytes(3, 4, &len_val_h as *const u32 as *const std::ffi::c_void);
+                        enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+                    }
+                } else {
+                    // Pre-norm: new_h = h_post_attn + down_out
+                    enc.set_compute_pipeline_state(&self.residual_add_pipeline);
+                    enc.set_buffer(0, Some(&h_post_attn), h_off);
+                    enc.set_buffer(1, Some(&down_out), down_off);
+                    enc.set_buffer(2, Some(new_h), h_off);
+                    enc.set_bytes(3, 4, &len_val_h as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+                }
+            }
+
+            h_buf = new_h;
+        }
+
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        super::buffers::read_buffer_f32(h_buf, k * hidden)
     }
 }

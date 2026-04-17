@@ -137,7 +137,7 @@ impl Backend {
                         for &b in &buf[..n] {
                             let c = b as char;
                             line_buf.push(c);
-                            if c == '\n' || line_buf.len() > 80 {
+                            if c == '\n' {
                                 let _ = stdout_tx.send(line_buf.clone());
                                 line_buf.clear();
                             }

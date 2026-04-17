@@ -27,6 +27,36 @@ impl MetalBackend {
     ///   - Q4_K:  fused gate+up kernel + q4k_matvec (uint4, 8 rows/TG, nr0=2)
     ///   - Q4_0:  legacy Q8-input path
     #[allow(clippy::too_many_arguments)]
+    /// Decode one token, optionally probing h_post_attn at a specific layer.
+    ///
+    /// When `probe_layer` is Some(L), copies `h_post_attn` at layer L into a
+    /// side buffer and returns it alongside the final output. This lets the
+    /// caller run KNN overlay checks on the probed residual WITHOUT breaking
+    /// the GPU pipeline — the entire 34-layer decode stays in one cmd buffer.
+    ///
+    /// Returns (final_h, Option<probe_h>).
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_token_with_probe(
+        &self,
+        kv_cache: &mut ops::kv_cache::KVCache,
+        layers: &[crate::FullPipelineLayer],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _rope_base: f32,
+        probe_layer: Option<usize>,
+    ) -> (Vec<f32>, Option<Vec<f32>>) {
+        let result = self.decode_token_inner(kv_cache, layers, x, hidden, inter,
+            q_dim, kv_dim, _num_q_heads, _num_kv_heads, _head_dim, _rope_base,
+            probe_layer);
+        result
+    }
+
     pub fn decode_token(
         &self,
         kv_cache: &mut ops::kv_cache::KVCache,
@@ -41,6 +71,27 @@ impl MetalBackend {
         _head_dim: usize,
         _rope_base: f32,
     ) -> Vec<f32> {
+        self.decode_token_inner(kv_cache, layers, x, hidden, inter,
+            q_dim, kv_dim, _num_q_heads, _num_kv_heads, _head_dim, _rope_base,
+            None).0
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_token_inner(
+        &self,
+        kv_cache: &mut ops::kv_cache::KVCache,
+        layers: &[crate::FullPipelineLayer],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _rope_base: f32,
+        probe_layer: Option<usize>,
+    ) -> (Vec<f32>, Option<Vec<f32>>) {
         let num_layers = layers.len();
         let hidden_val = hidden as u32;
         let inter_val = inter as u32;
@@ -79,6 +130,12 @@ impl MetalBackend {
         let attn_out_buf = self.bufs.output((q_dim * 4) as u64);
         let o_out_buf = self.bufs.output((hidden * 4) as u64);
         let h_post_attn = self.bufs.output((hidden * 4) as u64);
+        // Probe buffer: if probe_layer is set, we copy h_post_attn here at that layer.
+        let probe_buf = if probe_layer.is_some() {
+            Some(self.bufs.output((hidden * 4) as u64))
+        } else {
+            None
+        };
         let ffn_norm_out = self.bufs.output((hidden * 4) as u64);
         let ffn_q8 = self.bufs.output(hidden as u64);
         let ffn_q8s = self.bufs.output((hidden / 32 * 4) as u64);
@@ -398,10 +455,10 @@ impl MetalBackend {
                 enc, &kv_cache.layers[l],
                 &self.kv_append_pipeline, &k_out, &v_out,
             );
-            ops::kv_cache::encode_kv_attend(
+            ops::kv_cache::encode_kv_attend_softcap(
                 enc, &kv_cache.layers[l],
                 &self.kv_attend_pipeline, &q_out, &attn_out,
-                layer_num_q_heads, scale, window_size,
+                layer_num_q_heads, scale, window_size, layer.softcap,
             );
             kv_cache.layers[l].current_len += 1;
 
@@ -549,6 +606,21 @@ impl MetalBackend {
                 enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
             }
 
+            // ── KNN probe: snapshot h_post_attn at the probe layer ──
+            // Uses residual_add(h_post_attn, zero, probe_buf) as a copy.
+            // One dispatch (~0.01 ms), no pipeline break.
+            if let Some(pl) = probe_layer {
+                if l == pl {
+                    if let Some(ref pb) = probe_buf {
+                        use crate::metal::ops::full_pipeline::encode_residual_add;
+                        let zero_vec = vec![0.0f32; hidden];
+                        let zero_buf = self.bufs.transient_from_f32(&zero_vec);
+                        encode_residual_add(enc, &self.residual_add_pipeline,
+                            &h_post_attn, &zero_buf, pb, hidden);
+                    }
+                }
+            }
+
             // DIAGNOSTIC: LARQL_SKIP_FFN=1 bypasses FFN entirely, returning h_post_attn
             // as the layer output. Used to isolate whether the Gemma 3 decode NaN
             // comes from attention+O-proj+post-attn-norm vs. FFN+post-FFN-norm.
@@ -564,7 +636,9 @@ impl MetalBackend {
                 enc.set_buffer(1, Some(&zero_buf), 0);
                 enc.set_buffer(2, Some(&new_h), 0);
                 enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
-                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+                // residual_add is per-element (no cooperative reduction), so dispatch ONE
+                // thread per output element across many threadgroups.
+                enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
                 h_buf = new_h;
                 continue; // skip steps 6-8
             }
@@ -720,43 +794,56 @@ impl MetalBackend {
                                 MTLSize::new(q4k_gu::THREADS_PER_TG, 1, 1),
                             );
                         }
-                        // GEGLU activation
-                        let geglu = match layer.activation {
-                            crate::Activation::GeluTanh => &self.geglu_gelu_tanh_pipeline,
-                            _ => &self.geglu_pipeline,
-                        };
-                        enc.set_compute_pipeline_state(geglu);
-                        enc.set_buffer(0, Some(&gate_out), 0);
-                        enc.set_buffer(1, Some(&up_out), 0);
-                        enc.set_buffer(2, Some(&act_buf), 0);
-                        enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
-                        enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
-                        // DIAGNOSTIC: LARQL_SKIP_DOWN=1 bypasses down projection (zero-fills down_out).
+                        // Fused GEGLU + down projection (S1 technique: activation
+                        // computed on-the-fly per row, no intermediate activation buffer).
+                        // Saves one full dispatch + one read/write of the inter-sized buffer.
+                        // Falls back to separate dispatches for Q6_K down weights.
                         let skip_down = std::env::var("LARQL_SKIP_DOWN").ok().as_deref() == Some("1");
                         if skip_down {
+                            // DIAGNOSTIC: zero-fill down_out
                             let zero_vec = vec![0.0f32; hidden];
                             let zero_buf = self.bufs.transient_from_f32(&zero_vec);
-                            let len_val = hidden as u32;
-                            enc.set_compute_pipeline_state(&self.residual_add_pipeline);
-                            enc.set_buffer(0, Some(&zero_buf), 0);
-                            enc.set_buffer(1, Some(&zero_buf), 0);
-                            enc.set_buffer(2, Some(&down_out), 0);
-                            enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
-                            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+                            use crate::metal::ops::full_pipeline::encode_residual_add;
+                            encode_residual_add(enc, &self.residual_add_pipeline,
+                                &zero_buf, &zero_buf, &down_out, hidden);
+                        } else if !down_is_q6k {
+                            // Q4_K down: fused GEGLU+down kernel (same as walk-FFN S1)
+                            use crate::metal::shaders::q4k_geglu_down as q4k_gd;
+                            let geglu_down_pipeline = match layer.activation {
+                                crate::Activation::GeluTanh => &self.q4k_geglu_gelu_tanh_down_pipeline,
+                                _ => &self.q4k_geglu_silu_down_pipeline,
+                            };
+                            let n_tgs_geglu = (hidden as u64).div_ceil(q4k_gd::ROWS_PER_TG);
+                            enc.set_compute_pipeline_state(geglu_down_pipeline);
+                            enc.set_buffer(0, Some(&down_bufs[l]), 0);
+                            enc.set_buffer(1, Some(&gate_out), 0);
+                            enc.set_buffer(2, Some(&up_out), 0);
+                            enc.set_buffer(3, Some(&down_out), 0);
+                            enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(5, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                            enc.dispatch_thread_groups(
+                                MTLSize::new(n_tgs_geglu, 1, 1),
+                                MTLSize::new(q4k_gd::THREADS_PER_TG, 1, 1),
+                            );
                         } else {
-                            // Down projection: Q6_K for Ollama/Gemma 3, Q4_K for llama.cpp Q4_K_M.
-                            if down_is_q6k {
-                                enc.set_compute_pipeline_state(&self.q6k_matvec_pipeline);
-                            } else {
-                                enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline);
-                            }
+                            // Q6_K down: separate GEGLU + down (no fused kernel for Q6_K)
+                            let geglu = match layer.activation {
+                                crate::Activation::GeluTanh => &self.geglu_gelu_tanh_pipeline,
+                                _ => &self.geglu_pipeline,
+                            };
+                            enc.set_compute_pipeline_state(geglu);
+                            enc.set_buffer(0, Some(&gate_out), 0);
+                            enc.set_buffer(1, Some(&up_out), 0);
+                            enc.set_buffer(2, Some(&act_buf), 0);
+                            enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                            enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
+                            enc.set_compute_pipeline_state(&self.q6k_matvec_pipeline);
                             enc.set_buffer(0, Some(&down_bufs[l]), 0);
                             enc.set_buffer(1, Some(&act_buf), 0);
                             enc.set_buffer(2, Some(&down_out), 0);
                             enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
                             enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
-                            let threads = if down_is_q6k { q6k::THREADS_PER_TG } else { q4k::THREADS_PER_TG };
-                            enc.dispatch_thread_groups(MTLSize::new(n_tgs_down, 1, 1), MTLSize::new(threads, 1, 1));
+                            enc.dispatch_thread_groups(MTLSize::new(n_tgs_down, 1, 1), MTLSize::new(q6k::THREADS_PER_TG, 1, 1));
                         }
                     } else {
                         let n_tgs_up = (inter as u64).div_ceil(q4k::ROWS_PER_TG);
@@ -935,6 +1022,8 @@ impl MetalBackend {
             }
         }
 
-        super::buffers::read_buffer_f32(&h_buf, hidden)
+        let final_h = super::buffers::read_buffer_f32(&h_buf, hidden);
+        let probe_h = probe_buf.as_ref().map(|pb| super::buffers::read_buffer_f32(pb, hidden));
+        (final_h, probe_h)
     }
 }

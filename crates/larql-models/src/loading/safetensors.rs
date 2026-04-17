@@ -114,8 +114,24 @@ pub fn load_model_dir(path: impl AsRef<Path>) -> Result<ModelWeights, ModelError
             }
         } else {
             // Standard float path
+            // GPU decode mode: skip FFN + lm_head tensors (they come from Q4_K
+            // vindex files instead). Saves ~13 GB peak RSS for Gemma 3 4B.
+            let skip_ffn = std::env::var("LARQL_SKIP_FFN_LOAD").ok().as_deref() == Some("1");
             for (name, view) in st.tensors() {
                 let key = normalize_key(&name, prefixes);
+                if skip_ffn {
+                    let kl = key.to_lowercase();
+                    if kl.contains("gate_proj") || kl.contains("up_proj")
+                        || kl.contains("down_proj") || kl.contains("lm_head")
+                        || kl.contains("ffn_gate") || kl.contains("ffn_up")
+                        || kl.contains("ffn_down") {
+                        continue;
+                    }
+                    // Note: q_proj/k_proj/v_proj/o_proj are NOT skipped here
+                    // because CPU prefill still uses f32 attention weights.
+                    // Once GPU prefill (prefill_q4 for post-norm) ships, those
+                    // can be skipped too — saving another ~4 GB.
+                }
                 let shape = view.shape();
                 let data = match tensor_to_f32(&view) {
                     Ok(d) => d,

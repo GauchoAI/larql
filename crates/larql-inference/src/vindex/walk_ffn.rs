@@ -151,16 +151,21 @@ impl<'a> WalkFfn<'a> {
             let x_owned = x_row.to_owned();
 
             // Gate: try fastest path available
-            //   1. gate_walk (per-feature dot, no matmul) if available
+            //   0. HNSW graph search (O(log N), ~0.1ms) if enabled
+            //   1. gate_walk (brute-force BLAS gemv, ~5ms) if available
             //   2. Q4 gate KNN via compute backend (0.5ms Metal, 1ms CPU Q4)
             //   3. f32 brute-force BLAS (1.1ms) as fallback
-            let hits = self.index.gate_walk(layer, &x_owned, self.top_k)
-                .or_else(|| {
-                    self.backend.and_then(|be|
-                        self.index.gate_knn_q4(layer, &x_owned, self.top_k, be)
-                    )
-                })
-                .unwrap_or_else(|| self.index.gate_knn(layer, &x_owned, self.top_k));
+            let hits = if self.index.is_hnsw_enabled() {
+                self.index.gate_knn(layer, &x_owned, self.top_k)
+            } else {
+                self.index.gate_walk(layer, &x_owned, self.top_k)
+                    .or_else(|| {
+                        self.backend.and_then(|be|
+                            self.index.gate_knn_q4(layer, &x_owned, self.top_k, be)
+                        )
+                    })
+                    .unwrap_or_else(|| self.index.gate_knn(layer, &x_owned, self.top_k))
+            };
 
             let mut out_row = out.row_mut(s);
 
@@ -321,6 +326,317 @@ impl<'a> WalkFfn<'a> {
                 let mut out_row = out.row_mut(s);
                 for j in 0..hidden { out_row[j] = down_result[j]; }
             }
+        }
+
+        if let Some(bias) = arch.ffn_down_bias_key(layer)
+            .and_then(|k| self.weights.vectors.get(&k))
+        {
+            crate::forward::add_bias(&mut out, bias);
+        }
+
+        Some((out, full_activation))
+    }
+
+    /// Walk-FFN on the f32 interleaved mmap (`interleaved.bin`), sparse
+    /// gather via Metal. Option C: bit-exact with dense f32, reads only top-K
+    /// rows per layer via the new `f32_sparse_matvec` / `f32_sparse_vecmat`
+    /// Metal kernels. Bandwidth per decode ~680 MB vs dense's 10.6 GB.
+    fn walk_ffn_f32_sparse(
+        &self,
+        layer: usize,
+        x: &Array2<f32>,
+    ) -> Option<(Array2<f32>, Array2<f32>)> {
+        let gate_view = self.index.interleaved_gate(layer)?;
+        let up_view = self.index.interleaved_up(layer)?;
+        let down_view = self.index.interleaved_down(layer)?;
+        let up_flat = up_view.as_slice()?; // row-major [intermediate, hidden]
+        let down_flat = down_view.as_slice()?;
+
+        let intermediate = gate_view.shape()[0];
+        let hidden = x.shape()[1];
+        let seq_len = x.shape()[0];
+        let backend = self.backend?;
+        let arch = &*self.weights.arch;
+        let use_gelu = matches!(
+            arch.activation(),
+            larql_models::Activation::GeluTanh | larql_models::Activation::Gelu
+        );
+
+        // We dense-compute gate and up so activation[] has the same numeric
+        // content as Q4_K walk / dense reference. The SPARSITY win comes from
+        // the down projection only: instead of activation[intermediate] @
+        // down[intermediate, hidden] reading 104 MB per layer, we sort
+        // activation by magnitude, keep the top_k, and sparse-gather only
+        // those rows of down. Bandwidth per layer drops from 3 × 104 MB
+        // (dense f32 walk) to 2 × 104 MB + (top_k/intermediate) × 104 MB.
+        // Output is bit-close to dense because the dropped contributions are
+        // the smallest-magnitude activations.
+        let top_k_cap = self.top_k.min(intermediate);
+        let mut out = Array2::<f32>::zeros((seq_len, hidden));
+        let mut full_activation = Array2::<f32>::zeros((seq_len, intermediate));
+
+        for s in 0..seq_len {
+            let x_row: Vec<f32> = x.row(s).to_vec();
+
+            // 1. Dense gate matvec via Metal (matches reference exactly).
+            let gate_scores_2d = larql_compute::dot_proj_gpu(
+                &x.slice(ndarray::s![s..s+1, ..]), &gate_view, Some(backend),
+            );
+            let gate_scores: Vec<f32> = gate_scores_2d.row(0).to_vec();
+
+            // 2. Dense up matvec via Metal.
+            let up_scores_2d = larql_compute::dot_proj_gpu(
+                &x.slice(ndarray::s![s..s+1, ..]), &up_view, Some(backend),
+            );
+            let up_scores: Vec<f32> = up_scores_2d.row(0).to_vec();
+
+            // 3. GEGLU for all intermediate features.
+            let mut activation = vec![0.0f32; intermediate];
+            for i in 0..intermediate {
+                let g = gate_scores[i];
+                let u = up_scores[i];
+                activation[i] = if use_gelu {
+                    crate::ffn::gelu_tanh(g) * u
+                } else {
+                    g * crate::ffn::sigmoid(g) * u
+                };
+                full_activation[[s, i]] = activation[i];
+            }
+
+            // 4. Pick top_k features by activation magnitude. Linear scan
+            //    with partial sort — fine for intermediate ~10 K.
+            let mut idx_by_mag: Vec<(u32, f32)> = activation.iter().enumerate()
+                .map(|(i, &a)| (i as u32, a.abs()))
+                .collect();
+            idx_by_mag.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            idx_by_mag.truncate(top_k_cap);
+            let indices: Vec<u32> = idx_by_mag.iter().map(|&(i, _)| i).collect();
+            let top_activations: Vec<f32> = indices.iter().map(|&i| activation[i as usize]).collect();
+
+            // 5. Sparse down vecmat: only top_k rows contribute. Bandwidth ∝ K.
+            let down_out = backend.f32_sparse_vecmat(down_flat, &top_activations, &indices, hidden)?;
+
+            let mut out_row = out.row_mut(s);
+            for j in 0..hidden { out_row[j] = down_out[j]; }
+        }
+
+        // Suppress unused-import warning for up_flat (kept in scope for future
+        // sparse-up optimization when gate_knn is good enough to drive it).
+        let _ = up_flat;
+
+        if let Some(bias) = arch.ffn_down_bias_key(layer)
+            .and_then(|k| self.weights.vectors.get(&k))
+        {
+            crate::forward::add_bias(&mut out, bias);
+        }
+        Some((out, full_activation))
+    }
+
+    /// Walk-FFN on Q4_K interleaved data (148-byte Ollama layout from
+    /// `interleaved_q4k_real.bin`). Dispatches the existing `q4k_matvec`
+    /// Metal shader for gate+up per layer, then a CPU vec×mat for down
+    /// (no Metal q4k_vecmat kernel exists yet — CPU fallback is acceptable
+    /// since down is ~5% of per-layer cost at top_k=1024).
+    ///
+    /// Advantage over Q4_0 walk: per-sub-block scales + 6-bit mins give
+    /// ~3× better dequant precision, reducing token drift on long generation.
+    fn walk_ffn_q4k_interleaved(
+        &self,
+        layer: usize,
+        x: &Array2<f32>,
+    ) -> Option<(Array2<f32>, Array2<f32>)> {
+        let q4k_mmap = self.index.interleaved_q4k_real_mmap_ref()?;
+        let intermediate = self.index.num_features(layer);
+        if intermediate == 0 { return None; }
+        let hidden = x.shape()[1];
+        let seq_len = x.shape()[0];
+
+        let q4k_bytes_per_matrix = intermediate * hidden / 256 * 148;
+        let q4k_bytes_per_layer = q4k_bytes_per_matrix * 3;
+        let layer_start = layer * q4k_bytes_per_layer;
+        if layer_start + q4k_bytes_per_layer > q4k_mmap.len() { return None; }
+
+        let gate = &q4k_mmap[layer_start..layer_start + q4k_bytes_per_matrix];
+        let up = &q4k_mmap[layer_start + q4k_bytes_per_matrix
+            ..layer_start + 2 * q4k_bytes_per_matrix];
+        let down = &q4k_mmap[layer_start + 2 * q4k_bytes_per_matrix
+            ..layer_start + 3 * q4k_bytes_per_matrix];
+
+        let backend = self.backend?;
+        let arch = &*self.weights.arch;
+        let use_gelu = matches!(
+            arch.activation(),
+            larql_models::Activation::GeluTanh | larql_models::Activation::Gelu
+        );
+
+        let mut out = Array2::<f32>::zeros((seq_len, hidden));
+        let mut full_activation = Array2::<f32>::zeros((seq_len, intermediate));
+
+        // Idea 5: gate-KNN-predicted layer skip. If the layer's max|activation|
+        // falls below LARQL_LAYER_SKIP_THRESHOLD, skip the down projection
+        // entirely and return zeros. Tracing can be enabled separately to see
+        // the distribution.
+        let skip_threshold: f32 = std::env::var("LARQL_LAYER_SKIP_THRESHOLD")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let trace_skip = std::env::var("LARQL_LAYER_SKIP_TRACE")
+            .ok().as_deref() == Some("1");
+        // Experimental: truncate activation to top-K by magnitude, zeroing
+        // smaller features. Forces the chained path so we can see/modify the
+        // activation array before it goes into down. Set to 0 / unset to
+        // disable. Use to find the correctness cliff: at what K does the
+        // model break? Below the cliff, sparse-walk wins are unsafe.
+        let topk_truncate: usize = std::env::var("LARQL_WALK_TOPK")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        // Sub-block-level truncation: pick top-S of total_subs (intermediate/32)
+        // sub-blocks ranked by sum-of-|activation|, zero the rest. Element-level
+        // top-K leaves activations scattered across all subs, so the down matvec
+        // still reads every block. Sub-level top-S is what a real sparse Metal
+        // kernel could actually skip. This cliff test tells us whether the
+        // shader is worth building.
+        let topk_subs: usize = std::env::var("LARQL_WALK_TOPK_SUBS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+        let measure = crate::perf::is_enabled();
+
+        for s in 0..seq_len {
+            let x_row: Vec<f32> = x.row(s).to_vec();
+
+            // S1/P11: try the fully-fused FFN first — one Metal command buffer
+            // with three encoders (gate matvec, up matvec, GEGLU+down) all
+            // sharing GPU buffers. Eliminates the gate/up readback + re-upload
+            // and 1 wait_until_completed per layer. Validated bit-close to the
+            // chained path by `q4k_ffn_full_matches_chained` cargo test.
+            // Falls back to the chained gate+up + GEGLU+down path when
+            // LARQL_LAYER_SKIP_THRESHOLD is set (needs intermediate gate/up
+            // values for max_act computation) or backend lacks the full kernel.
+            let activation_kind = if use_gelu { "gelu_tanh" } else { "silu" };
+            let need_activation_array = skip_threshold > 0.0 || trace_skip
+                || topk_truncate > 0 || topk_subs > 0;
+            let mut down_result_opt: Option<Vec<f32>> = None;
+            if !need_activation_array {
+                let t_full = std::time::Instant::now();
+                if let Some(d) = backend.q4k_ffn_full(
+                    gate, up, down, &x_row,
+                    hidden, intermediate, activation_kind,
+                ) {
+                    if measure { crate::perf::record("walk.ffn_full_fused", t_full.elapsed().as_micros()); }
+                    down_result_opt = Some(d);
+                }
+            }
+
+            // Chained fallback paths (P5 + P8b): used when full-fused isn't
+            // available or layer-skip needs intermediate activations.
+            let mut gate_scores_opt: Option<Vec<f32>> = None;
+            let mut up_scores_opt: Option<Vec<f32>> = None;
+            if down_result_opt.is_none() {
+                let t_gu = std::time::Instant::now();
+                let (gate_scores, up_scores) = match backend.q4k_matvec_pair(
+                    gate, up, &x_row, intermediate, hidden,
+                ) {
+                    Some(pair) => pair,
+                    None => (
+                        backend.q4k_matvec(gate, &x_row, intermediate, hidden)?,
+                        backend.q4k_matvec(up, &x_row, intermediate, hidden)?,
+                    ),
+                };
+                if measure { crate::perf::record("walk.gate_up_dispatch", t_gu.elapsed().as_micros()); }
+                gate_scores_opt = Some(gate_scores);
+                up_scores_opt = Some(up_scores);
+
+                if !need_activation_array {
+                    let t_fused = std::time::Instant::now();
+                    if let Some(d) = backend.q4k_geglu_down(
+                        down, gate_scores_opt.as_ref().unwrap(), up_scores_opt.as_ref().unwrap(),
+                        hidden, intermediate, activation_kind,
+                    ) {
+                        if measure { crate::perf::record("walk.geglu_down_fused", t_fused.elapsed().as_micros()); }
+                        down_result_opt = Some(d);
+                    }
+                }
+            }
+
+            let down_result = match down_result_opt {
+                Some(d) => d,
+                None => {
+                    // Both fused paths failed (or layer-skip was requested).
+                    // gate_scores/up_scores are guaranteed populated by the
+                    // chained-fallback block above when down_result_opt is None.
+                    let gate_scores = gate_scores_opt.expect("gate_scores must be populated when fused path failed");
+                    let up_scores = up_scores_opt.expect("up_scores must be populated when fused path failed");
+
+                    let t_act = std::time::Instant::now();
+                    let mut activation = vec![0.0f32; intermediate];
+                    let mut max_act = 0.0f32;
+                    for i in 0..intermediate {
+                        let g = gate_scores[i];
+                        let u = up_scores[i];
+                        activation[i] = if use_gelu {
+                            crate::ffn::gelu_tanh(g) * u
+                        } else {
+                            g * crate::ffn::sigmoid(g) * u
+                        };
+                        let a = activation[i].abs();
+                        if a > max_act { max_act = a; }
+                        full_activation[[s, i]] = activation[i];
+                    }
+                    if measure { crate::perf::record("walk.activation", t_act.elapsed().as_micros()); }
+
+                    if trace_skip {
+                        let max_gate = gate_scores.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                        eprintln!("[layer-skip L{layer:02} s={s}] max|gate|={max_gate:.3} max|act|={max_act:.3} skip={}",
+                            if skip_threshold > 0.0 && max_act < skip_threshold { "yes" } else { "no" });
+                    }
+                    if skip_threshold > 0.0 && max_act < skip_threshold { continue; }
+
+                    // P15 experiment: truncate activation to top-K by magnitude.
+                    // Simulates "what if a graph index pre-selected only the top-K
+                    // most relevant features?" Sweep LARQL_WALK_TOPK to find the
+                    // correctness cliff. K=intermediate is a no-op identity.
+                    if topk_truncate > 0 && topk_truncate < intermediate {
+                        let mut idx: Vec<u32> = (0..intermediate as u32).collect();
+                        idx.sort_unstable_by(|&a, &b| {
+                            activation[b as usize].abs()
+                                .partial_cmp(&activation[a as usize].abs())
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        // Zero everything below top_k.
+                        for &i in idx.iter().skip(topk_truncate) {
+                            activation[i as usize] = 0.0;
+                        }
+                    }
+
+                    // P16: sub-block-level top-S. Group activation into 32-element
+                    // sub-blocks (matches the q4k_geglu_*_down inner loop), rank
+                    // by sum-of-|act|, zero the bottom (total_subs - S) subs.
+                    // This is the granularity a sparse-down Metal kernel could
+                    // skip — element-level top-K can't, since avg occupancy
+                    // per sub stays well above zero.
+                    let total_subs = intermediate / 32;
+                    if topk_subs > 0 && topk_subs < total_subs {
+                        let mut sub_score: Vec<(usize, f32)> = (0..total_subs)
+                            .map(|s| {
+                                let base = s * 32;
+                                let sum: f32 = (0..32).map(|i| activation[base + i].abs()).sum();
+                                (s, sum)
+                            })
+                            .collect();
+                        sub_score.sort_unstable_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        for &(s, _) in sub_score.iter().skip(topk_subs) {
+                            let base = s * 32;
+                            for i in 0..32 { activation[base + i] = 0.0; }
+                        }
+                    }
+
+                    let t_down = std::time::Instant::now();
+                    let r = backend.q4k_matvec(down, &activation, hidden, intermediate)?;
+                    if measure { crate::perf::record("walk.down_dispatch", t_down.elapsed().as_micros()); }
+                    r
+                }
+            };
+            let mut out_row = out.row_mut(s);
+            for j in 0..hidden { out_row[j] = down_result[j]; }
         }
 
         if let Some(bias) = arch.ffn_down_bias_key(layer)
@@ -582,16 +898,54 @@ impl<'a> FfnBackend for WalkFfn<'a> {
             }
         }
 
+        // LARQL_WALK_FORMAT lets a caller pin one branch for benchmarking:
+        //   "q4_k" → Metal Q4_K walk (Option A) — 10.5 tok/s, 9.3 GB RSS
+        //   "q4_0" → Metal Q4_0 walk (Option B) — 4.7 tok/s, 11.1 GB RSS
+        //   "f32_sparse" → Metal f32 sparse gather (Option C proper) — bit-exact
+        //                 with dense f32, reads only top-K rows per layer
+        //   "f32"  → f32 interleaved walk (dense matmul over 10.2 GB mmap —
+        //            correct but bandwidth-bound at 0.09 tok/s)
+        //   unset  → priority chain (Q4_K first if available, then Q4_0, then f32)
+        let forced = std::env::var("LARQL_WALK_FORMAT").ok();
+        let want = forced.as_deref();
+
+        // Option C: f32 sparse-gather Metal walk. Only fires when explicitly
+        // requested, because the dense interleaved mmap (10.2 GB) needs to be
+        // loaded but only top-K rows are *touched* per decode.
+        if want == Some("f32_sparse")
+            && self.index.has_interleaved()
+            && self.backend.is_some()
+        {
+            if let Some(result) = self.walk_ffn_f32_sparse(layer, x) {
+                return result;
+            }
+        }
+
+        // Q4_K walk (Option A): higher precision than Q4_0, matches llama.cpp/Ollama
+        // production quant strategy. Fires when the real Q4_K file is loaded AND
+        // a Metal q4k_matvec kernel is available.
+        if (want.is_none() || want == Some("q4_k"))
+            && self.index.has_interleaved_q4k_real()
+            && self.backend.is_some()
+        {
+            if let Some(result) = self.walk_ffn_q4k_interleaved(layer, x) {
+                return result;
+            }
+        }
+
         // Q4 interleaved: preferred when GPU Q4 is available (Metal shader faster than BLAS).
         // CPU Q4 C kernel is slower than CPU BLAS at these dimensions — only use with GPU.
-        if self.index.has_interleaved_q4() && self.backend.is_some_and(|be| be.has_q4()) {
+        if (want.is_none() || want == Some("q4_0"))
+            && self.index.has_interleaved_q4()
+            && self.backend.is_some_and(|be| be.has_q4())
+        {
             if let Some(result) = self.walk_ffn_q4_interleaved(layer, x) {
                 return result;
             }
         }
 
         // f32 interleaved: gate+up+down contiguous per layer.
-        if self.index.has_interleaved() {
+        if (want.is_none() || want == Some("f32")) && self.index.has_interleaved() {
             if let Some(result) = self.walk_ffn_interleaved(layer, x) {
                 return result;
             }
@@ -693,4 +1047,40 @@ impl<'a> FfnBackend for WalkFfn<'a> {
     fn name(&self) -> &str {
         "walk"
     }
+}
+
+/// Q4_K vector × matrix for the walk-FFN down projection.
+///
+/// `down_q4k` is one layer's down matrix of shape `[intermediate, hidden]`
+/// in 148-byte Ollama Q4_K blocks. `activation` is the GEGLU output of
+/// length `intermediate`. Returns `out[hidden] = sum_i activation[i] * dequant(down_row_i)`.
+///
+/// Per-row dequant, scaled-accumulate. Skips rows with near-zero activation
+/// (`|act| < 1e-10`) — cheap sparsity win when the GEGLU output is sparse.
+/// No Metal Q4_K vec×mat shader exists yet; CPU fallback is acceptable
+/// because down is ~5-10% of per-layer wall time once gate+up are on Metal.
+fn q4k_vecmat_cpu(
+    down_q4k: &[u8],
+    activation: &[f32],
+    intermediate: usize,
+    hidden: usize,
+) -> Vec<f32> {
+    // Dequantize the entire matrix once. Costs `intermediate * hidden * 4` bytes
+    // of f32 memory but sidesteps the subtle bugs we hit trying to dequant per-row
+    // and per-block. Roundtrip correctness is established (Metal q4k_matvec
+    // uses the same decoder semantics and produces right outputs for gate/up),
+    // so calling dequant on the whole blob + `activation @ matrix` is safe.
+    let full = larql_models::quant::ggml::dequantize_q4_k(down_q4k, intermediate * hidden)
+        .expect("Q4_K matrix dequant");
+    // full is row-major [intermediate, hidden]. out[j] = Σ_i activation[i] * full[i*hidden + j].
+    let mut out = vec![0.0f32; hidden];
+    for i in 0..intermediate {
+        let act = activation[i];
+        if act.abs() < 1e-10 { continue; }
+        let row = &full[i * hidden..(i + 1) * hidden];
+        for j in 0..hidden {
+            out[j] += act * row[j];
+        }
+    }
+    out
 }

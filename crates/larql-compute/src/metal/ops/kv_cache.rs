@@ -102,6 +102,24 @@ pub fn encode_kv_attend(
     scale: f32,
     window_size: u32,
 ) {
+    encode_kv_attend_softcap(enc, cache, attend_pipeline, q, out,
+        num_q_heads, scale, window_size, 0.0);
+}
+
+/// Same as `encode_kv_attend` but with optional softcap (Gemma 3: softcap=50).
+/// softcap=0.0 disables.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_kv_attend_softcap(
+    enc: &ComputeCommandEncoderRef,
+    cache: &LayerKVCache,
+    attend_pipeline: &ComputePipelineState,
+    q: &Buffer,
+    out: &Buffer,
+    num_q_heads: usize,
+    scale: f32,
+    window_size: u32,
+    softcap: f32,
+) {
     let t_val = (cache.current_len + 1) as u32;
     let hd = cache.head_dim as u32;
     let num_q_val = num_q_heads as u32;
@@ -118,6 +136,7 @@ pub fn encode_kv_attend(
     enc.set_bytes(7, 4, &num_kv as *const u32 as *const c_void);
     enc.set_bytes(8, 4, &scale as *const f32 as *const c_void);
     enc.set_bytes(9, 4, &window_size as *const u32 as *const c_void);
+    enc.set_bytes(10, 4, &softcap as *const f32 as *const c_void);
     enc.dispatch_thread_groups(
         MTLSize::new(num_q_heads as u64, 1, 1),
         MTLSize::new(256.min(cache.head_dim as u64), 1, 1),

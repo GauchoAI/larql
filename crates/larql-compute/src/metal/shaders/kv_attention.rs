@@ -20,6 +20,7 @@ kernel void kv_attention(
     constant uint&      num_kv  [[buffer(7)]],
     constant float&     scale   [[buffer(8)]],
     constant uint&      window_size [[buffer(9)]],
+    constant float&     softcap [[buffer(10)]],
     uint tg_id  [[threadgroup_position_in_grid]],
     uint tid    [[thread_index_in_threadgroup]],
     uint tg_sz  [[threads_per_threadgroup]],
@@ -47,6 +48,12 @@ kernel void kv_attention(
         }
         for (uint d = (head_dim & ~3u); d < head_dim; d++) dot += q[d] * k[d];
         dot *= scale;
+        // Optional softcap (Gemma 3: softcap=50). Clamp tanh argument to
+        // [-30, 30] to avoid Metal tanh() NaN for |arg| > ~44.
+        if (softcap > 0.0f) {
+            float arg = clamp(dot / softcap, -30.0f, 30.0f);
+            dot = tanh(arg) * softcap;
+        }
         tg_scores[t - t_start] = dot;
         local_max = max(local_max, dot);
     }

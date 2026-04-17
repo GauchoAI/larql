@@ -428,7 +428,7 @@ fn main() -> io::Result<()> {
         }
 
         // Timeout: if generating and no output for 3 seconds, assume done
-        if state.is_generating && state.last_output_time.elapsed().as_secs() >= 3 {
+        if state.is_generating && state.last_output_time.elapsed().as_secs() >= 30 {
             tui_log("[STATE] timeout → is_generating = false");
             if !state.assistant_buf.is_empty() {
                 let buf_copy = state.assistant_buf.clone();
@@ -467,6 +467,7 @@ fn main() -> io::Result<()> {
                                 });
                                 be.send(&format!("insert {} {} {}", parts[0], parts[1], parts[2]))?;
                                 state.is_generating = true;
+                                state.last_output_time = Instant::now();
                             }
                         } else if input.to_lowercase() == "quit" || input.to_lowercase() == "exit" {
                             break;
@@ -479,6 +480,7 @@ fn main() -> io::Result<()> {
                             state.assistant_buf.clear();
                             be.send(&format!("chat {input}"))?;
                             state.is_generating = true;
+                            state.last_output_time = Instant::now(); // reset timeout clock
                             state.tok_s = 0.0;
                         }
                         draw(&mut terminal, &state);

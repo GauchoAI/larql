@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use larql_inference::ComputeBackend;
 use larql_models::ModelWeights;
 use larql_vindex::{PatchedVindex, VindexConfig, ndarray::Array2, tokenizers};
 use tokio::sync::RwLock;
@@ -30,22 +31,45 @@ pub struct LoadedModel {
     pub infer_disabled: bool,
     /// Model weights, lazy-loaded on first INFER request.
     pub weights: std::sync::OnceLock<ModelWeights>,
+    /// ComputeBackend for the fast Metal path (mode=fast, mode=knn).
+    /// Lazy-initialized on first use; serializes inference requests via
+    /// `inference_lock` because the KV cache inside is shared mutable state.
+    pub backend: std::sync::OnceLock<std::sync::Arc<dyn ComputeBackend>>,
+    /// Serializes access to the Metal backend's KV cache. Held around any
+    /// `predict_honest_with_knn` / `capture_residual_post_attn_norm` call.
+    pub inference_lock: std::sync::Mutex<()>,
     /// Probe-confirmed feature labels: (layer, feature) → relation name.
     /// Loaded from feature_labels.json if present.
     pub probe_labels: HashMap<(usize, usize), String>,
+    /// Walk-only mode: after loading, FFN weights are dropped (~10.7 GB) and
+    /// the fast-path `/v1/infer mode=fast` routes through `WalkFfn` instead
+    /// of `WeightFfnGpu`. Set at server startup via `--walk-only`.
+    pub walk_only: bool,
 }
 
 impl LoadedModel {
-    /// Get or lazy-load model weights for inference.
+    /// Get or lazy-load model weights for inference. Drops FFN tensors when
+    /// `walk_only` is set (reclaims ~10.7 GB for a 4B model).
     pub fn get_or_load_weights(&self) -> Result<&ModelWeights, String> {
         if let Some(w) = self.weights.get() {
             return Ok(w);
         }
         let mut cb = larql_vindex::SilentLoadCallbacks;
-        let weights = larql_vindex::load_model_weights(&self.path, &mut cb)
+        let mut weights = larql_vindex::load_model_weights(&self.path, &mut cb)
             .map_err(|e| format!("failed to load model weights: {e}"))?;
+        if self.walk_only {
+            let freed = weights.drop_ffn_weights();
+            tracing::info!("[walk-only] dropped FFN weights: {:.1} GB freed", freed as f64 / 1e9);
+        }
         let _ = self.weights.set(weights);
         Ok(self.weights.get().unwrap())
+    }
+
+    /// Get or lazy-init the shared ComputeBackend (Metal when available).
+    pub fn get_or_init_backend(&self) -> &std::sync::Arc<dyn ComputeBackend> {
+        self.backend.get_or_init(|| {
+            std::sync::Arc::from(larql_inference::default_backend())
+        })
     }
 }
 

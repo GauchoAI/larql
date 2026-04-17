@@ -2,6 +2,7 @@
 
 pub mod describe;
 pub mod explain;
+pub mod generate_stream;
 pub mod health;
 pub mod infer;
 pub mod insert;
@@ -37,6 +38,7 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/explain-infer", post(explain::handle_explain))
         .route("/v1/insert", post(insert::handle_insert))
         .route("/v1/stream", get(stream::handle_stream))
+        .route("/v1/generate", post(generate_stream::handle_generate_stream))
         .route("/v1/health", get(health::handle_health))
         .route("/v1/models", get(models::handle_models))
         .with_state(state)

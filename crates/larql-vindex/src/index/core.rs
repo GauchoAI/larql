@@ -73,6 +73,10 @@ pub struct VectorIndex {
     pub(crate) hnsw_cache: Mutex<Vec<Option<super::hnsw::HnswLayer>>>,
     pub(crate) hnsw_enabled: std::sync::atomic::AtomicBool,
     pub(crate) hnsw_ef_search: std::sync::atomic::AtomicUsize,
+    /// Cached f32 gate vectors per layer, shared via Arc so HNSW search
+    /// doesn't clone the ~100MB matrix on every call. Populated on first
+    /// HNSW call per layer.
+    pub(crate) hnsw_gate_refs: Mutex<Vec<Option<Arc<Vec<f32>>>>>,
     /// Mmap'd lm_head (output projection): [vocab_size, hidden_size], f32.
     pub(crate) lm_head_mmap: Option<Arc<memmap2::Mmap>>,
     pub vocab_size: usize,
@@ -81,7 +85,12 @@ pub struct VectorIndex {
     /// Q4_0 quantized interleaved FFN data (7x smaller, dequant on read).
     pub(crate) interleaved_q4_mmap: Option<Arc<memmap2::Mmap>>,
     /// Q4_K/Q6_K quantized interleaved FFN data (Ollama-compatible, matches attn format).
+    /// Historical: this file is actually Q6_K data despite the name —
+    /// `build_q4k_weights.rs` uses quantize_q6_k for FFN matrices.
     pub(crate) interleaved_q4k_mmap: Option<Arc<memmap2::Mmap>>,
+    /// True Q4_K interleaved FFN data (148-byte Ollama Q4_K blocks, matching
+    /// the `q4k_matvec` Metal shader). File: `interleaved_q4k_real.bin`.
+    pub(crate) interleaved_q4k_real_mmap: Option<Arc<memmap2::Mmap>>,
 
     /// Q4_0 gate vectors mmap — for fast Q4 KNN via larql-compute.
     pub(crate) gate_q4_mmap: Option<Arc<memmap2::Mmap>>,
@@ -127,11 +136,13 @@ impl Clone for VectorIndex {
             hnsw_ef_search: std::sync::atomic::AtomicUsize::new(
                 self.hnsw_ef_search.load(Ordering::Relaxed)
             ),
+            hnsw_gate_refs: Mutex::new((0..self.num_layers).map(|_| None).collect()),
             lm_head_mmap: self.lm_head_mmap.clone(),
             vocab_size: self.vocab_size,
             interleaved_mmap: self.interleaved_mmap.clone(),
             interleaved_q4_mmap: self.interleaved_q4_mmap.clone(),
             interleaved_q4k_mmap: self.interleaved_q4k_mmap.clone(),
+            interleaved_q4k_real_mmap: self.interleaved_q4k_real_mmap.clone(),
             gate_q4_mmap: self.gate_q4_mmap.clone(),
             gate_q4_slices: self.gate_q4_slices.clone(),
             lm_head_q4_mmap: self.lm_head_q4_mmap.clone(),
@@ -171,11 +182,13 @@ impl VectorIndex {
             hnsw_cache: Mutex::new((0..num_layers).map(|_| None).collect()),
             hnsw_enabled: std::sync::atomic::AtomicBool::new(false),
             hnsw_ef_search: std::sync::atomic::AtomicUsize::new(200),
+            hnsw_gate_refs: Mutex::new((0..num_layers).map(|_| None).collect()),
             lm_head_mmap: None,
             vocab_size: 0,
             interleaved_mmap: None,
             interleaved_q4_mmap: None,
             interleaved_q4k_mmap: None,
+            interleaved_q4k_real_mmap: None,
             gate_q4_mmap: None,
             gate_q4_slices: Vec::new(),
             lm_head_q4_mmap: None,
@@ -216,11 +229,13 @@ impl VectorIndex {
             hnsw_cache: Mutex::new((0..num_layers).map(|_| None).collect()),
             hnsw_enabled: std::sync::atomic::AtomicBool::new(false),
             hnsw_ef_search: std::sync::atomic::AtomicUsize::new(200),
+            hnsw_gate_refs: Mutex::new((0..num_layers).map(|_| None).collect()),
             lm_head_mmap: None,
             vocab_size: 0,
             interleaved_mmap: None,
             interleaved_q4_mmap: None,
             interleaved_q4k_mmap: None,
+            interleaved_q4k_real_mmap: None,
             gate_q4_mmap: None,
             gate_q4_slices: Vec::new(),
             lm_head_q4_mmap: None,
@@ -389,11 +404,13 @@ impl VectorIndex {
             hnsw_cache: Mutex::new((0..num_layers).map(|_| None).collect()),
             hnsw_enabled: std::sync::atomic::AtomicBool::new(false),
             hnsw_ef_search: std::sync::atomic::AtomicUsize::new(200),
+            hnsw_gate_refs: Mutex::new((0..num_layers).map(|_| None).collect()),
             lm_head_mmap: None,
             vocab_size: 0,
             interleaved_mmap: None,
             interleaved_q4_mmap: None,
             interleaved_q4k_mmap: None,
+            interleaved_q4k_real_mmap: None,
             gate_q4_mmap: None,
             gate_q4_slices: Vec::new(),
             lm_head_q4_mmap: None,
@@ -510,6 +527,10 @@ impl GateIndex for VectorIndex {
         self.num_features(layer)
     }
 
+    fn is_hnsw_enabled(&self) -> bool {
+        self.is_hnsw_enabled()
+    }
+
     fn down_override(&self, layer: usize, feature: usize) -> Option<&[f32]> {
         self.down_overrides.get(&(layer, feature)).map(|v| v.as_slice())
     }
@@ -612,5 +633,17 @@ impl GateIndex for VectorIndex {
 
     fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> {
         self.interleaved_q4k_mmap.as_ref().map(|m| m.as_ref() as &[u8])
+    }
+
+    fn has_interleaved_q4k_real(&self) -> bool {
+        self.has_interleaved_q4k_real()
+    }
+
+    fn interleaved_q4k_real_mmap_ref(&self) -> Option<&[u8]> {
+        self.interleaved_q4k_real_mmap.as_ref().map(|m| m.as_ref() as &[u8])
+    }
+
+    fn attn_q4k_layer_data(&self, layer: usize) -> Option<[(&[u8], &str); 4]> {
+        self.attn_q4k_layer_data(layer)
     }
 }

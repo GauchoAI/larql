@@ -1,0 +1,145 @@
+A cool attention variant was widely
+adopted in many leading solutions in OpenAI's
+parameter golf challenge. But how does it work
+in a transformer architecture? We process an input sequence
+with a stack of attention and feedforward network layers. Let's take a closer look. The attention layer gathers
+relevant context for each token. We start with a sequence of token
+embeddings. Let's say x1 through x5. We obtain the value vectors
+by applying a learned linear transformation
+called the value matrix WV For each token, the attention
+layer produces its output by computing a weighted sum
+combination of these value vectors. The attention weights are computed
+as a scaled dot product between queries
+and keys, followed by a softmax. We then project each attention
+output using the learned linear
+transformation, WO. This allows us to update each token's
+embedding to incorporate relevant contextual information gathered from the rest of the sequence
+using residual connections. This all sounds great. But something's off here. We can break down
+this summation into two parts. One that sums over all previous
+tokens, and one that captures the contribution
+from the current token itself. This first component contains
+the rich contextual information we want attention to extract. The second component captures
+the value from the current token itself. To see why this could be a problem. Let's look at feedforward networks. The feedforward network processes each embedding independently. A typical feedforward
+network is a two layer MLP. First, we pass the input vector
+through a linear layer, then apply a nonlinear activation
+function. Finally, a second linear layer maps
+the result back to the original dimensionality
+of the token embedding As with the attention layer, We update the token embeddings
+using residual connections. Comparing these two processes, side by side makes the issue clear. Here, the value vector v-i is computed
+by applying a learned linear projection to the embedding
+x-i using the value matrix WV. This means the v-i direction, a linear function of x-i,
+is already a direction the residual and FFN pathway
+can express. This mixing of contextual
+and pointwise signals in the attention output poses
+a problem. it forces the attention mechanism
+to choose between modeling contextual relationships
+and pointwise features, leading to unnecessary competition
+between the two. One potential fix is simply to
+ignore the current token entirely. That is, make the self-attention
+exclusive for capturing context. But this simple approach
+does not work. Two main reasons. First, value vectors
+within a sequence tend to be positively correlated. Similar tokens
+have similar value directions. Consider the sentence. Shall we drive your car or my car? The word car appears twice at the start of training. Both occurrences
+share identical embeddings and therefore identical value
+vectors. Standard attention lets the second car attend heavily to the first car, so the second car absorbs
+the first car's value direction. Even though what the first car
+actually needs is context from your and the second car needs context
+from my. The self value direction bleeds in and crowds out
+the contextual signal. Even with the weight a-ii
+set to zero, the self value v-i direction can still leak
+into the attention output through nearby
+or semantically similar tokens. Second, preventing attention
+from attending to the current
+token can hurt performance because it removes the flexibility
+to use the weight a-ii as an attention sink, allowing the model
+to avoid assigning excessive weights to irrelevant tokens. Let's take a closer look
+at the problem with a trained model of sequence length 2048
+trained for 100 billion tokens. On the left, the average attention weight to the current
+token is relatively high. On the right, we see that
+the average cosine similarity between the attention output
+and each token's own value vector rises with layer depth. In other words,
+the attention output is heavily aligned with each token's own
+self-value vector direction. The paper refers to this
+as Attention Similarity Bias. This bias indicates
+that the attention mechanism wastes its capacity modeling the pointwise
+feature transformation rather than leveraging contextual
+information from other tokens. Therefore, the key idea is to remove the self-value vector v-i
+from the attention output y-i. This can be done
+with orthogonal projection. Let's visualize this process
+to build some intuition. Here we show five value vectors
+in three dimensional space using the attention weights computed
+from the query and key vectors. We scale the value vectors
+and sum them to form the attention output y5. To remove the self-value
+vector component, we need to find a vector z that is as close as possible
+to our attention output, and is also perpendicular
+to the self-value vector. In other words, the vector z is
+orthogonal to the self-value vector. But how do we find this vector
+z5? Here is a key fact
+from linear algebra. Any vector can be decomposed
+into exactly two parts, a component in the direction of the vector v
+and a component perpendicular to v. These two parts together
+reconstruct y exactly. So we can always write y as z plus alpha times v,
+where z is perpendicular to v. If we can find a scalar value alpha,
+we can determine the vector z by removing the vector alpha times v
+from the attention output y. So how do we actually compute
+the scalar value alpha? We need z to be perpendicular to v so their dot product must be zero. Applying the linearity property
+of the inner product, we can break the equation
+into two parts and rearrange it as follows. By moving the norm of the vector
+to the denominator. On the right hand side. we obtain the precise
+value of alpha. Plugging the alpha into the equation
+yields this expression. This is the core idea
+behind Exclusive Self Attention. And the beautiful thing is
+that this works regardless of how
+the attention weights were computed. We do not need to change the query,
+key, or value matrices. We only need to apply this one
+geometric correction at the end. Now let's see what this looks like
+in code. Here the input x has dimensions
+of batch size B, sequence length T, and the
+embedding vector dimension D. The standard multi-head attention computation
+stays completely unchanged. We compute the query, key, and value vectors
+using the learned linear projection, and then compute the attention
+output Y using the standard formula. The XSA mode simply adds two lines. First, we normalize each value
+vector to unit length, giving us Vn. Next, we remove from Y the component that lies in the direction of Vn. That is, we subtract
+Y's projection onto Vn from Y. That is it. Two lines of code changes. Drop this into any existing
+transformer and the attention output is now guaranteed to be orthogonal
+to the self value direction. As with standard attention,
+we compute the final output by applying the output projection
+matrix Wo. With this change,
+attention can focus exclusively on what
+it was always supposed to do. Gathering context from other tokens. But does it actually work? Let's look at the training
+and validation loss curves. The author tested three model sizes 0.7, 1.4 and 2.7 billion parameters. In each case, XSA sits below
+the baseline throughout training. The margin is not dramatic,
+but it is a consistent improvement in all cases, and the gap does
+not close as training continues. But what about downstream tasks? Here is the performance across a suite of language
+understanding benchmarks. The improvement grows
+as the model gets larger. One interpretation: bigger models have more attention
+capacity to begin with. So freeing that capacity
+from redundant self-direction encoding yields larger
+absolute gains. But practical adoption
+depends on more than accuracy. Does adding XSA slow things down? Here, the paper reports the speed
+and peak memory usage under different sequence lengths compared to standard attention. XSA introduces
+minimal computational overhead. The same trend holds
+for varying model sizes. But how robust is this to changes in hyperparameters
+like the learning rate? The learning rate sweep addresses
+this concern Across a wide range of learning
+rates. XSA consistently outperforms
+the baseline. This matters because adding just
+two lines of code to your existing training setup can yield
+improvements almost for free, without requiring any
+additional hyperparameter tuning. Furthermore, as we increase
+the sequence length from 512 tokens to 1024, 2048, all the way up to 16,000, the gap between XSA and the baseline
+grows larger. Think about why this should be true. The whole point of XSA
+is to help the attention layer focus on contextual information
+from other tokens. When your sequence is short,
+there is not much long range context to gather, but as the sequence grows longer, the value of accurately
+integrating information from many distant positions
+increases. Standard attention wastes capacity by redundantly encoding each token's
+own information, a problem that intensifies
+with longer sequences. XSA eliminates this inefficiency, with benefits that grow
+as contextual demands increase. To sum up: two lines of code. No changes to the standard attention computation
+and minimal compute overhead. The attention output
+is now orthogonal to the self-value direction. Enabling attention to focus solely
+on contextual information. The gains hold across model sizes. learning rates, and sequence lengths. What we do not yet know is whether
+they persist at much larger scales. That said, this is certainly
+a promising direction. Thanks for watching
+and I'll see you next time.

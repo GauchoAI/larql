@@ -54,9 +54,11 @@ pub fn run_ffn(
     ffn: &dyn FfnBackend,
     capture_activation: bool,
 ) -> (Array2<f32>, Option<Array2<f32>>) {
+    let measure = crate::perf::is_enabled();
     let norm_offset = weights.arch.norm_weight_offset();
     let arch = &*weights.arch;
 
+    let t_pre = std::time::Instant::now();
     let pre_ffn_key = if arch.has_post_norms() {
         arch.pre_feedforward_layernorm_key(layer)
     } else {
@@ -66,6 +68,7 @@ pub fn run_ffn(
         Some(key) => apply_norm(weights, h_post_attn, &key, norm_offset),
         None => rms_norm(h_post_attn, None, norm_offset),
     };
+    if measure { crate::perf::record("walk.pre_ffn_norm", t_pre.elapsed().as_micros()); }
 
     let trace = std::env::var("LARQL_TRACE_FFN").ok().as_deref() == Some("1");
     if trace {
@@ -86,6 +89,7 @@ pub fn run_ffn(
         eprintln!("[ffn-cpu] L{layer:02} ffn_out amax={fo_amax:.2}");
     }
 
+    let t_post = std::time::Instant::now();
     let res_mult = arch.residual_multiplier();
     let h_out = if arch.has_post_norms() {
         let normed = match arch.post_feedforward_layernorm_key(layer) {
@@ -106,6 +110,7 @@ pub fn run_ffn(
     } else {
         h_post_attn + &ffn_out
     };
+    if measure { crate::perf::record("walk.post_ffn_norm_residual", t_post.elapsed().as_micros()); }
 
     (h_out, activation)
 }

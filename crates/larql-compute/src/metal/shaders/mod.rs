@@ -37,6 +37,7 @@ pub mod v_norm;
 pub mod turboquant_encode;
 pub mod turboquant_decode;
 pub mod graph_walk_knn;
+pub mod f32_sparse_walk;
 
 /// Concatenate all shaders into one MSL source string for compilation.
 pub fn all_shaders() -> String {
@@ -86,5 +87,7 @@ pub fn all_shaders() -> String {
     src.push_str(turboquant_decode::SHADER);
     // Graph walk KNN
     src.push_str(graph_walk_knn::SHADER);
+    // f32 sparse walk (Option C)
+    src.push_str(f32_sparse_walk::SHADER);
     src
 }

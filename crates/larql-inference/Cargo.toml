@@ -31,6 +31,9 @@ blas-src = { version = "0.10", features = ["accelerate"] }
 # Tokenizer
 tokenizers = "0.21"
 
+# Sampling (token-level RNG for temperature + top-p sampling)
+rand = "0.9"
+
 [features]
 default = []
 metal = ["larql-compute/metal"]

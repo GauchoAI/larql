@@ -237,6 +237,29 @@ impl VectorIndex {
         self.interleaved_q4k_mmap.is_some()
     }
 
+    /// Load the true Q4_K interleaved FFN file (`interleaved_q4k_real.bin`,
+    /// 148-byte Ollama Q4_K blocks — matches the `q4k_matvec` Metal shader).
+    /// The older `interleaved_q4k.bin` on disk is actually Q6_K data despite
+    /// its name, so we keep the new file on a separate mmap slot.
+    pub fn load_interleaved_q4k_real(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
+        let path = dir.join("interleaved_q4k_real.bin");
+        if !path.exists() {
+            return Err(VindexError::Parse("interleaved_q4k_real.bin not found".into()));
+        }
+        let file = std::fs::File::open(&path)?;
+        let mmap = unsafe { mmap_optimized(&file)? };
+        self.interleaved_q4k_real_mmap = Some(Arc::new(mmap));
+        Ok(())
+    }
+
+    pub fn has_interleaved_q4k_real(&self) -> bool {
+        self.interleaved_q4k_real_mmap.is_some()
+    }
+
+    pub fn interleaved_q4k_real_mmap_ref(&self) -> Option<&[u8]> {
+        self.interleaved_q4k_real_mmap.as_ref().map(|m| m.as_ref() as &[u8])
+    }
+
     /// Dequantize one matrix from Q4 interleaved file → f32 Array2.
     /// component: 0=gate, 1=up, 2=down
     fn dequant_q4_matrix(&self, layer: usize, component: usize) -> Option<ndarray::Array2<f32>> {

@@ -67,6 +67,9 @@ pub trait GateIndex {
     fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> { None }
     fn has_interleaved_q4k(&self) -> bool { false }
     fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> { None }
+    fn has_interleaved_q4k_real(&self) -> bool { false }
+    fn interleaved_q4k_real_mmap_ref(&self) -> Option<&[u8]> { None }
+    fn attn_q4k_layer_data(&self, _layer: usize) -> Option<[(&[u8], &str); 4]> { None }
 
     /// Gate KNN via Q4 matvec — scored by a ComputeBackend.
     /// Returns None if Q4 gate data isn't loaded or backend doesn't support Q4.
@@ -84,6 +87,10 @@ pub trait GateIndex {
     fn gate_walk(&self, _layer: usize, _residual: &Array1<f32>, _top_k: usize) -> Option<Vec<(usize, f32)>> {
         None // Override in VectorIndex to use mmap
     }
+
+    /// Whether HNSW graph search is enabled. When true, WalkFfn skips
+    /// brute-force gate_walk and routes through gate_knn (which dispatches HNSW).
+    fn is_hnsw_enabled(&self) -> bool { false }
 
     fn gate_knn_batch(&self, layer: usize, x: &Array2<f32>, top_k: usize) -> Vec<usize> {
         let seq_len = x.shape()[0];

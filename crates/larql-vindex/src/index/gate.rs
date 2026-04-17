@@ -173,6 +173,49 @@ impl VectorIndex {
     /// Per-feature gate walk: score each feature with an individual dot product.
     /// No matrix multiplication. Iterates gate vectors from mmap and computes
     /// dot products one feature at a time. Returns exact top-K.
+    /// Gate vectors for one layer as a flat f32 vec: [num_features × hidden].
+    /// Handles both f32 (zero-copy) and f16 (decode) mmap storage.
+    pub fn gate_layer_f32(&self, layer: usize) -> Option<Vec<f32>> {
+        let n = self.num_features(layer);
+        if n == 0 { return None; }
+        let elems = n * self.hidden_size;
+
+        if let Some(mmap) = &self.gate_mmap_bytes {
+            if let Some(slice) = self.gate_mmap_slices.get(layer) {
+                if slice.num_features == 0 { return None; }
+                match self.gate_mmap_dtype {
+                    crate::config::dtype::StorageDtype::F32 => {
+                        let off = slice.float_offset * 4;
+                        let end = off + elems * 4;
+                        if end <= mmap.len() {
+                            let data = unsafe {
+                                std::slice::from_raw_parts(
+                                    mmap[off..end].as_ptr() as *const f32, elems,
+                                )
+                            };
+                            return Some(data.to_vec());
+                        }
+                    }
+                    crate::config::dtype::StorageDtype::F16 => {
+                        let off = slice.float_offset * 2;
+                        let end = off + elems * 2;
+                        if end <= mmap.len() {
+                            return Some(crate::config::dtype::decode_floats(
+                                &mmap[off..end],
+                                crate::config::dtype::StorageDtype::F16,
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Fallback: heap
+        self.gate_vectors.get(layer)
+            .and_then(|v| v.as_ref())
+            .map(|m| m.as_slice().unwrap().to_vec())
+    }
+
     pub fn gate_walk(
         &self,
         layer: usize,
@@ -635,6 +678,22 @@ impl VectorIndex {
         }
     }
 
+    /// Shared f32 gate vectors for a layer via Arc. Populated lazily on first
+    /// call. Used by HNSW search to avoid cloning ~100MB of gate data per call.
+    fn gate_arc(&self, layer: usize) -> Option<std::sync::Arc<Vec<f32>>> {
+        {
+            let refs = self.hnsw_gate_refs.lock().unwrap();
+            if let Some(Some(arc)) = refs.get(layer) { return Some(arc.clone()); }
+        }
+        // Build it — fall back to one clone, then cache.
+        let data = self.gate_layer_f32(layer)?;
+        let arc = std::sync::Arc::new(data);
+        let mut refs = self.hnsw_gate_refs.lock().unwrap();
+        if refs.len() <= layer { refs.resize(layer + 1, None); }
+        refs[layer] = Some(arc.clone());
+        Some(arc)
+    }
+
     /// Gate KNN via HNSW: graph search instead of brute-force matmul.
     fn gate_knn_hnsw(
         &self,
@@ -646,16 +705,13 @@ impl VectorIndex {
 
         let ef = self.hnsw_ef_search.load(std::sync::atomic::Ordering::Relaxed);
 
-        // We need both the HNSW index and the vectors for search
+        // Arc-cached gate vectors (no clone on hot path).
+        let arc = self.gate_arc(layer)?;
+        let num_features = self.num_features(layer);
+        let view = ArrayView2::from_shape((num_features, self.hidden_size), arc.as_slice()).unwrap();
+
         let cache = self.hnsw_cache.lock().unwrap();
         let hnsw = cache[layer].as_ref()?;
-
-        // Get gate matrix for dot product computation during search
-        let (data, num_features) = self.gate_matrix_f32(layer)?;
-        let view = ArrayView2::from_shape(
-            (num_features, self.hidden_size), &data
-        ).unwrap();
-
         let results = hnsw.search(&view, residual, top_k, ef);
         Some(results)
     }

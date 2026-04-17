@@ -20,7 +20,7 @@ pub struct InferRequest {
 }
 
 fn default_top() -> usize { 5 }
-fn default_mode() -> String { "walk".into() }
+fn default_mode() -> String { "fast".into() }
 
 /// Extract session ID from headers.
 fn session_id(headers: &HeaderMap) -> Option<String> {
@@ -68,11 +68,91 @@ fn run_infer(
     let start = std::time::Instant::now();
 
     let is_compare = req.mode == "compare";
+    let use_fast = req.mode == "fast";
     let use_walk = req.mode == "walk" || is_compare;
     let use_dense = req.mode == "dense" || is_compare;
 
     let mut result = serde_json::Map::new();
     result.insert("prompt".into(), serde_json::json!(req.prompt));
+
+    if use_fast {
+        // Fast path: Metal f32 forward + KNN overlay consult. Sub-second
+        // prefill after the server's warmup pass. This is the route "ask"
+        // in bench_interactive routes through. When `walk_only` is set, the
+        // FFN backend swaps from dense WeightFfnGpu to the sparse Q4_0
+        // WalkFfn (uses `interleaved_q4.bin` mmap), trading ~2× decode
+        // speed for ~7 GB less RSS.
+        let run_fast = |patched: &larql_vindex::PatchedVindex| {
+            let backend = model.get_or_init_backend();
+            // Empty CachedLayerGraph — we don't actually cache any layers
+            // here; passing `build(&[])` would still invoke the FFN for the
+            // first layer, which panics in walk-only mode (dropped FFN
+            // tensors). `from_residuals` gives us an empty cache cheaply.
+            let cache = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
+            let knn_opt = if patched.knn_store.is_empty() {
+                None
+            } else { Some(&patched.knn_store) };
+
+            let walk_ffn_opt = if model.walk_only {
+                Some(larql_inference::WalkFfn::new_with_backend(
+                    weights, patched.base(), 1024, &**backend,
+                ))
+            } else { None };
+            let ffn_override: Option<&dyn larql_inference::ffn::FfnBackend> =
+                walk_ffn_opt.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
+
+            let _guard = match model.inference_lock.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            backend.reset_kv_cache();
+            let fast_start = std::time::Instant::now();
+            let pred = larql_inference::predict_honest_with_knn_ffn(
+                weights, &model.tokenizer, &token_ids, req.top,
+                patched.base(), &**backend, &cache,
+                0..weights.num_layers, knn_opt, ffn_override,
+            );
+            let fast_ms = fast_start.elapsed().as_secs_f64() * 1000.0;
+            (pred, fast_ms)
+        };
+
+        let (pred, fast_ms) = if let Some(sid) = session_id {
+            let sessions = state.sessions.sessions_blocking_write();
+            if let Some(session) = sessions.get(sid) {
+                run_fast(&session.patched)
+            } else {
+                drop(sessions);
+                let patched = model.patched.blocking_read();
+                run_fast(&patched)
+            }
+        } else {
+            let patched = model.patched.blocking_read();
+            run_fast(&patched)
+        };
+
+        let predictions: Vec<serde_json::Value> = pred
+            .predictions
+            .iter()
+            .map(|(tok, prob)| {
+                serde_json::json!({
+                    "token": tok,
+                    "probability": (*prob * 10000.0).round() / 10000.0,
+                })
+            })
+            .collect();
+        let knn_override = pred.predictions.first()
+            .map(|(s, _)| s.contains("KNN override"))
+            .unwrap_or(false);
+
+        result.insert("predictions".into(), serde_json::json!(predictions));
+        result.insert("mode".into(), serde_json::json!("fast"));
+        result.insert("fast_ms".into(), serde_json::json!((fast_ms * 10.0).round() / 10.0));
+        result.insert("knn_override".into(), serde_json::json!(knn_override));
+
+        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        result.insert("latency_ms".into(), serde_json::json!((latency_ms * 10.0).round() / 10.0));
+        return Ok(serde_json::Value::Object(result));
+    }
 
     // Helper: run walk inference against a PatchedVindex
     let run_walk = |patched: &larql_vindex::PatchedVindex| {

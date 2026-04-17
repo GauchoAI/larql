@@ -8,8 +8,10 @@ pub mod forward;
 pub mod graph_ffn;
 pub mod layer_graph;
 pub mod model;
+pub mod perf;
 pub mod route_ffn;
 pub mod residual;
+pub mod sampling;
 pub mod tokenizer;
 pub mod trace;
 pub mod vindex;
@@ -70,7 +72,10 @@ pub use layer_graph::{
     LayerGraph, LayerOutput, DenseLayerGraph, WalkLayerGraph, PipelinedLayerGraph,
     CachedLayerGraph, PerLayerGraph,
     predict_with_graph, predict_with_graph_vindex_logits, predict_pipeline,
-    predict_split_pass, predict_split_cached, predict_honest, generate, GenerateResult, AttentionCache,
+    predict_split_pass, predict_split_cached, predict_honest, predict_honest_with_knn,
+    predict_honest_with_knn_ffn, capture_residual_post_attn_norm,
+    capture_residual_post_attn_norm_ffn,
+    generate, GenerateResult, AttentionCache,
     hybrid::predict_hybrid,
     trace_with_graph, build_adaptive_graph,
     // Analysis/validation

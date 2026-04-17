@@ -19,6 +19,7 @@ axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+futures = "0.3"
 tonic = "0.13"
 prost = "0.13"
 tower = { version = "0.5", features = ["limit"] }
@@ -30,6 +31,10 @@ clap = { version = "4", features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[features]
+default = []
+metal = ["larql-inference/metal"]
 
 [build-dependencies]
 tonic-build = "0.13"

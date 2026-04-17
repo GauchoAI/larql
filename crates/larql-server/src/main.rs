@@ -91,9 +91,23 @@ struct Cli {
     /// TLS private key path for HTTPS.
     #[arg(long)]
     tls_key: Option<PathBuf>,
+
+    /// Skip Metal shader warmup at startup. Without warmup the first request
+    /// of each prompt length pays 10-20s of shader compilation; warmup moves
+    /// that cost out of the interactive loop. Default: warmup enabled.
+    #[arg(long)]
+    no_warmup: bool,
+
+    /// Walk-only mode: drop FFN weights after load (~10.7 GB reclaimed) and
+    /// route `/v1/infer mode=fast` through the sparse Q4_0 walk over the
+    /// vindex instead of dense Metal matmul. RSS drops from ~18 GB to ~11 GB
+    /// at the cost of ~2× slower decode. Requires `interleaved_q4.bin` in
+    /// the vindex (generate via `build_interleaved_q4` example).
+    #[arg(long)]
+    walk_only: bool,
 }
 
-fn load_single_vindex(path_str: &str, no_infer: bool) -> Result<LoadedModel, BoxError> {
+fn load_single_vindex(path_str: &str, no_infer: bool, walk_only: bool) -> Result<LoadedModel, BoxError> {
     let path = if larql_vindex::is_hf_path(path_str) {
         info!("Resolving HuggingFace path: {}", path_str);
         larql_vindex::resolve_hf_vindex(path_str)?
@@ -126,6 +140,14 @@ fn load_single_vindex(path_str: &str, no_infer: bool) -> Result<LoadedModel, Box
         Err(_) => info!("  Down features: not available"),
     }
     if let Ok(()) = index.load_up_features(&path) { info!("  Up features: loaded (full mmap FFN)") }
+    // Tiers the Metal fast path needs: lm_head (for finalize_logits), q4k/q8
+    // attn weights, interleaved Q4/Q4_K FFN mmaps. Matches bench_interactive.
+    let _ = index.load_lm_head(&path);
+    let _ = index.load_lm_head_q4(&path);
+    let _ = index.load_attn_q4k(&path);
+    let _ = index.load_attn_q8(&path);
+    let _ = index.load_interleaved_q4(&path);
+    let _ = index.load_interleaved_q4k(&path);
     index.warmup();
     info!("  Warmup: done");
 
@@ -158,7 +180,10 @@ fn load_single_vindex(path_str: &str, no_infer: bool) -> Result<LoadedModel, Box
         tokenizer,
         infer_disabled: no_infer,
         weights: std::sync::OnceLock::new(),
+        backend: std::sync::OnceLock::new(),
+        inference_lock: std::sync::Mutex::new(()),
         probe_labels,
+        walk_only,
     })
 }
 
@@ -205,13 +230,13 @@ async fn main() -> Result<(), BoxError> {
         }
         info!("Found {} vindexes in {}", paths.len(), dir.display());
         for p in &paths {
-            match load_single_vindex(&p.to_string_lossy(), cli.no_infer) {
+            match load_single_vindex(&p.to_string_lossy(), cli.no_infer, cli.walk_only) {
                 Ok(m) => models.push(Arc::new(m)),
                 Err(e) => warn!("  Skipping {}: {}", p.display(), e),
             }
         }
     } else if let Some(ref vindex_path) = cli.vindex_path {
-        let m = load_single_vindex(vindex_path, cli.no_infer)?;
+        let m = load_single_vindex(vindex_path, cli.no_infer, cli.walk_only)?;
         models.push(Arc::new(m));
     } else {
         return Err("must provide a vindex path or --dir".into());
@@ -219,6 +244,68 @@ async fn main() -> Result<(), BoxError> {
 
     if models.is_empty() {
         return Err("no vindexes loaded".into());
+    }
+
+    // Metal shader warmup: compile pipelines for common seq_lens up front
+    // so clients don't pay 10-20s for the first request of each length.
+    // Runs on spawn_blocking before the HTTP listener binds — we cannot
+    // call `RwLock::blocking_read` directly from the async runtime.
+    if !cli.no_warmup {
+        for m in &models {
+            if m.infer_disabled || !m.config.has_model_weights {
+                continue;
+            }
+            let m_cl = Arc::clone(m);
+            let id = m.id.clone();
+            info!("Warming up Metal shaders for model '{}' ...", id);
+            let t0 = std::time::Instant::now();
+            let report = tokio::task::spawn_blocking(move || -> Result<Vec<(usize, f64)>, String> {
+                let tw = std::time::Instant::now();
+                let weights = m_cl.get_or_load_weights()?;
+                tracing::info!("  weights loaded in {:.1}s", tw.elapsed().as_secs_f64());
+                let backend = m_cl.get_or_init_backend();
+                let bos = m_cl.tokenizer.encode("", true).ok()
+                    .and_then(|e| e.get_ids().first().copied())
+                    .unwrap_or(1);
+                let patched = m_cl.patched.blocking_read();
+                // Match the hot-path FFN at warmup time. When walk_only is set
+                // we must warm the Q4_0 walk kernel, not the dense matmul (the
+                // dense path would panic on dropped FFN weights anyway).
+                let walk_ffn_warmup = if m_cl.walk_only {
+                    Some(larql_inference::WalkFfn::new_with_backend(
+                        weights, patched.base(), 1024, &**backend,
+                    ))
+                } else { None };
+                let ffn_override: Option<&dyn larql_inference::ffn::FfnBackend> =
+                    walk_ffn_warmup.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
+                let mut timings = Vec::new();
+                for &n in &[1usize, 4, 8, 16, 32] {
+                    let ids: Vec<u32> = std::iter::repeat(bos).take(n).collect();
+                    // Empty CachedLayerGraph — avoids invoking the FFN (which
+                    // would panic in walk_only mode since FFN tensors were
+                    // dropped after load).
+                    let cache = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
+                    backend.reset_kv_cache();
+                    let t = std::time::Instant::now();
+                    let _ = larql_inference::predict_honest_with_knn_ffn(
+                        weights, &m_cl.tokenizer, &ids, 1, patched.base(),
+                        &**backend, &cache, 0..weights.num_layers, None, ffn_override,
+                    );
+                    let s = t.elapsed().as_secs_f64();
+                    tracing::info!("  seq_len={} {:.1}s", n, s);
+                    timings.push((n, s));
+                }
+                backend.reset_kv_cache();
+                Ok(timings)
+            }).await.map_err(|e| e.to_string())?;
+            match report {
+                Ok(timings) => {
+                    for (n, s) in timings { info!("  seq_len={} {:.1}s", n, s); }
+                    info!("Warmup done for '{}' in {:.1}s", id, t0.elapsed().as_secs_f64());
+                }
+                Err(e) => warn!("  warmup failed for '{}': {}", id, e),
+            }
+        }
     }
 
     // Parse rate limiter if specified.

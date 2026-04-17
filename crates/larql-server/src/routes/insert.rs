@@ -25,10 +25,16 @@ pub struct InsertRequest {
     pub alpha: f32,
     #[serde(default = "default_confidence")]
     pub confidence: f32,
+    /// `"constellation"` (default, legacy Architecture-A weight overlay via
+    /// walk-FFN residual capture, ~75 s) or `"knn"` (Architecture-B KNN
+    /// store via Metal f32 residual capture, ~400 ms).
+    #[serde(default = "default_insert_mode")]
+    pub mode: String,
 }
 
 fn default_alpha() -> f32 { 0.25 }
 fn default_confidence() -> f32 { 0.9 }
+fn default_insert_mode() -> String { "knn".into() }
 
 /// Extract session ID from headers.
 fn session_id(headers: &HeaderMap) -> Option<String> {
@@ -164,6 +170,113 @@ fn apply_insert(
     (inserted, use_constellation)
 }
 
+/// Architecture-B KNN-overlay insert via Metal f32 residual capture.
+///
+/// Runs `capture_residual_post_attn_norm` on the canonical prompt
+/// `"The {relation words} of {entity} is"`, adds a single entry to
+/// `patched.knn_store` at the install layer, returns timing + totals.
+fn run_insert_knn(
+    state: &AppState,
+    model: &LoadedModel,
+    req: &InsertRequest,
+    session_id: Option<&str>,
+    start: std::time::Instant,
+) -> Result<serde_json::Value, ServerError> {
+    if !model.config.has_model_weights {
+        return Err(ServerError::InferenceUnavailable(
+            "KNN insert requires model weights".into(),
+        ));
+    }
+    let weights = model
+        .get_or_load_weights()
+        .map_err(ServerError::InferenceUnavailable)?;
+
+    // Default install layer matches LQL and bench_interactive:
+    //   num_layers - 8 (L26 for Gemma 3 4B).
+    let install_layer: usize = req.layer.unwrap_or_else(||
+        model.config.num_layers.saturating_sub(8));
+
+    // Canonical prompt.
+    let rel_words = req.relation.replace(['-', '_'], " ");
+    let prompt = format!("The {rel_words} of {} is", req.entity);
+    let prompt_enc = model.tokenizer.encode(prompt.as_str(), true)
+        .map_err(|e| ServerError::Internal(format!("tokenize error: {e}")))?;
+    let token_ids: Vec<u32> = prompt_enc.get_ids().to_vec();
+
+    // Target token id — tokenize " {target}" and take first id.
+    let spaced_target = format!(" {}", req.target);
+    let tgt_enc = model.tokenizer.encode(spaced_target.as_str(), false)
+        .map_err(|e| ServerError::Internal(format!("tokenize target: {e}")))?;
+    let target_id: u32 = tgt_enc.get_ids().first().copied().unwrap_or(0);
+
+    // Capture residual via Metal forward. When walk_only is set, the dense
+    // FFN tensors were dropped — use a WalkFfn so capture reads from the
+    // vindex mmap. The stored key is in the pre_ffn_norm(h_post_attn) stage
+    // regardless of which FFN ran, so cosine queries stay comparable.
+    let key = {
+        let backend = model.get_or_init_backend();
+        // Use lock_ignore_poison pattern: the mutex only serializes; no
+        // invariant is broken by a prior panic.
+        let _guard = match model.inference_lock.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        backend.reset_kv_cache();
+
+        let patched = model.patched.blocking_read();
+        let walk_ffn = if model.walk_only {
+            Some(larql_inference::WalkFfn::new_with_backend(
+                weights, patched.base(), 1024, &**backend,
+            ))
+        } else { None };
+        let ffn_override: Option<&dyn larql_inference::ffn::FfnBackend> =
+            walk_ffn.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
+
+        let k = larql_inference::capture_residual_post_attn_norm_ffn(
+            weights, &token_ids, install_layer, &**backend, ffn_override,
+        );
+        backend.reset_kv_cache();
+        k
+    };
+    let key = key.ok_or_else(|| ServerError::Internal(
+        "residual capture failed (non-post-norm model or layer out of range)".into(),
+    ))?;
+
+    // Store. Session-scoped if X-Session-Id present; else global.
+    if let Some(sid) = session_id {
+        let mut sessions = state.sessions.sessions_blocking_write();
+        let now = std::time::Instant::now();
+        let session = sessions.entry(sid.to_string()).or_insert_with(|| {
+            let base = model.patched.blocking_read();
+            crate::session::SessionState::new(base.base().clone(), now)
+        });
+        session.touch(now);
+        session.patched.knn_store.add(
+            install_layer, key, target_id,
+            req.target.clone(), req.entity.clone(), req.relation.clone(),
+            req.confidence,
+        );
+    } else {
+        let mut patched = model.patched.blocking_write();
+        patched.knn_store.add(
+            install_layer, key, target_id,
+            req.target.clone(), req.entity.clone(), req.relation.clone(),
+            req.confidence,
+        );
+    }
+
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    Ok(serde_json::json!({
+        "entity": req.entity,
+        "relation": req.relation,
+        "target": req.target,
+        "layer": install_layer,
+        "mode": "knn",
+        "session": session_id,
+        "latency_ms": (latency_ms * 10.0).round() / 10.0,
+    }))
+}
+
 fn run_insert(
     state: &AppState,
     model: &LoadedModel,
@@ -171,6 +284,13 @@ fn run_insert(
     session_id: Option<&str>,
 ) -> Result<serde_json::Value, ServerError> {
     let start = std::time::Instant::now();
+
+    // KNN-overlay insert (Architecture B). Capture residual via Metal f32
+    // and add to PatchedVindex.knn_store. ~400 ms vs ~75 s for
+    // Architecture A walk-FFN capture below.
+    if req.mode == "knn" {
+        return run_insert_knn(state, model, req, session_id, start);
+    }
 
     // Determine insert layers
     let last = model.config.num_layers.saturating_sub(1);

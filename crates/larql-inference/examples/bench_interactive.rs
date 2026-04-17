@@ -434,10 +434,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Some(t) => t,
                             None => break,
                         };
-                        let tok = tokenizer.decode(&[tid], true).unwrap_or_default();
-                        let is_eos = tok.trim() == "<eos>" || tok.trim() == "</s>"
-                            || tok.trim() == "<end_of_turn>" || tok.trim() == "<|endoftext|>";
+                        // Check EOS with special tokens VISIBLE (decode(skip=false)),
+                        // then print with specials hidden (decode(skip=true)).
+                        let tok_raw = tokenizer.decode(&[tid], false).unwrap_or_default();
+                        let is_eos = tok_raw.contains("<end_of_turn>") || tok_raw.contains("<eos>")
+                            || tok_raw.contains("</s>") || tok_raw.contains("<|endoftext|>")
+                            || tid == 1 || tid == 0; // common EOS token IDs
                         if is_eos { stopped = true; break; }
+                        let tok = tokenizer.decode(&[tid], true).unwrap_or_default();
                         print!("{tok}"); stdout.flush().ok();
                         next = tid;
                     }

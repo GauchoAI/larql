@@ -100,20 +100,37 @@ impl Backend {
         let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
         let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
 
-        // Read stdout CHAR-BY-CHAR for real-time streaming.
-        // Accumulate into chunks separated by small time gaps or newlines.
+        // Read stdout CHAR-BY-CHAR with timeout flush for partial lines.
+        // The "> " prompt has no newline — must flush on timeout.
         std::thread::spawn(move || {
             use std::io::Read;
-            let mut reader = BufReader::new(stdout);
-            let mut buf = [0u8; 1];
+            use std::time::{Duration, Instant};
+            // Set non-blocking reads via polling
+            let mut reader = stdout;
+            let mut buf = [0u8; 256];
             let mut line_buf = String::new();
-            while reader.read(&mut buf).unwrap_or(0) == 1 {
-                let c = buf[0] as char;
-                line_buf.push(c);
-                // Send on newline or when we have accumulated text
-                if c == '\n' || line_buf.len() > 80 {
-                    let _ = stdout_tx.send(line_buf.clone());
-                    line_buf.clear();
+            let mut last_read = Instant::now();
+            loop {
+                // Try to read available bytes
+                match reader.read(&mut buf) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        for &b in &buf[..n] {
+                            let c = b as char;
+                            line_buf.push(c);
+                            if c == '\n' || line_buf.len() > 80 {
+                                let _ = stdout_tx.send(line_buf.clone());
+                                line_buf.clear();
+                            }
+                        }
+                        last_read = Instant::now();
+                        // Flush partial line immediately if it looks like a prompt
+                        if line_buf.trim() == ">" || line_buf.trim() == "> " {
+                            let _ = stdout_tx.send(line_buf.clone());
+                            line_buf.clear();
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
             if !line_buf.is_empty() {

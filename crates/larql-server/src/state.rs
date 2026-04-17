@@ -89,6 +89,8 @@ pub struct AppState {
     pub describe_cache: DescribeCache,
     /// RAG fact store for conversation-as-knowledge.
     pub rag_store: crate::routes::rag::RagStore,
+    /// K-vector RAG store — attention-based retrieval.
+    pub kv_rag_store: crate::routes::kv_rag::KvRagStore,
 }
 
 impl AppState {

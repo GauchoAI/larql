@@ -373,12 +373,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Or: chat "Write a Python chess game" 200
                 let (text_raw, n_raw) = split_trailing_int(rest);
                 let user_text = parse_quoted(text_raw);
-                // Default to 200 tokens for chat (split_trailing_int defaults to "20")
-                let n: usize = if n_raw == "20" && !rest.trim().ends_with("20") {
-                    200
-                } else {
-                    n_raw.parse().unwrap_or(200)
-                };
+                // No hardcoded limit — model stops on <end_of_turn> naturally.
+                // Cap at 4096 to prevent infinite loops on degenerate output.
+                let n: usize = 4096;
                 // System prompt — encourage complete responses
                 let system = "You are a helpful coding assistant. Always give complete, detailed answers. When writing code, provide the full working program in a markdown code block. Never cut your response short.";
                 let chat_prompt = format!(

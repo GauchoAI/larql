@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::time::Instant;
+use std::fs::OpenOptions;
 
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyModifiers, KeyEventKind};
 use crossterm::terminal::{
@@ -108,6 +109,15 @@ impl Backend {
         let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
         let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
 
+        // Log file for debugging
+        let log_path = std::env::temp_dir().join("larql-tui.log");
+        let log_file = Arc::new(Mutex::new(
+            OpenOptions::new().create(true).truncate(true).write(true).open(&log_path).ok()
+        ));
+        let log_stdout = Arc::clone(&log_file);
+        let log_stderr = Arc::clone(&log_file);
+        eprintln!("[larql-tui] log: {}", log_path.display());
+
         // Read stdout CHAR-BY-CHAR with timeout flush for partial lines.
         // The "> " prompt has no newline — must flush on timeout.
         std::thread::spawn(move || {
@@ -137,6 +147,13 @@ impl Backend {
                             let _ = stdout_tx.send(line_buf.clone());
                             line_buf.clear();
                         }
+                        // Log
+                        if let Ok(mut guard) = log_stdout.lock() {
+                            if let Some(ref mut f) = *guard {
+                                use std::io::Write;
+                                let _ = write!(f, "[stdout] {}", std::str::from_utf8(&buf[..n]).unwrap_or("?"));
+                            }
+                        }
                     }
                     Err(_) => break,
                 }
@@ -151,6 +168,12 @@ impl Backend {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 if let Ok(line) = line {
+                    if let Ok(mut guard) = log_stderr.lock() {
+                        if let Some(ref mut f) = *guard {
+                            use std::io::Write;
+                            let _ = writeln!(f, "[stderr] {}", line);
+                        }
+                    }
                     let _ = stderr_tx.send(line);
                 }
             }

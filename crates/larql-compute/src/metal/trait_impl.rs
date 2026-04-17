@@ -619,6 +619,12 @@ impl ComputeBackend for MetalBackend {
         *cache_guard = None; // drop entirely so next decode_token re-creates with correct layer count
     }
 
+    fn rollback_kv_cache(&self, n: usize) {
+        if let Some(kv) = self.kv_cache.lock().unwrap().as_mut() {
+            kv.rollback(n);
+        }
+    }
+
     fn debug_read_kv_layer(&self, layer: usize) -> Option<(Vec<f32>, Vec<f32>, usize)> {
         let guard = self.kv_cache.lock().ok()?;
         let kv = guard.as_ref()?;

@@ -58,6 +58,16 @@ impl KVCache {
     pub fn current_len(&self) -> usize {
         self.layers.first().map(|l| l.current_len).unwrap_or(0)
     }
+
+    /// Rollback: discard the last `n` tokens from the cache.
+    /// Safe because kv_attention reads `[0..current_len]`; stale data
+    /// at positions >= new current_len is simply never read.
+    /// Used by speculative decoding to undo rejected draft tokens.
+    pub fn rollback(&mut self, n: usize) {
+        for layer in &mut self.layers {
+            layer.current_len = layer.current_len.saturating_sub(n);
+        }
+    }
 }
 
 /// Encode KV append dispatch into an existing encoder.

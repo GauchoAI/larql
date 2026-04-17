@@ -125,6 +125,10 @@ pub trait ComputeBackend: Send + Sync {
     /// Reset KV cache (for new prompt).
     fn reset_kv_cache(&self) {}
 
+    /// Rollback KV cache: discard the last `n` tokens from all layers.
+    /// Used by speculative decoding to undo rejected draft tokens.
+    fn rollback_kv_cache(&self, _n: usize) {}
+
     /// Diagnostic: read back K and V cache contents for one layer.
     /// Returns (k_flat, v_flat, current_len) or None if unsupported.
     #[allow(clippy::type_complexity)]

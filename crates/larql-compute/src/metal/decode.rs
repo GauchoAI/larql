@@ -1135,29 +1135,56 @@ impl MetalBackend {
                 enc.set_bytes(5, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
                 enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
 
-                // Step 2: QKV projection — format-aware (Q4_K or Q6_K)
-                let k_val = hidden as u32;
-                let dispatch_proj = |enc: &metal::ComputeCommandEncoderRef,
-                                      w_buf: &metal::Buffer, in_buf: &metal::Buffer, in_off: u64,
-                                      out_buf: &metal::Buffer, out_off: u64,
-                                      rows: usize, fmt: crate::QuantFormat| {
-                    let n_val = rows as u32;
-                    let (pipeline, rows_per_tg, threads_per_tg) = match fmt {
-                        crate::QuantFormat::Q6_K => (&self.q6k_matvec_pipeline, q6k::ROWS_PER_TG, q6k::THREADS_PER_TG),
-                        _ => (&self.q4k_matvec_pipeline, q4k::ROWS_PER_TG, q4k::THREADS_PER_TG),
+                // Step 2: QKV projection — batched matvec (shared weight reads)
+                // For bi==0, dispatch ONE batched matvec for all K positions.
+                // Subsequent bi iterations skip this step.
+                if bi == 0 {
+                    let k_val = hidden as u32;
+                    let m_val = k as u32;
+                    let dispatch_batch_proj = |enc: &metal::ComputeCommandEncoderRef,
+                                               w_buf: &metal::Buffer,
+                                               in_buf: &metal::Buffer,  // [K, hidden]
+                                               out_buf: &metal::Buffer, // [K, rows] or [rows, K]
+                                               rows: usize, fmt: crate::QuantFormat| {
+                        let n_val = rows as u32;
+                        // Use batched pipeline: reads weights once, dots against K inputs
+                        match fmt {
+                            crate::QuantFormat::Q6_K => {
+                                let n_tgs = (rows as u64).div_ceil(q6k::ROWS_PER_TG);
+                                enc.set_compute_pipeline_state(&self.q6k_matvec_batch_pipeline);
+                                enc.set_buffer(0, Some(w_buf), 0);
+                                enc.set_buffer(1, Some(in_buf), 0);
+                                enc.set_buffer(2, Some(out_buf), 0);
+                                enc.set_bytes(3, 4, &n_val as *const u32 as *const std::ffi::c_void);
+                                enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
+                                enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
+                                enc.dispatch_thread_groups(
+                                    MTLSize::new(n_tgs, 1, 1),
+                                    MTLSize::new(q6k::THREADS_PER_TG, 1, 1),
+                                );
+                            }
+                            _ => {
+                                let n_tgs = (rows as u64).div_ceil(q4k::BATCH_ROWS_PER_TG);
+                                enc.set_compute_pipeline_state(&self.q4k_matvec_batch_pipeline);
+                                enc.set_buffer(0, Some(w_buf), 0);
+                                enc.set_buffer(1, Some(in_buf), 0);
+                                enc.set_buffer(2, Some(out_buf), 0);
+                                enc.set_bytes(3, 4, &n_val as *const u32 as *const std::ffi::c_void);
+                                enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
+                                enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
+                                enc.dispatch_thread_groups(
+                                    MTLSize::new(n_tgs, 1, 1),
+                                    MTLSize::new(q4k::BATCH_THREADS_PER_TG, 1, 1),
+                                );
+                            }
+                        }
                     };
-                    let n_tgs = (rows as u64).div_ceil(rows_per_tg);
-                    enc.set_compute_pipeline_state(pipeline);
-                    enc.set_buffer(0, Some(w_buf), 0);
-                    enc.set_buffer(1, Some(in_buf), in_off);
-                    enc.set_buffer(2, Some(out_buf), out_off);
-                    enc.set_bytes(3, 4, &n_val as *const u32 as *const std::ffi::c_void);
-                    enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
-                    enc.dispatch_thread_groups(MTLSize::new(n_tgs, 1, 1), MTLSize::new(threads_per_tg, 1, 1));
-                };
-                dispatch_proj(enc, &wq_bufs[l], &norm_buf, norm_off_bi, &q_out, q_off, layer_q_dim, layer.wq.format);
-                dispatch_proj(enc, &wk_bufs[l], &norm_buf, norm_off_bi, &k_out, k_off, kv_dim, layer.wk.format);
-                dispatch_proj(enc, &wv_bufs[l], &norm_buf, norm_off_bi, &v_out, v_off, kv_dim, layer.wv.format);
+                    // Input: norm_buf [K, hidden]. Output: q_out [q_dim, K], k_out [kv_dim, K], v_out [kv_dim, K]
+                    // Note: batch output layout is [row, M] (row-major, M batch positions per row)
+                    dispatch_batch_proj(enc, &wq_bufs[l], &norm_buf, &q_out, layer_q_dim, layer.wq.format);
+                    dispatch_batch_proj(enc, &wk_bufs[l], &norm_buf, &k_out, kv_dim, layer.wk.format);
+                    dispatch_batch_proj(enc, &wv_bufs[l], &norm_buf, &v_out, kv_dim, layer.wv.format);
+                }
 
                 // Step 3: QK-norm (Gemma 3)
                 if layer.q_norm_weight.is_some() {
@@ -1252,21 +1279,34 @@ impl MetalBackend {
                 let gate_off_bi = (bi * inter * 4) as u64;
                 let down_off = (bi * hidden * 4) as u64;
 
-                // Step 7: O projection (format-aware)
-                let o_k_val = layer_q_dim as u32;
-                {
-                    let (o_pipeline, o_rpt, o_tpt) = match layer.wo.format {
-                        crate::QuantFormat::Q6_K => (&self.q6k_matvec_pipeline, q6k::ROWS_PER_TG, q6k::THREADS_PER_TG),
-                        _ => (&self.q4k_matvec_pipeline, q4k::ROWS_PER_TG, q4k::THREADS_PER_TG),
-                    };
-                    let n_tgs_o = (hidden as u64).div_ceil(o_rpt);
-                    enc.set_compute_pipeline_state(o_pipeline);
-                    enc.set_buffer(0, Some(&wo_bufs[l]), 0);
-                    enc.set_buffer(1, Some(&attn_out), attn_off);
-                    enc.set_buffer(2, Some(&o_out), o_off);
-                    enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-                    enc.set_bytes(4, 4, &o_k_val as *const u32 as *const std::ffi::c_void);
-                    enc.dispatch_thread_groups(MTLSize::new(n_tgs_o, 1, 1), MTLSize::new(o_tpt, 1, 1));
+                // Step 7: O projection — batched matvec at bi==0
+                if bi == 0 {
+                    let o_k_val = layer_q_dim as u32;
+                    let m_val = k as u32;
+                    match layer.wo.format {
+                        crate::QuantFormat::Q6_K => {
+                            let n_tgs = (hidden as u64).div_ceil(q6k::ROWS_PER_TG);
+                            enc.set_compute_pipeline_state(&self.q6k_matvec_batch_pipeline);
+                            enc.set_buffer(0, Some(&wo_bufs[l]), 0);
+                            enc.set_buffer(1, Some(&attn_out), 0);
+                            enc.set_buffer(2, Some(&o_out), 0);
+                            enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(4, 4, &o_k_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
+                            enc.dispatch_thread_groups(MTLSize::new(n_tgs, 1, 1), MTLSize::new(q6k::THREADS_PER_TG, 1, 1));
+                        }
+                        _ => {
+                            let n_tgs = (hidden as u64).div_ceil(q4k::BATCH_ROWS_PER_TG);
+                            enc.set_compute_pipeline_state(&self.q4k_matvec_batch_pipeline);
+                            enc.set_buffer(0, Some(&wo_bufs[l]), 0);
+                            enc.set_buffer(1, Some(&attn_out), 0);
+                            enc.set_buffer(2, Some(&o_out), 0);
+                            enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(4, 4, &o_k_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
+                            enc.dispatch_thread_groups(MTLSize::new(n_tgs, 1, 1), MTLSize::new(q4k::BATCH_THREADS_PER_TG, 1, 1));
+                        }
+                    }
                 }
 
                 // Step 8: Post-attn norm + residual (Gemma 3 post-norm)

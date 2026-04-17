@@ -87,7 +87,92 @@ kernel void q4k_matvec(
         if (lane == 0) out[row_idx] = sum;
     }
 }
+// Batched Q4_K matvec: read weights once, dot against M input vectors.
+// out[row * M + m] = dot(W[row], X[m * K ..])
+// Reduces NR0 to 2 to fit M accumulators in registers.
+// Shared weight read = M× bandwidth saving.
+constant uint Q4K_BATCH_NR0 = 2;
+
+kernel void q4k_matvec_batch(
+    device const uchar*  W4K   [[buffer(0)]],
+    device const float*  X     [[buffer(1)]],   // [M, K]
+    device float*        out   [[buffer(2)]],   // [N, M]
+    constant uint&       N     [[buffer(3)]],
+    constant uint&       K     [[buffer(4)]],
+    constant uint&       M     [[buffer(5)]],   // batch size (1..8)
+    uint tg_id     [[threadgroup_position_in_grid]],
+    uint tid_in_tg [[thread_index_in_threadgroup]],
+    uint lane      [[thread_index_in_simdgroup]],
+    uint sg_id     [[simdgroup_index_in_threadgroup]])
+{
+    uint superblocks = K / 256;
+    uint bytes_per_row = superblocks * Q4K_BLOCK_SIZE;
+    uint total_subs = superblocks * 8;
+    uint first_row = (tg_id * 4 + sg_id) * Q4K_BATCH_NR0;
+
+    // acc[row][batch] — NR0=2, M up to 8 = 16 float registers
+    float acc[2][8];
+    for (uint r = 0; r < Q4K_BATCH_NR0; r++)
+        for (uint m = 0; m < 8; m++) acc[r][m] = 0.f;
+
+    for (uint sub = lane; sub < total_subs; sub += 32) {
+        uint sb = sub / 8;
+        uint j = sub % 8;
+        uint xi = sb * 256 + j * 32;
+
+        for (uint r = 0; r < Q4K_BATCH_NR0; r++) {
+            uint row_idx = first_row + r;
+            if (row_idx >= N) break;
+
+            device const uchar* block = W4K + row_idx * bytes_per_row + sb * Q4K_BLOCK_SIZE;
+            device const half* dh = (device const half*)block;
+            float d    = float(dh[0]);
+            float dmin = float(dh[1]);
+
+            device const uchar* sc_bytes = block + 4;
+            float sc = d * float(sc_bytes[j] & 0x3F);
+            float mn;
+            device const uchar* min_bytes = block + 16;
+            if (j < 4) mn = dmin * float(min_bytes[j] & 0x0F);
+            else mn = dmin * float((min_bytes[j - 4] >> 4) & 0x0F);
+
+            device const uint4* qp = (device const uint4*)(block + 20 + j * 16);
+            uint4 w = qp[0];
+
+            // Extract weight nibbles once, dot against M inputs
+            float wv[32];
+            #define EX(W, S, I) wv[I] = float((W>>S)&0xFu); wv[I+1] = float((W>>(S+4))&0xFu);
+            EX(w.x, 0, 0); EX(w.x, 8, 2); EX(w.x,16, 4); EX(w.x,24, 6);
+            EX(w.y, 0, 8); EX(w.y, 8,10); EX(w.y,16,12); EX(w.y,24,14);
+            EX(w.z, 0,16); EX(w.z, 8,18); EX(w.z,16,20); EX(w.z,24,22);
+            EX(w.w, 0,24); EX(w.w, 8,26); EX(w.w,16,28); EX(w.w,24,30);
+            #undef EX
+
+            for (uint m = 0; m < M; m++) {
+                float dot = 0.0f, xs = 0.0f;
+                for (uint i = 0; i < 32; i++) {
+                    float xv = X[m * K + xi + i];
+                    dot += wv[i] * xv;
+                    xs += xv;
+                }
+                acc[r][m] += sc * dot - mn * xs;
+            }
+        }
+    }
+
+    for (uint r = 0; r < Q4K_BATCH_NR0; r++) {
+        uint row_idx = first_row + r;
+        if (row_idx >= N) break;
+        for (uint m = 0; m < M; m++) {
+            float sum = simd_sum(acc[r][m]);
+            if (lane == 0) out[m * N + row_idx] = sum;
+        }
+    }
+}
 "#;
 
 pub const ROWS_PER_TG: u64 = 32; // 4 simdgroups × NR0=8 rows
 pub const THREADS_PER_TG: u64 = 128;  // 4 simdgroups × 32 lanes
+
+pub const BATCH_ROWS_PER_TG: u64 = 8; // 4 simdgroups × NR0=2 rows (for batched)
+pub const BATCH_THREADS_PER_TG: u64 = 128;

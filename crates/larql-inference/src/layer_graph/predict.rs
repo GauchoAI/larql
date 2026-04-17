@@ -791,6 +791,35 @@ pub fn predict_honest_with_knn_ffn(
 
                         true
                     } else { false }
+                } else if force_quant_early && arch.has_post_norms() {
+                    // GPU sequential prefill: process each prompt token through
+                    // decode_token one at a time. Uses the proven GPU decode path
+                    // (validated at cos=0.9994) instead of dispatch_full_pipeline
+                    // (which NaNs for post-norm). Cost: seq_len × decode_time
+                    // (~11 × 26ms = 286ms vs 763ms CPU). KV cache populated
+                    // correctly by decode_token's internal kv_cache_append.
+                    backend.reset_kv_cache();
+                    let embeds = crate::forward::embed_tokens_pub(weights, token_ids);
+                    let t_prefill = std::time::Instant::now();
+                    let mut last_h = vec![0.0f32; hidden];
+                    for p in 0..seq_len {
+                        let x: Vec<f32> = embeds.row(p).to_vec();
+                        if let Some(result) = backend.decode_token(
+                            &layers, &x, hidden, intermediate, q_dim, kv_dim,
+                            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+                        ) {
+                            last_h = result;
+                        }
+                    }
+                    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+                    if std::env::var("LARQL_TRACE_PREFILL_TIME").ok().as_deref() == Some("1") {
+                        eprintln!("[gpu-seq-prefill] {seq_len} tokens in {prefill_ms:.0}ms ({:.1}ms/tok)",
+                            prefill_ms / seq_len as f64);
+                    }
+                    // Copy final h into the h matrix for finalize_logits
+                    let mut row = h.row_mut(seq_len - 1);
+                    for j in 0..hidden { row[j] = last_h[j]; }
+                    true
                 } else {
                     // Post-norm models (Gemma3): CPU prefill (correct) → GPU logits (fast)
                     // CPU handles post-norms correctly. Use CPU hidden state, GPU for logits only.

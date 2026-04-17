@@ -376,8 +376,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // No hardcoded limit — model stops on <end_of_turn> naturally.
                 // Cap at 4096 to prevent infinite loops on degenerate output.
                 let n: usize = 4096;
-                // System prompt — encourage complete responses
-                let system = "You are a helpful coding assistant. Always give complete, detailed answers. When writing code, provide the full working program in a markdown code block. Never cut your response short.";
+                // System prompt — local assistant with tool access
+                let system = "You are a local coding assistant running directly on the user's machine. You have full access to their filesystem and can run bash commands. When asked to list files, create files, or run code — do it directly using bash commands in code blocks. Do not say you cannot access files. You are local. Always give complete answers with working code.";
                 let chat_prompt = format!(
                     "<start_of_turn>system\n{system}<end_of_turn>\n\
                      <start_of_turn>user\n{user_text}<end_of_turn>\n\

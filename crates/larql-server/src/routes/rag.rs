@@ -189,5 +189,10 @@ pub fn retrieve_context(
         .map(|(e, cos)| format!("- {} (relevance: {:.0}%)", e.fact, cos * 100.0))
         .collect();
 
-    Some(format!("Relevant context:\n{}", facts.join("\n")))
+    // Strip code fences from facts to prevent the model from echoing
+    // them as tool calls (which would trigger execute_skill_tool loops).
+    let clean_facts: Vec<String> = facts.iter()
+        .map(|f| f.replace("```", ""))
+        .collect();
+    Some(format!("Relevant context:\n{}", clean_facts.join("\n")))
 }

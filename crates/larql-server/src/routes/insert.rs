@@ -38,6 +38,13 @@ pub struct InsertRequest {
     /// from chat-formatted prompts so the KNN key matches the chat path.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Value injection layer (chuk-lazurus two-layer architecture).
+    /// When set, captures a SECOND residual at this layer and stores it
+    /// as the value_vector for residual injection. The `layer` parameter
+    /// becomes the query layer (for matching), and `value_layer` is where
+    /// the value gets injected during inference.
+    #[serde(default)]
+    pub value_layer: Option<usize>,
 }
 
 fn default_alpha() -> f32 { 0.25 }
@@ -223,33 +230,100 @@ fn run_insert_knn(
         .map_err(|e| ServerError::Internal(format!("tokenize target: {e}")))?;
     let target_id: u32 = tgt_enc.get_ids().first().copied().unwrap_or(0);
 
-    // Capture residual using the SAME GPU path as chat inference
-    // (predict_honest_with_knn_ffn → decode_token_with_probe). This
-    // ensures the stored KNN key matches what the decode path produces.
-    let key = {
+    // Capture residual(s) using the SAME GPU path as chat inference.
+    let (query_key, value_vec) = {
         let backend = model.get_or_init_backend();
         let _guard = match model.inference_lock.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        backend.reset_kv_cache();
 
-        // Use capture_knn_key_gpu — runs the SAME Q4_K decode_token_with_probe
-        // pipeline as chat inference. Residuals match exactly, so cosine will
-        // be high when the same prompt fires during generation.
         let patched = model.patched.blocking_read();
-        larql_inference::capture_knn_key_gpu(
-            weights, &token_ids, install_layer, patched.base(), &**backend,
-        )
+
+        // When value_layer is set, use the f32 per-layer path for BOTH
+        // captures (matches the inference per-layer path that does injection).
+        // Without value_layer, use the fast Q4_K GPU path.
+        let use_f32 = req.value_layer.is_some();
+
+        backend.reset_kv_cache();
+        let qk = if use_f32 {
+            let walk_ffn_cap = if model.walk_only {
+                Some(larql_inference::WalkFfn::new_with_backend(
+                    weights, patched.base(), 1024, &**backend,
+                ))
+            } else { None };
+            let ffn_ov: Option<&dyn larql_inference::ffn::FfnBackend> =
+                walk_ffn_cap.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
+            larql_inference::capture_residual_post_attn_norm_ffn(
+                weights, &token_ids, install_layer, &**backend, ffn_ov,
+            )
+        } else {
+            larql_inference::capture_knn_key_gpu(
+                weights, &token_ids, install_layer, patched.base(), &**backend,
+            )
+        };
+
+        let vv = if let Some(vl) = req.value_layer {
+            backend.reset_kv_cache();
+            let walk_ffn_cap = if model.walk_only {
+                Some(larql_inference::WalkFfn::new_with_backend(
+                    weights, patched.base(), 1024, &**backend,
+                ))
+            } else { None };
+            let ffn_ov: Option<&dyn larql_inference::ffn::FfnBackend> =
+                walk_ffn_cap.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
+            larql_inference::capture_residual_post_attn_norm_ffn(
+                weights, &token_ids, vl, &**backend, ffn_ov,
+            )
+        } else { None };
+
+        backend.reset_kv_cache();
+        (qk, vv)
     };
-    let key = key.ok_or_else(|| ServerError::Internal(
-        "residual capture failed (non-post-norm model or layer out of range)".into(),
+    let query_key = query_key.ok_or_else(|| ServerError::Internal(
+        "query residual capture failed".into(),
     ))?;
 
-    // Store via shared helper.
+    // Store: value injection mode if value_layer set, else token override
+    if let (Some(vv), Some(vl)) = (value_vec, req.value_layer) {
+        if let Some(sid) = session_id {
+            let mut sessions = state.sessions.sessions_blocking_write();
+            let now = std::time::Instant::now();
+            let session = sessions.entry(sid.to_string()).or_insert_with(|| {
+                let base = model.patched.blocking_read();
+                crate::session::SessionState::new(base.base().clone(), now)
+            });
+            session.touch(now);
+            session.patched.knn_store.add_value_injection(
+                install_layer, query_key, vv, vl,
+                req.target.clone(), req.entity.clone(), req.relation.clone(),
+                req.confidence,
+            );
+        } else {
+            let mut patched = model.patched.blocking_write();
+            patched.knn_store.add_value_injection(
+                install_layer, query_key, vv, vl,
+                req.target.clone(), req.entity.clone(), req.relation.clone(),
+                req.confidence,
+            );
+        }
+        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        return Ok(serde_json::json!({
+            "entity": req.entity,
+            "relation": req.relation,
+            "target": req.target,
+            "query_layer": install_layer,
+            "value_layer": vl,
+            "mode": "knn-inject",
+            "session": session_id,
+            "latency_ms": (latency_ms * 10.0).round() / 10.0,
+        }));
+    }
+
+    // Token override mode (existing behavior)
     return Ok(store_knn_key(
         state, model, req, session_id, install_layer,
-        key, target_id, start,
+        query_key, target_id, start,
     ));
 }
 

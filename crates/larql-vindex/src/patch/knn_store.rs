@@ -16,11 +16,18 @@ use ndarray::{Array1, Array2};
 use serde::{Serialize, Deserialize};
 
 /// A single entry in the retrieval-override KNN store.
+///
+/// Two modes:
+/// - **Token override** (value_vector=None): match at `layer`, replace
+///   the model's prediction with `target_id`. Original KNN behavior.
+/// - **Value injection** (value_vector=Some): match at `layer` (query
+///   layer), inject `value_vector` into residual at `value_layer`. The
+///   chuk-lazurus two-layer architecture: query early, inject late.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnnEntry {
     /// L2-normalized residual key (hidden_size floats).
     pub key: Vec<f32>,
-    /// Target token ID to emit when this entry matches.
+    /// Target token ID to emit when this entry matches (token override mode).
     pub target_id: u32,
     /// Decoded target token string.
     pub target_token: String,
@@ -30,6 +37,14 @@ pub struct KnnEntry {
     pub relation: String,
     /// Confidence score (user-specified or default 1.0).
     pub confidence: f32,
+    /// Value vector for residual injection (value injection mode).
+    /// When Some, this vector is blended into the residual stream at
+    /// `value_layer` instead of overriding a token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_vector: Option<Vec<f32>>,
+    /// Layer where value_vector should be injected (value injection mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_layer: Option<usize>,
 }
 
 /// Per-layer retrieval-override store. Entries are independent —
@@ -65,7 +80,7 @@ impl Default for KnnStore {
 }
 
 impl KnnStore {
-    /// Add an entry. The key is L2-normalized before storage.
+    /// Add a token-override entry. The key is L2-normalized before storage.
     pub fn add(
         &mut self,
         layer: usize,
@@ -84,8 +99,38 @@ impl KnnStore {
             entity,
             relation,
             confidence,
+            value_vector: None,
+            value_layer: None,
         });
         self.dirty.lock().unwrap().insert(layer);
+    }
+
+    /// Add a value-injection entry (chuk-lazurus two-layer architecture).
+    /// `query_layer` is where the key is stored (for matching).
+    /// `value_vector` is injected at `value_layer` during inference.
+    pub fn add_value_injection(
+        &mut self,
+        query_layer: usize,
+        key: Vec<f32>,
+        value_vector: Vec<f32>,
+        value_layer: usize,
+        target_token: String,
+        entity: String,
+        relation: String,
+        confidence: f32,
+    ) {
+        let normalized_key = l2_normalize(&key);
+        self.entries.entry(query_layer).or_default().push(KnnEntry {
+            key: normalized_key,
+            target_id: 0,
+            target_token,
+            entity,
+            relation,
+            confidence,
+            value_vector: Some(value_vector),
+            value_layer: Some(value_layer),
+        });
+        self.dirty.lock().unwrap().insert(query_layer);
     }
 
     /// Remove all entries matching an entity name.
@@ -339,6 +384,8 @@ impl KnnStore {
                     entity: meta["entity"].as_str().unwrap_or("").to_string(),
                     relation: meta["relation"].as_str().unwrap_or("").to_string(),
                     confidence: meta["confidence"].as_f64().unwrap_or(1.0) as f32,
+                    value_vector: None,
+                    value_layer: None,
                 });
             }
 

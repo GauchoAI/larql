@@ -13,6 +13,7 @@ pub mod relations;
 pub mod select;
 pub mod stats;
 pub mod stream;
+pub mod probe;
 pub mod walk;
 pub mod walk_ffn;
 
@@ -43,6 +44,7 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/health", get(health::handle_health))
         .route("/v1/models", get(models::handle_models))
         .route("/v1/chat/completions", post(chat_completions::handle_chat_completions))
+        .route("/v1/probe", post(probe::handle_probe))
         .with_state(state)
 }
 

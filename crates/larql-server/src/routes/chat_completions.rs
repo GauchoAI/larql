@@ -96,7 +96,7 @@ pub async fn handle_chat_completions(
 
     // RAG: retrieve matching facts and inject as context
     let user_msg = req.messages.last().map(|m| m.content.as_str()).unwrap_or("");
-    let rag_context = super::rag::retrieve_context(&state, &model, user_msg, 0.5);
+    let rag_context = super::rag::retrieve_context(&state, &model, user_msg, 0.40);
     let chat_prompt = if let Some(ref ctx) = rag_context {
         tracing::info!("[chat] RAG injecting {} chars of context", ctx.len());
         // Inject RAG context as a system-level addition

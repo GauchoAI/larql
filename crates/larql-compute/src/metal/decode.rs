@@ -1148,6 +1148,8 @@ impl MetalBackend {
                                                rows: usize, fmt: crate::QuantFormat| {
                         let n_val = rows as u32;
                         // Use batched pipeline: reads weights once, dots against K inputs
+                        // 2D grid: (n_tgs, M, 1) — different batch positions
+                        // on different GPU cores, sharing weight data via L2.
                         match fmt {
                             crate::QuantFormat::Q6_K => {
                                 let n_tgs = (rows as u64).div_ceil(q6k::ROWS_PER_TG);
@@ -1159,12 +1161,12 @@ impl MetalBackend {
                                 enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
                                 enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
                                 enc.dispatch_thread_groups(
-                                    MTLSize::new(n_tgs, 1, 1),
+                                    MTLSize::new(n_tgs, m_val as u64, 1),
                                     MTLSize::new(q6k::THREADS_PER_TG, 1, 1),
                                 );
                             }
                             _ => {
-                                let n_tgs = (rows as u64).div_ceil(q4k::BATCH_ROWS_PER_TG);
+                                let n_tgs = (rows as u64).div_ceil(q4k::ROWS_PER_TG);
                                 enc.set_compute_pipeline_state(&self.q4k_matvec_batch_pipeline);
                                 enc.set_buffer(0, Some(w_buf), 0);
                                 enc.set_buffer(1, Some(in_buf), 0);
@@ -1173,8 +1175,8 @@ impl MetalBackend {
                                 enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
                                 enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
                                 enc.dispatch_thread_groups(
-                                    MTLSize::new(n_tgs, 1, 1),
-                                    MTLSize::new(q4k::BATCH_THREADS_PER_TG, 1, 1),
+                                    MTLSize::new(n_tgs, m_val as u64, 1),
+                                    MTLSize::new(q4k::THREADS_PER_TG, 1, 1),
                                 );
                             }
                         }
@@ -1279,7 +1281,7 @@ impl MetalBackend {
                 let gate_off_bi = (bi * inter * 4) as u64;
                 let down_off = (bi * hidden * 4) as u64;
 
-                // Step 7: O projection — batched matvec at bi==0
+                // Step 7: O projection — 2D batched matvec at bi==0
                 if bi == 0 {
                     let o_k_val = layer_q_dim as u32;
                     let m_val = k as u32;
@@ -1293,10 +1295,10 @@ impl MetalBackend {
                             enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
                             enc.set_bytes(4, 4, &o_k_val as *const u32 as *const std::ffi::c_void);
                             enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
-                            enc.dispatch_thread_groups(MTLSize::new(n_tgs, 1, 1), MTLSize::new(q6k::THREADS_PER_TG, 1, 1));
+                            enc.dispatch_thread_groups(MTLSize::new(n_tgs, m_val as u64, 1), MTLSize::new(q6k::THREADS_PER_TG, 1, 1));
                         }
                         _ => {
-                            let n_tgs = (hidden as u64).div_ceil(q4k::BATCH_ROWS_PER_TG);
+                            let n_tgs = (hidden as u64).div_ceil(q4k::ROWS_PER_TG);
                             enc.set_compute_pipeline_state(&self.q4k_matvec_batch_pipeline);
                             enc.set_buffer(0, Some(&wo_bufs[l]), 0);
                             enc.set_buffer(1, Some(&attn_out), 0);
@@ -1304,7 +1306,7 @@ impl MetalBackend {
                             enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
                             enc.set_bytes(4, 4, &o_k_val as *const u32 as *const std::ffi::c_void);
                             enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
-                            enc.dispatch_thread_groups(MTLSize::new(n_tgs, 1, 1), MTLSize::new(q4k::BATCH_THREADS_PER_TG, 1, 1));
+                            enc.dispatch_thread_groups(MTLSize::new(n_tgs, m_val as u64, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
                         }
                     }
                 }

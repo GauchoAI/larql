@@ -47,6 +47,7 @@ struct AppState {
     echo_stripped: bool,       // whether we've stripped the echo for this query
     assistant_buf: String,     // accumulate streaming tokens
     last_output_time: Instant, // detect stalled generation
+    pending_tool_result: Option<String>, // bash output to feed back to model
 }
 
 impl AppState {
@@ -66,6 +67,7 @@ impl AppState {
             echo_stripped: false,
             assistant_buf: String::new(),
             last_output_time: Instant::now(),
+            pending_tool_result: None,
         }
     }
 }
@@ -432,10 +434,24 @@ fn main() -> io::Result<()> {
             tui_log("[STATE] timeout → is_generating = false");
             if !state.assistant_buf.is_empty() {
                 let buf_copy = state.assistant_buf.clone();
-                execute_tool_calls(&buf_copy, &mut state.messages);
+                if let Some(output) = execute_tool_calls(&buf_copy, &mut state.messages) {
+                    state.pending_tool_result = Some(output);
+                }
                 state.assistant_buf.clear();
             }
             state.is_generating = false;
+            new_output = true;
+        }
+
+        // Tool-result feedback: if bash was executed, feed output back to model
+        if let Some(result) = state.pending_tool_result.take() {
+            let feedback = format!("The command output was:\n{result}\n\nPlease continue based on this output.");
+            state.messages.push(Message::User(format!("[tool result]")));
+            state.echo_stripped = true;
+            state.assistant_buf.clear();
+            state.last_output_time = Instant::now();
+            be.send(&format!("chat {feedback}"))?;
+            state.is_generating = true;
             new_output = true;
         }
 
@@ -536,7 +552,9 @@ fn process_stdout_line(line: &str, state: &mut AppState) {
             // Finalize
             if !state.assistant_buf.is_empty() {
                 let buf_copy = state.assistant_buf.clone();
-                execute_tool_calls(&buf_copy, &mut state.messages);
+                if let Some(output) = execute_tool_calls(&buf_copy, &mut state.messages) {
+                    state.pending_tool_result = Some(output);
+                }
                 state.assistant_buf.clear();
             }
             state.is_generating = false;
@@ -549,11 +567,11 @@ fn process_stdout_line(line: &str, state: &mut AppState) {
 
     // Timing line — finalize the current response
     if content.contains("tok/s") && (content.contains("prefill") || content.contains("decode")) {
-        // Execute tool calls on the accumulated text (don't push again —
-        // the live streaming message is already in state.messages)
+        // Execute tool calls on the accumulated text
+        let mut bash_output: Option<String> = None;
         if !state.assistant_buf.is_empty() {
             let buf_copy = state.assistant_buf.clone();
-            execute_tool_calls(&buf_copy, &mut state.messages);
+            bash_output = execute_tool_calls(&buf_copy, &mut state.messages);
             state.assistant_buf.clear();
         }
         if let Some(tok_s) = extract_tok_s(content) {
@@ -563,6 +581,10 @@ fn process_stdout_line(line: &str, state: &mut AppState) {
             }
         }
         state.is_generating = false;
+        // If a bash tool was executed, queue the output for the model
+        if let Some(output) = bash_output {
+            state.pending_tool_result = Some(output);
+        }
         return;
     }
 
@@ -638,7 +660,9 @@ fn process_stderr_line(line: &str, state: &mut AppState) {
     }
 }
 
-fn execute_tool_calls(text: &str, messages: &mut Vec<Message>) {
+/// Execute tool calls found in the response. Returns bash output if a bash
+/// block was executed (for feeding back to the model).
+fn execute_tool_calls(text: &str, messages: &mut Vec<Message>) -> Option<String> {
     // Parse <tool>write_file</tool> <path>...</path> <content>...</content>
     if let Some(tool_start) = text.find("<tool>") {
         let after_tool = &text[tool_start + 6..];
@@ -713,10 +737,11 @@ fn execute_tool_calls(text: &str, messages: &mut Vec<Message>) {
         }
     }
 
-    // Auto-save markdown code blocks to workspace files
+    // Auto-detect and execute/save markdown code blocks
     let mut in_block = false;
     let mut lang = String::new();
     let mut code = String::new();
+    let mut bash_result: Option<String> = None;
     for line in text.lines() {
         if line.trim_start().starts_with("```") && !in_block {
             in_block = true;
@@ -725,30 +750,59 @@ fn execute_tool_calls(text: &str, messages: &mut Vec<Message>) {
         } else if line.trim_start().starts_with("```") && in_block {
             in_block = false;
             if !code.trim().is_empty() {
-                let ext = match lang.as_str() {
-                    "python" | "py" => "py",
-                    "javascript" | "js" => "js",
-                    "rust" | "rs" => "rs",
-                    "html" => "html",
-                    "css" => "css",
-                    "sh" | "bash" => "sh",
-                    _ => "txt",
-                };
-                let filename = format!("output.{ext}");
-                let workspace = std::env::current_dir().unwrap_or_default();
-                let path = workspace.join(&filename);
-                match std::fs::write(&path, &code) {
-                    Ok(()) => {
-                        messages.push(Message::ToolUse {
-                            tool: "write_file".into(),
-                            detail: format!("✓ saved {} ({} bytes)", path.display(), code.len()),
-                        });
+                // Bash blocks: EXECUTE and return output for model feedback
+                if lang == "bash" || lang == "sh" {
+                    let cmd = code.trim();
+                    messages.push(Message::ToolUse {
+                        tool: "bash".into(),
+                        detail: format!("$ {}", cmd.lines().next().unwrap_or(cmd)),
+                    });
+                    match std::process::Command::new("sh").arg("-c").arg(cmd).output() {
+                        Ok(output) => {
+                            let mut result = String::from_utf8_lossy(&output.stdout).to_string();
+                            let err = String::from_utf8_lossy(&output.stderr);
+                            if !err.is_empty() {
+                                if !result.is_empty() { result.push('\n'); }
+                                result.push_str(&err);
+                            }
+                            if result.is_empty() { result = "(no output)".into(); }
+                            if result.len() > 1000 {
+                                result.truncate(1000);
+                                result.push_str("\n...(truncated)");
+                            }
+                            messages.push(Message::System(result.clone()));
+                            bash_result = Some(result);
+                        }
+                        Err(e) => {
+                            messages.push(Message::System(format!("error: {e}")));
+                        }
                     }
-                    Err(e) => {
-                        messages.push(Message::ToolUse {
-                            tool: "write_file".into(),
-                            detail: format!("✗ {e}"),
-                        });
+                } else {
+                    // Non-bash: save to file
+                    let ext = match lang.as_str() {
+                        "python" | "py" => "py",
+                        "javascript" | "js" => "js",
+                        "rust" | "rs" => "rs",
+                        "html" => "html",
+                        "css" => "css",
+                        _ => "txt",
+                    };
+                    let filename = format!("output.{ext}");
+                    let workspace = std::env::current_dir().unwrap_or_default();
+                    let path = workspace.join(&filename);
+                    match std::fs::write(&path, &code) {
+                        Ok(()) => {
+                            messages.push(Message::ToolUse {
+                                tool: "write_file".into(),
+                                detail: format!("✓ saved {} ({} bytes)", path.display(), code.len()),
+                            });
+                        }
+                        Err(e) => {
+                            messages.push(Message::ToolUse {
+                                tool: "write_file".into(),
+                                detail: format!("✗ {e}"),
+                            });
+                        }
                     }
                 }
             }
@@ -757,6 +811,7 @@ fn execute_tool_calls(text: &str, messages: &mut Vec<Message>) {
             code.push('\n');
         }
     }
+    bash_result
 }
 
 fn extract_tag(text: &str, tag: &str) -> Option<String> {

@@ -240,22 +240,23 @@ fn run_insert_knn(
 
         let patched = model.patched.blocking_read();
 
-        // When value_layer is set, use the f32 per-layer path for BOTH
-        // captures (matches the inference per-layer path that does injection).
-        // Without value_layer, use the fast Q4_K GPU path.
-        let use_f32 = req.value_layer.is_some();
+        // When value_layer is set, use capture_knn_key_perlayer which runs
+        // the EXACT same per-layer path as inference (Q6_K attention + CPU
+        // softmax + GPU FFN). Without value_layer, use the fast GPU path.
+        let use_perlayer = req.value_layer.is_some();
+
+        let walk_ffn_cap = if model.walk_only {
+            Some(larql_inference::WalkFfn::new_with_backend(
+                weights, patched.base(), 1024, &**backend,
+            ))
+        } else { None };
+        let ffn_ov: Option<&dyn larql_inference::ffn::FfnBackend> =
+            walk_ffn_cap.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
 
         backend.reset_kv_cache();
-        let qk = if use_f32 {
-            let walk_ffn_cap = if model.walk_only {
-                Some(larql_inference::WalkFfn::new_with_backend(
-                    weights, patched.base(), 1024, &**backend,
-                ))
-            } else { None };
-            let ffn_ov: Option<&dyn larql_inference::ffn::FfnBackend> =
-                walk_ffn_cap.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
-            larql_inference::capture_residual_post_attn_norm_ffn(
-                weights, &token_ids, install_layer, &**backend, ffn_ov,
+        let qk = if use_perlayer {
+            larql_inference::capture_knn_key_perlayer(
+                weights, &token_ids, install_layer, patched.base(), &**backend, ffn_ov,
             )
         } else {
             larql_inference::capture_knn_key_gpu(
@@ -265,15 +266,8 @@ fn run_insert_knn(
 
         let vv = if let Some(vl) = req.value_layer {
             backend.reset_kv_cache();
-            let walk_ffn_cap = if model.walk_only {
-                Some(larql_inference::WalkFfn::new_with_backend(
-                    weights, patched.base(), 1024, &**backend,
-                ))
-            } else { None };
-            let ffn_ov: Option<&dyn larql_inference::ffn::FfnBackend> =
-                walk_ffn_cap.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
-            larql_inference::capture_residual_post_attn_norm_ffn(
-                weights, &token_ids, vl, &**backend, ffn_ov,
+            larql_inference::capture_knn_key_perlayer(
+                weights, &token_ids, vl, patched.base(), &**backend, ffn_ov,
             )
         } else { None };
 

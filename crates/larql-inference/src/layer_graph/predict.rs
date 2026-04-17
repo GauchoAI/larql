@@ -348,6 +348,132 @@ pub fn capture_residual_post_attn_norm(
     capture_residual_post_attn_norm_ffn(weights, token_ids, target_layer, backend, None)
 }
 
+/// Capture the normed probe residual matching the EXACT inference path:
+/// Q4_K decode_token for prefill (populates KV cache), then per-layer
+/// path for the last token (matching how inference does value-injection
+/// decode). This ensures KV cache entries and residuals are identical.
+pub fn capture_knn_key_perlayer(
+    weights: &ModelWeights,
+    token_ids: &[u32],
+    probe_layer: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    ffn_override: Option<&dyn crate::ffn::FfnBackend>,
+) -> Option<Vec<f32>> {
+    let arch = &*weights.arch;
+    if !arch.has_post_norms() { return None; }
+    let hidden = weights.hidden_size;
+    let norm_offset = arch.norm_weight_offset();
+
+    // Step 1: Prefill via Q4_K decode_token (same as inference prefill).
+    // This populates the Metal KV cache with Q4_K-computed K/V entries.
+    // Use capture_knn_key_gpu's pipeline setup but DON'T capture the probe —
+    // just populate the KV cache.
+    let gate_index: &dyn larql_vindex::GateIndex = index;
+    let intermediate = gate_index.num_features(0);
+    let has_q4k = gate_index.attn_q4k_layer_data(0).is_some();
+    let (q4_ffn, ffn_is_q4k) = if let Some(mmap) = gate_index.interleaved_q4k_real_mmap_ref() {
+        (Some(mmap), true)
+    } else if let Some(mmap) = gate_index.interleaved_q4k_mmap_ref() {
+        (Some(mmap), true)
+    } else if let Some(mmap) = gate_index.interleaved_q4_mmap_ref() {
+        (Some(mmap), false)
+    } else {
+        return None;
+    };
+    let q4_ffn = q4_ffn?;
+    if !has_q4k || intermediate == 0 { return None; }
+
+    let q4_per_matrix = if ffn_is_q4k {
+        (intermediate * hidden).div_ceil(256) * 148
+    } else {
+        intermediate * hidden / 32 * 18
+    };
+    let ffn_format = if ffn_is_q4k {
+        larql_compute::QuantFormat::Q4_K
+    } else {
+        larql_compute::QuantFormat::Q4_0
+    };
+    let layers = super::pipeline_layer::build_pipeline_layers(
+        weights, index, 0..weights.num_layers,
+        q4_ffn, q4_per_matrix, ffn_format,
+    );
+    if layers.is_empty() { return None; }
+
+    let q_dim = weights.num_q_heads * weights.head_dim;
+    let kv_dim = weights.num_kv_heads * weights.head_dim;
+    let rope = arch.rope_base_for_layer(0) as f32;
+
+    backend.reset_kv_cache();
+    let embeds = crate::forward::embed_tokens_pub(weights, token_ids);
+    let seq_len = token_ids.len();
+
+    // Prefill: Q4_K decode_token for all tokens (populates KV cache)
+    for p in 0..seq_len {
+        let x: Vec<f32> = embeds.row(p).to_vec();
+        backend.decode_token_with_probe(
+            &layers, &x, hidden, intermediate, q_dim, kv_dim,
+            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+            None, // no probe during prefill
+        );
+    }
+
+    // Step 2: Run ONE more decode step through the per-layer path to
+    // capture the residual. Use the SAME function as inference decode.
+    // The KV cache now has Q4_K entries from prefill — per-layer reads them.
+    use crate::ffn::WeightFfnGpu;
+    let dense_ffn = WeightFfnGpu { weights, backend };
+    let ffn: &dyn crate::ffn::FfnBackend = match ffn_override {
+        Some(f) => f,
+        None => &dense_ffn,
+    };
+
+    // The "next token" after prefill — use the embedding of the last prompt token
+    // as input (this mirrors how inference starts the decode loop after prefill).
+    let last_embed: Vec<f32> = embeds.row(seq_len - 1).to_vec();
+    let mut h_tok = ndarray::Array2::from_shape_vec((1, hidden), last_embed).unwrap();
+
+    // Actually — after Q4_K prefill, the model already computed the output for
+    // all prefill tokens. The NEXT decode step would use the sampled first token.
+    // But we don't have a sampled token. Instead, we capture the residual
+    // at the LAST prefill position by running the per-layer path WITH the
+    // Q4_K-populated KV cache. The KV cache already has seq_len entries.
+    // We remove the last entry so the per-layer path re-processes position
+    // seq_len-1 with its own attention, reading K/V[0..seq_len-2] from cache.
+    backend.rollback_kv_cache(1); // remove last position from Q4_K prefill
+
+    let last_x = embeds.row(seq_len - 1).to_vec();
+    let mut h_decode = ndarray::Array2::from_shape_vec((1, hidden), last_x).unwrap();
+
+    for (rel_idx, abs_layer) in (0..weights.num_layers).enumerate() {
+        let (h_post_attn, _) =
+            crate::attention::gpu::run_attention_kv_cached_f32_opt(
+                weights, &h_decode, abs_layer, rel_idx, backend,
+                Some(index as &dyn larql_vindex::GateIndex),
+            )?;
+
+        if abs_layer == probe_layer {
+            let pre_ffn_key = if arch.has_post_norms() {
+                arch.pre_feedforward_layernorm_key(abs_layer)
+            } else {
+                Some(arch.post_attention_layernorm_key(abs_layer))
+            };
+            let h_ffn = match pre_ffn_key {
+                Some(key) => crate::forward::apply_norm(weights, &h_post_attn, &key, norm_offset),
+                None => crate::residual::rms_norm(&h_post_attn, None, norm_offset),
+            };
+            backend.reset_kv_cache();
+            return Some(h_ffn.row(0).to_vec());
+        }
+
+        let (h_out, _) = crate::forward::run_ffn(weights, &h_post_attn, abs_layer, ffn, false);
+        h_decode = h_out;
+    }
+
+    backend.reset_kv_cache();
+    None
+}
+
 /// Capture the normed probe residual at `probe_layer` using the SAME GPU
 /// path as `predict_honest_with_knn_ffn` (Q4_K decode_token_with_probe).
 /// Returns the pre_ffn_norm(h_post_attn) vector — identical to what the

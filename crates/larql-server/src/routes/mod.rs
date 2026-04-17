@@ -13,6 +13,7 @@ pub mod relations;
 pub mod select;
 pub mod stats;
 pub mod stream;
+pub mod kv_rag;
 pub mod probe;
 pub mod rag;
 pub mod walk;
@@ -48,6 +49,8 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/probe", post(probe::handle_probe))
         .route("/v1/rag/insert", post(rag::handle_rag_insert))
         .route("/v1/rag/query", post(rag::handle_rag_query))
+        .route("/v1/kv-rag/insert", post(kv_rag::handle_kv_rag_insert))
+        .route("/v1/kv-rag/query", post(kv_rag::handle_kv_rag_query))
         .with_state(state)
 }
 

@@ -60,32 +60,19 @@ impl AppState {
         }
     }
 
-    /// Build the OpenAI messages array from conversation history.
+    /// Build the chat messages — ONLY the current user message.
+    /// Conversation history is in the RAG store, not in the prompt.
+    /// Zero context growth. No compaction needed.
     fn build_chat_messages(&self) -> Vec<ChatMsg> {
+        // Just the last user message — RAG injects relevant history server-side
         let mut msgs = Vec::new();
-
-        for msg in &self.messages {
-            match msg {
-                Message::User(text) => {
-                    msgs.push(ChatMsg { role: "user".into(), content: text.clone() });
-                }
-                Message::Assistant(text) if !text.is_empty() => {
-                    msgs.push(ChatMsg { role: "assistant".into(), content: text.clone() });
-                }
-                Message::ToolResult { summary } => {
-                    msgs.push(ChatMsg {
-                        role: "user".into(),
-                        content: format!("[Tool output]\n{summary}"),
-                    });
-                }
-                _ => {}
+        if let Some(msg) = self.messages.iter().rev()
+            .find(|m| matches!(m, Message::User(_)))
+        {
+            if let Message::User(text) = msg {
+                msgs.push(ChatMsg { role: "user".into(), content: text.clone() });
             }
         }
-
-        // Cap context to avoid unbounded prefill growth
-        let max_msgs = 12;
-        let start = msgs.len().saturating_sub(max_msgs);
-        msgs.drain(..start);
         msgs
     }
 }
@@ -395,13 +382,41 @@ async fn main() -> io::Result<()> {
                     };
 
                     if let Some(_summary) = execute_skill_tool(&response_text, &mut state.messages) {
-                        // Tool executed. The ToolResult is now in messages.
-                        // Send full conversation history so model has context.
                         state.messages.push(Message::Assistant(String::new()));
                         let chat_msgs = state.build_chat_messages();
                         spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone());
                     } else {
                         state.is_generating = false;
+
+                        // Auto-INSERT conversation turn into RAG store.
+                        // Both user message and assistant response become
+                        // retrievable facts — no context window growth.
+                        let url = state.server_url.clone();
+                        let user_msg = state.messages.iter().rev()
+                            .find_map(|m| match m { Message::User(t) => Some(t.clone()), _ => None })
+                            .unwrap_or_default();
+                        let asst_msg = response_text.chars().take(500).collect::<String>();
+                        tokio::spawn(async move {
+                            let client = reqwest::Client::new();
+                            // INSERT user message
+                            if !user_msg.is_empty() {
+                                let _ = client.post(format!("{url}/v1/rag/insert"))
+                                    .json(&serde_json::json!({
+                                        "fact": format!("User asked: {}", &user_msg[..user_msg.len().min(300)]),
+                                        "category": "conversation",
+                                    }))
+                                    .send().await;
+                            }
+                            // INSERT assistant response
+                            if !asst_msg.is_empty() {
+                                let _ = client.post(format!("{url}/v1/rag/insert"))
+                                    .json(&serde_json::json!({
+                                        "fact": format!("Assistant answered: {}", &asst_msg[..asst_msg.len().min(300)]),
+                                        "category": "conversation",
+                                    }))
+                                    .send().await;
+                            }
+                        });
                     }
                     new_output = true;
                 }

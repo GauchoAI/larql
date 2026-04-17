@@ -172,24 +172,108 @@ fn extract_k_vector(
         );
     }
 
-    // Read K from KV cache at the target layer, last position
-    let rel_layer = layer; // layer index within the pipeline
-    let (k_flat, _v_flat, past_len) = backend.debug_read_kv_layer(rel_layer)?;
-    if past_len == 0 { return None; }
+    // Extract pre-RoPE K vector by running the attention projection
+    // directly on the last token's hidden state. This gives the raw
+    // semantic K without positional encoding (RoPE), which is much
+    // better for retrieval matching.
 
-    // Extract the specific head's K vector from the last position
-    // k_flat is [past_len, kv_dim] row-major
-    let last_pos = past_len - 1;
-    let head_start = kv_head * hd;
-    let head_end = head_start + hd;
-    let row_start = last_pos * kv_dim;
+    // Read the KV cache to get past_len (for position tracking)
+    let (_, _, past_len) = backend.debug_read_kv_layer(0).unwrap_or((Vec::new(), Vec::new(), 0));
+    // The last token is at position past_len - 1 in the cache.
+    // We need to re-compute K from the hidden state at that position.
 
-    if row_start + head_end > k_flat.len() { return None; }
+    // Re-run the last token through just the input norm + K projection
+    // at the target layer. We have the embedding, but need the hidden
+    // state at `layer`. Since the KV cache was populated by decode_token,
+    // we can't easily recover the hidden state.
 
-    let k_head: Vec<f32> = k_flat[row_start + head_start..row_start + head_end].to_vec();
+    // Alternative: run ONE more decode step and capture K before RoPE.
+    // Use the per-layer attention path which exposes Q/K/V.
+    backend.reset_kv_cache();
+
+    // Re-prefill with GPU pipeline
+    let embeds = larql_inference::forward::embed_tokens_pub(weights, &token_ids);
+    for p in 0..token_ids.len() {
+        let x: Vec<f32> = embeds.row(p).to_vec();
+        backend.decode_token_with_probe(
+            &layers, &x, hidden, intermediate, q_dim, kv_dim,
+            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+            None,
+        );
+    }
+
+    // Now rollback last position and re-run through per-layer attention
+    // to capture the pre-RoPE K vector
+    backend.rollback_kv_cache(1);
+
+    let last_embed: Vec<f32> = embeds.row(token_ids.len() - 1).to_vec();
+    let h_tok = larql_inference::ndarray::Array2::from_shape_vec((1, hidden), last_embed).unwrap();
+
+    // Run layers 0..target_layer through per-layer path
+    use larql_inference::ffn::WeightFfnGpu;
+    let dense_ffn = WeightFfnGpu { weights, backend: &**backend };
+    let mut h_cur = h_tok;
+    let patched_base = patched.base();
+
+    for (rel_idx, abs_layer) in (0..=layer).enumerate() {
+        // Input norm
+        let norm_key = arch.input_layernorm_key(abs_layer);
+        let h_norm = larql_inference::forward::apply_norm(weights, &h_cur, &norm_key, norm_off);
+
+        if abs_layer == layer {
+            // At target layer: compute K projection (pre-RoPE)
+            let attn_data = patched_base.attn_q4k_layer_data(abs_layer);
+            let h_flat: Vec<f32> = h_norm.row(0).to_vec();
+
+            let k_vec = if let Some(arr4) = attn_data {
+                let (k_bytes, _) = arr4[1]; // K projection
+                backend.q6k_matvec(k_bytes, &h_flat, kv_dim, hidden)?
+            } else {
+                let wk = weights.tensors.get(&arch.attn_k_key(abs_layer))?;
+                let k_proj = larql_compute::dot_proj_gpu(
+                    &h_norm, wk, Some(&**backend));
+                k_proj.row(0).to_vec()
+            };
+
+            // QK-norm (if model uses it)
+            let qk_off = if arch.qk_norm_weight_offset() != 0.0 {
+                arch.qk_norm_weight_offset()
+            } else { norm_off };
+            let k_arr = larql_inference::ndarray::Array2::from_shape_vec((1, kv_dim), k_vec).unwrap();
+            let k_normed = match arch.attn_k_norm_key(abs_layer)
+                .and_then(|k| weights.vectors.get(&k))
+            {
+                Some(w) => {
+                    use larql_inference::residual::rms_norm_heads;
+                    rms_norm_heads(&k_arr, w, nkv, hd, qk_off)
+                }
+                None => k_arr,
+            };
+
+            // Extract the specific head's K vector (NO RoPE!)
+            let head_start = kv_head * hd;
+            let head_end = head_start + hd;
+            let k_head: Vec<f32> = k_normed.row(0)
+                .slice(larql_inference::ndarray::s![head_start..head_end])
+                .to_vec();
+
+            backend.reset_kv_cache();
+            return Some(l2_norm(&k_head));
+        }
+
+        // Run full attention + FFN to get to next layer
+        let (h_post_attn, _) =
+            larql_inference::attention::gpu::run_attention_kv_cached_f32_opt(
+                weights, &h_cur, abs_layer, rel_idx, &**backend,
+                Some(patched_base as &dyn larql_vindex::GateIndex),
+            )?;
+        let (h_out, _) = larql_inference::forward::run_ffn(
+            weights, &h_post_attn, abs_layer, &dense_ffn, false);
+        h_cur = h_out;
+    }
 
     backend.reset_kv_cache();
-    Some(l2_norm(&k_head))
+    None
 }
 
 /// Extract Q vector at a specific layer/head for a query.

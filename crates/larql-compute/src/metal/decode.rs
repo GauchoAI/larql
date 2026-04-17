@@ -1026,4 +1026,42 @@ impl MetalBackend {
         let probe_h = probe_buf.as_ref().map(|pb| super::buffers::read_buffer_f32(pb, hidden));
         (final_h, probe_h)
     }
+
+    /// Batch-decode K tokens through all layers.
+    ///
+    /// Phase 1 implementation: processes K tokens using the proven single-token
+    /// decode path (sequential within one method). Each call appends to the KV
+    /// cache and produces one hidden state. Returns all K hidden states.
+    ///
+    /// This gives the correct API for speculative decoding verification.
+    /// Future optimization: replace the inner loop with batched Metal dispatches
+    /// (shared weight reads, batched KV attention) for true K-token parallelism.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_token_batch(
+        &self,
+        kv_cache: &mut ops::kv_cache::KVCache,
+        layers: &[crate::FullPipelineLayer],
+        x_batch: &[f32],     // [K * hidden] — K token embeddings concatenated
+        batch_size: usize,    // K
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_base: f32,
+    ) -> Vec<f32> {
+        let mut results = Vec::with_capacity(batch_size * hidden);
+        for bi in 0..batch_size {
+            let x = &x_batch[bi * hidden..(bi + 1) * hidden];
+            let (h, _) = self.decode_token_inner(
+                kv_cache, layers, x, hidden, inter,
+                q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base,
+                None,
+            );
+            results.extend_from_slice(&h);
+        }
+        results
+    }
 }

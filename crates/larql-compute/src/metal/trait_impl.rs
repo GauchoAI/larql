@@ -625,6 +625,26 @@ impl ComputeBackend for MetalBackend {
         }
     }
 
+    fn decode_token_batch(
+        &self,
+        layers: &[crate::FullPipelineLayer<'_>],
+        x_batch: &[f32],
+        batch_size: usize,
+        hidden: usize, inter: usize,
+        q_dim: usize, kv_dim: usize,
+        num_q_heads: usize, num_kv_heads: usize, head_dim: usize,
+        rope_base: f32,
+    ) -> Option<Vec<f32>> {
+        let num_layers = layers.len();
+        let mut cache_guard = self.kv_cache.lock().unwrap();
+        if cache_guard.is_none() {
+            *cache_guard = Some(self.create_kv_cache(num_layers, 4096, num_kv_heads, head_dim));
+        }
+        let kv = cache_guard.as_mut().unwrap();
+        Some(MetalBackend::decode_token_batch(self, kv, layers, x_batch, batch_size,
+            hidden, inter, q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base))
+    }
+
     fn debug_read_kv_layer(&self, layer: usize) -> Option<(Vec<f32>, Vec<f32>, usize)> {
         let guard = self.kv_cache.lock().ok()?;
         let kv = guard.as_ref()?;

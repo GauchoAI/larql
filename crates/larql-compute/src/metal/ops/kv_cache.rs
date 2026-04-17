@@ -153,6 +153,81 @@ pub fn encode_kv_attend_softcap(
     );
 }
 
+/// Encode batched KV append: write K entries at [cache.current_len..+batch_size).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_kv_append_batch(
+    enc: &ComputeCommandEncoderRef,
+    cache: &LayerKVCache,
+    append_batch_pipeline: &ComputePipelineState,
+    new_k: &Buffer,    // [K, kv_dim]
+    new_v: &Buffer,    // [K, kv_dim]
+    batch_size: usize,
+) {
+    let pos = cache.current_len as u32;
+    let num_kv = cache.num_kv_heads as u32;
+    let hd = cache.head_dim as u32;
+    let total = cache.num_kv_heads * cache.head_dim;
+    let bs = batch_size as u32;
+
+    enc.set_compute_pipeline_state(append_batch_pipeline);
+    enc.set_buffer(0, Some(new_k), 0);
+    enc.set_buffer(1, Some(new_v), 0);
+    enc.set_buffer(2, Some(&cache.k_cache), 0);
+    enc.set_buffer(3, Some(&cache.v_cache), 0);
+    enc.set_bytes(4, 4, &pos as *const u32 as *const c_void);
+    enc.set_bytes(5, 4, &num_kv as *const u32 as *const c_void);
+    enc.set_bytes(6, 4, &hd as *const u32 as *const c_void);
+    enc.set_bytes(7, 4, &bs as *const u32 as *const c_void);
+    let grid = total * batch_size;
+    enc.dispatch_threads(
+        MTLSize::new(grid as u64, 1, 1),
+        MTLSize::new(256.min(grid as u64), 1, 1),
+    );
+}
+
+/// Encode batched KV attend: K queries with per-position causal mask.
+/// Draft tokens must already be in cache via encode_kv_append_batch.
+/// cache_len = number of positions BEFORE the batch was appended.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_kv_attend_batch(
+    enc: &ComputeCommandEncoderRef,
+    cache: &LayerKVCache,
+    attend_batched_pipeline: &ComputePipelineState,
+    q_batch: &Buffer,   // [K, q_dim]
+    out: &Buffer,        // [K, q_dim]
+    batch_size: usize,
+    cache_len: usize,    // positions before batch was appended
+    num_q_heads: usize,
+    scale: f32,
+    window_size: u32,
+    softcap: f32,
+) {
+    let cl = cache_len as u32;
+    let bs = batch_size as u32;
+    let hd = cache.head_dim as u32;
+    let num_q = num_q_heads as u32;
+    let num_kv = cache.num_kv_heads as u32;
+
+    enc.set_compute_pipeline_state(attend_batched_pipeline);
+    enc.set_buffer(0, Some(q_batch), 0);
+    enc.set_buffer(1, Some(&cache.k_cache), 0);
+    enc.set_buffer(2, Some(&cache.v_cache), 0);
+    enc.set_buffer(3, Some(out), 0);
+    enc.set_bytes(4, 4, &cl as *const u32 as *const c_void);
+    enc.set_bytes(5, 4, &bs as *const u32 as *const c_void);
+    enc.set_bytes(6, 4, &hd as *const u32 as *const c_void);
+    enc.set_bytes(7, 4, &num_q as *const u32 as *const c_void);
+    enc.set_bytes(8, 4, &num_kv as *const u32 as *const c_void);
+    enc.set_bytes(9, 4, &scale as *const f32 as *const c_void);
+    enc.set_bytes(10, 4, &window_size as *const u32 as *const c_void);
+    enc.set_bytes(11, 4, &softcap as *const f32 as *const c_void);
+    let tgs = num_q_heads * batch_size;
+    enc.dispatch_thread_groups(
+        MTLSize::new(tgs as u64, 1, 1),
+        MTLSize::new(256.min(cache.head_dim as u64), 1, 1),
+    );
+}
+
 /// Append new K/V to cache and run attention in one command buffer.
 /// Returns attention output [num_q_heads, head_dim].
 /// Legacy API — creates its own encoders. For merged pipelines, use

@@ -484,10 +484,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or(&[][..]);
                 let spec_inter = gi.num_features(0);
                 let spec_q4_per = (spec_inter * weights.hidden_size).div_ceil(256) * 148;
-                let spec_layers = larql_inference::layer_graph::pipeline_layer::build_pipeline_layers(
-                    weights, &index, 0..num_layers,
-                    spec_ffn_mmap, spec_q4_per, larql_compute::QuantFormat::Q4_K,
-                );
+                eprintln!("[spec] building layers: inter={spec_inter} mmap_len={} q4_per={spec_q4_per}",
+                    spec_ffn_mmap.len());
+                let spec_layers = if spec_ffn_mmap.is_empty() || spec_inter == 0 {
+                    eprintln!("[spec] WARNING: no FFN mmap or zero features, using empty layers");
+                    Vec::new()
+                } else {
+                    larql_inference::layer_graph::pipeline_layer::build_pipeline_layers(
+                        weights, &index, 0..num_layers,
+                        spec_ffn_mmap, spec_q4_per, larql_compute::QuantFormat::Q4_K,
+                    )
+                };
                 let r = larql_inference::layer_graph::speculative::generate_speculative(
                     weights, tokenizer, &ids, n, k,
                     &index, &*backend, &spec_layers,

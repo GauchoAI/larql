@@ -653,12 +653,23 @@ fn main() -> io::Result<()> {
                             break;
                         } else {
                             state.messages.push(Message::User(input.clone()));
-                            // Use the `chat` command which wraps in Gemma 3
-                            // chat template internally. No echo of prompt.
                             state.last_prompt = input.clone();
-                            state.echo_stripped = true; // chat cmd doesn't echo
+                            state.echo_stripped = true;
                             state.assistant_buf.clear();
-                            be.send(&format!("chat {input}"))?;
+
+                            // Auto-inject matching skills from .skills/ (local + global)
+                            let skill_context = match_skills(&input);
+                            if !skill_context.is_empty() {
+                                // Use chatml for multi-line skill context
+                                let full = format!("{skill_context}\n\n---\n\nUser request: {input}");
+                                be.send("chatml")?;
+                                for line in full.lines() {
+                                    be.send(line)?;
+                                }
+                                be.send("---END---")?;
+                            } else {
+                                be.send(&format!("chat {input}"))?;
+                            }
                             state.is_generating = true;
                             state.last_output_time = Instant::now(); // reset timeout clock
                             state.tok_s = 0.0;
@@ -694,6 +705,60 @@ fn main() -> io::Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
+}
+
+/// Scan .skills/ folders for skills matching the user's input.
+/// Checks: ./.skills/ (local) and ~/.skills/ (global).
+/// Returns concatenated skill.md content for all matching skills.
+fn match_skills(input: &str) -> String {
+    let input_lower = input.to_lowercase();
+    let mut context = String::new();
+
+    let skills_dirs = [
+        std::env::current_dir().unwrap_or_default().join(".skills"),
+        dirs_fallback().join(".skills"),
+        // Also check test fixtures during development
+        std::env::current_dir().unwrap_or_default().join("tests/fixtures/skills"),
+    ];
+
+    for dir in &skills_dirs {
+        if !dir.is_dir() { continue; }
+        let Ok(entries) = std::fs::read_dir(dir) else { continue; };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() { continue; }
+            let skill_name = path.file_name().unwrap_or_default()
+                .to_string_lossy().to_lowercase();
+
+            // Match: skill name appears in input, or common synonyms
+            let matches = input_lower.contains(&skill_name) || match skill_name.as_str() {
+                "list" => input_lower.contains("list") || input_lower.contains("files")
+                    || input_lower.contains("directory") || input_lower.contains("folder")
+                    || input_lower.contains("ls"),
+                "search" => input_lower.contains("search") || input_lower.contains("find")
+                    || input_lower.contains("grep") || input_lower.contains("look for"),
+                "stats" => input_lower.contains("stats") || input_lower.contains("statistics")
+                    || input_lower.contains("metrics") || input_lower.contains("how many")
+                    || input_lower.contains("count"),
+                _ => false,
+            };
+
+            if matches {
+                let skill_md = path.join("skill.md");
+                if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                    if !context.is_empty() { context.push_str("\n\n"); }
+                    context.push_str(&format!("[Skill: {}]\n{}", skill_name, content));
+                    tui_log(&format!("[SKILL] matched '{}' for input: {}", skill_name, &input[..input.len().min(40)]));
+                }
+            }
+        }
+    }
+    context
+}
+
+fn dirs_fallback() -> std::path::PathBuf {
+    std::env::var("HOME").map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
 }
 
 fn tui_log(msg: &str) {

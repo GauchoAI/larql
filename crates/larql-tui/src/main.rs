@@ -72,9 +72,17 @@ impl AppState {
 // ── Backend (subprocess) ─────────────────────────────────────────────────
 
 struct Backend {
+    child: std::process::Child,
     stdin: std::process::ChildStdin,
     stdout_rx: std::sync::mpsc::Receiver<String>,
     stderr_rx: std::sync::mpsc::Receiver<String>,
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Backend {
@@ -93,7 +101,7 @@ impl Backend {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        let stdin = child.stdin.take().unwrap();
+        let mut stdin_handle = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
@@ -148,7 +156,7 @@ impl Backend {
             }
         });
 
-        Ok(Self { stdin, stdout_rx, stderr_rx })
+        Ok(Self { child, stdin: stdin_handle, stdout_rx, stderr_rx })
     }
 
     fn send(&mut self, cmd: &str) -> io::Result<()> {
@@ -334,6 +342,9 @@ fn draw_status(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 // ── Main loop ────────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
+    // Kill any orphaned bench_interactive processes from previous runs
+    let _ = std::process::Command::new("pkill").args(["-f", "bench_interactive.*--walk-only"]).output();
+
     // Terminal setup
     enable_raw_mode()?;
     let mut stdout = io::stdout();

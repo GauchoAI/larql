@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::time::Instant;
 use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::io::{FromRawFd, IntoRawFd};
 
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyModifiers, KeyEventKind};
 use crossterm::terminal::{
@@ -75,8 +77,8 @@ impl AppState {
 // ── Backend (subprocess) ─────────────────────────────────────────────────
 
 struct Backend {
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
+    child: Option<std::process::Child>, // None for daemon mode
+    stdin: Box<dyn IoWrite + Send>,
     stdout_rx: std::sync::mpsc::Receiver<String>,
     stderr_rx: std::sync::mpsc::Receiver<String>,
     log: Arc<Mutex<Option<std::fs::File>>>,
@@ -84,8 +86,10 @@ struct Backend {
 
 impl Drop for Backend {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(ref mut child) = self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -105,7 +109,7 @@ impl Backend {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        let mut stdin_handle = child.stdin.take().unwrap();
+        let stdin_handle: Box<dyn IoWrite + Send> = Box::new(child.stdin.take().unwrap());
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
@@ -182,7 +186,85 @@ impl Backend {
             }
         });
 
-        Ok(Self { child, stdin: stdin_handle, stdout_rx, stderr_rx, log: Arc::clone(&log_file) })
+        Ok(Self { child: Some(child), stdin: stdin_handle, stdout_rx, stderr_rx, log: Arc::clone(&log_file) })
+    }
+
+    /// Connect to an already-running daemon via FIFOs.
+    fn connect_daemon() -> io::Result<Self> {
+        use std::fs::File;
+
+        let log_path = std::env::temp_dir().join("larql-tui.log");
+        let log_file = Arc::new(Mutex::new(
+            OpenOptions::new().create(true).truncate(true).write(true).open(&log_path).ok()
+        ));
+        let log_stdout = Arc::clone(&log_file);
+        let log_stderr = Arc::clone(&log_file);
+
+        // Open FIFOs — stdin is write-only, stdout/stderr are read-only
+        let stdin_file = OpenOptions::new().write(true).open(DAEMON_FIFO_IN)?;
+        let stdout_file = File::open(DAEMON_FIFO_OUT)?;
+        let stderr_file = File::open(DAEMON_FIFO_ERR)?;
+
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+
+        // Stdout reader thread
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut reader = stdout_file;
+            let mut buf = [0u8; 256];
+            let mut line_buf = String::new();
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        for &b in &buf[..n] {
+                            let c = b as char;
+                            line_buf.push(c);
+                            if c == '\n' {
+                                let _ = stdout_tx.send(line_buf.clone());
+                                line_buf.clear();
+                            }
+                        }
+                        if line_buf.trim() == ">" || line_buf.trim() == "> " {
+                            let _ = stdout_tx.send(line_buf.clone());
+                            line_buf.clear();
+                        }
+                        if let Ok(mut guard) = log_stdout.lock() {
+                            if let Some(ref mut f) = *guard {
+                                use std::io::Write;
+                                let _ = write!(f, "[stdout] {}", std::str::from_utf8(&buf[..n]).unwrap_or("?"));
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Stderr reader thread
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr_file);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    if let Ok(mut guard) = log_stderr.lock() {
+                        if let Some(ref mut f) = *guard {
+                            use std::io::Write;
+                            let _ = writeln!(f, "[stderr] {}", line);
+                        }
+                    }
+                    let _ = stderr_tx.send(line);
+                }
+            }
+        });
+
+        Ok(Self {
+            child: None, // daemon mode — don't own the process
+            stdin: Box::new(stdin_file),
+            stdout_rx,
+            stderr_rx,
+            log: log_file,
+        })
     }
 
     fn send(&mut self, cmd: &str) -> io::Result<()> {
@@ -378,9 +460,77 @@ fn draw_status(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
 // ── Main loop ────────────────────────────────────────────────────────────
 
+const DAEMON_PID_FILE: &str = "/tmp/larql-daemon.pid";
+const DAEMON_FIFO_IN: &str = "/tmp/larql-daemon.stdin";
+const DAEMON_FIFO_OUT: &str = "/tmp/larql-daemon.stdout";
+const DAEMON_FIFO_ERR: &str = "/tmp/larql-daemon.stderr";
+
+fn is_daemon_running() -> bool {
+    if let Ok(pid_str) = std::fs::read_to_string(DAEMON_PID_FILE) {
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            // Check if process is alive
+            let status = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output();
+            return status.map(|o| o.status.success()).unwrap_or(false);
+        }
+    }
+    false
+}
+
+fn start_daemon() -> io::Result<()> {
+    let bin = find_binary()?;
+    let model = std::env::var("LARQL_MODEL")
+        .unwrap_or_else(|_| "/Users/miguel_lemos/Desktop/gemma-3-4b-it".into());
+    let vindex = std::env::var("LARQL_VINDEX")
+        .unwrap_or_else(|_| "/Users/miguel_lemos/Desktop/llm-as-a-database/gemma3-4b.vindex".into());
+
+    // Create FIFOs (remove old ones first)
+    for fifo in &[DAEMON_FIFO_IN, DAEMON_FIFO_OUT, DAEMON_FIFO_ERR] {
+        let _ = std::fs::remove_file(fifo);
+        let status = std::process::Command::new("mkfifo").arg(fifo).status()?;
+        if !status.success() {
+            return Err(io::Error::new(io::ErrorKind::Other, format!("mkfifo failed for {fifo}")));
+        }
+    }
+
+    // Start bench_interactive with FIFOs, backgrounded
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "{bin} --model {model} --vindex {vindex} --walk-only --no-warmup \
+             < {DAEMON_FIFO_IN} > {DAEMON_FIFO_OUT} 2> {DAEMON_FIFO_ERR} &\n\
+             echo $!"
+        ))
+        .output()?;
+
+    let pid = String::from_utf8_lossy(&child.stdout).trim().to_string();
+    std::fs::write(DAEMON_PID_FILE, &pid)?;
+    eprintln!("[larql] daemon started (PID {pid})");
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
-    // Kill any orphaned bench_interactive processes from previous runs
-    let _ = std::process::Command::new("pkill").args(["-f", "bench_interactive.*--walk-only"]).output();
+    // Handle --daemon flag: just start daemon and exit
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--daemon") {
+        if is_daemon_running() {
+            eprintln!("[larql] daemon already running");
+            return Ok(());
+        }
+        start_daemon()?;
+        eprintln!("[larql] daemon started. Run `larql` to connect.");
+        return Ok(());
+    }
+
+    if args.iter().any(|a| a == "--stop") {
+        if let Ok(pid_str) = std::fs::read_to_string(DAEMON_PID_FILE) {
+            let _ = std::process::Command::new("kill").arg(pid_str.trim()).output();
+            let _ = std::fs::remove_file(DAEMON_PID_FILE);
+            eprintln!("[larql] daemon stopped");
+        }
+        return Ok(());
+    }
 
     // Terminal setup
     enable_raw_mode()?;
@@ -390,7 +540,15 @@ fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut state = AppState::new();
-    let mut be = Backend::spawn()?;
+
+    // Connect to daemon if running, otherwise spawn subprocess
+    let mut be = if is_daemon_running() {
+        state.messages.push(Message::System("Connecting to daemon (model already loaded)...".into()));
+        Backend::connect_daemon()?
+    } else {
+        state.messages.push(Message::System("Starting model (first time — subsequent launches will be instant)...".into()));
+        Backend::spawn()?
+    };
     state.status = "loading model...".into();
     draw(&mut terminal, &state);
 

@@ -373,9 +373,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Or: chat "Write a Python chess game" 200
                 let (text_raw, n_raw) = split_trailing_int(rest);
                 let user_text = parse_quoted(text_raw);
-                let n: usize = n_raw.parse().unwrap_or(200);
-                // Concise system prompt — Gemma 3 4B works best with short instructions
-                let system = "You are a helpful coding assistant. When writing code, use markdown code blocks.";
+                // Default to 200 tokens for chat (split_trailing_int defaults to "20")
+                let n: usize = if n_raw == "20" && !rest.trim().ends_with("20") {
+                    200
+                } else {
+                    n_raw.parse().unwrap_or(200)
+                };
+                // System prompt — encourage complete responses
+                let system = "You are a helpful coding assistant. Always give complete, detailed answers. When writing code, provide the full working program in a markdown code block. Never cut your response short.";
                 let chat_prompt = format!(
                     "<start_of_turn>system\n{system}<end_of_turn>\n\
                      <start_of_turn>user\n{user_text}<end_of_turn>\n\

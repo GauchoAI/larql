@@ -45,6 +45,7 @@ struct AppState {
     last_prompt: String,      // for echo stripping
     echo_stripped: bool,       // whether we've stripped the echo for this query
     assistant_buf: String,     // accumulate streaming tokens
+    last_output_time: Instant, // detect stalled generation
 }
 
 impl AppState {
@@ -63,6 +64,7 @@ impl AppState {
             last_prompt: String::new(),
             echo_stripped: false,
             assistant_buf: String::new(),
+            last_output_time: Instant::now(),
         }
     }
 }
@@ -362,6 +364,17 @@ fn main() -> io::Result<()> {
             new_output = true;
         }
 
+        // Timeout: if generating and no output for 3 seconds, assume done
+        if state.is_generating && state.last_output_time.elapsed().as_secs() >= 3 {
+            if !state.assistant_buf.is_empty() {
+                let buf_copy = state.assistant_buf.clone();
+                execute_tool_calls(&buf_copy, &mut state.messages);
+                state.assistant_buf.clear();
+            }
+            state.is_generating = false;
+            new_output = true;
+        }
+
         if new_output {
             draw(&mut terminal, &state);
         }
@@ -438,9 +451,23 @@ fn main() -> io::Result<()> {
 }
 
 fn process_stdout_line(line: &str, state: &mut AppState) {
+    state.last_output_time = Instant::now();
     // Preserve newlines! Only trim carriage returns, not \n.
     let trimmed = line.trim_end_matches('\r');
-    if trimmed.is_empty() || trimmed.trim() == ">" || trimmed.trim() == "> " { return; }
+    if trimmed.is_empty() { return; }
+    // The "> " prompt from bench_interactive means generation is done
+    if trimmed.trim() == ">" || trimmed.trim() == "> " {
+        if state.is_generating {
+            // Finalize
+            if !state.assistant_buf.is_empty() {
+                let buf_copy = state.assistant_buf.clone();
+                execute_tool_calls(&buf_copy, &mut state.messages);
+                state.assistant_buf.clear();
+            }
+            state.is_generating = false;
+        }
+        return;
+    }
 
     // Strip leading "> " prompt marker
     let content = if trimmed.starts_with("> ") { &trimmed[2..] } else { trimmed };

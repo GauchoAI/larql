@@ -83,32 +83,42 @@ kernel void q6k_matvec(
     acc = simd_sum(acc);
     if (lane == 0) out[row_idx] = acc;
 }
-// Batched Q6_K matvec: read weights once, dot against M input vectors.
-// out[row * M + m] = dot(W[row], X[m * K ..])
-// Grid: same as q6k_matvec. M is a compile-time max (8); actual batch
-// size passed as runtime constant. Shared weight read = M× bandwidth saving.
+// Batched Q6_K matvec — TRUE GPU parallelism via 2D threadgroup grid.
+//
+// Grid: (n_tgs, M, 1) where n_tgs = ceil(N / Q6K_ROWS_PER_TG).
+// tg_id.x = row block, tg_id.y = batch position.
+//
+// Different batch positions run on DIFFERENT GPU cores simultaneously.
+// Weight data for the same row is read by position 0 from DRAM → L2,
+// then by positions 1..M-1 from L2 (cache hit). Net: 1× DRAM bandwidth
+// for M positions, M× compute parallelized across cores.
+//
+// Output layout: [M, N] — out[m * N + row] for downstream [M, dim] buffers.
 kernel void q6k_matvec_batch(
     device const uchar*  W6K   [[buffer(0)]],
-    device const float*  X     [[buffer(1)]],   // [M, K] — M input vectors
-    device float*        out   [[buffer(2)]],   // [N, M] — M outputs per row
+    device const float*  X     [[buffer(1)]],   // [M, K]
+    device float*        out   [[buffer(2)]],   // [M, N]
     constant uint&       N     [[buffer(3)]],
     constant uint&       K     [[buffer(4)]],
-    constant uint&       M     [[buffer(5)]],   // batch size (1..8)
-    uint tg_id     [[threadgroup_position_in_grid]],
+    constant uint&       M     [[buffer(5)]],   // batch size
+    uint2 tg_id    [[threadgroup_position_in_grid]],
     uint tid_in_tg [[thread_index_in_threadgroup]],
     uint lane      [[thread_index_in_simdgroup]],
     uint sg_id     [[simdgroup_index_in_threadgroup]])
 {
+    uint bi = tg_id.y;          // batch position
+    if (bi >= M) return;
+
     uint superblocks = K / 256;
     uint bytes_per_row = superblocks * Q6K_BLOCK_SIZE;
 
-    uint row_idx = tg_id * Q6K_ROWS_PER_TG + sg_id;
+    uint row_idx = tg_id.x * Q6K_ROWS_PER_TG + sg_id;
     if (row_idx >= N) return;
 
     device const uchar* row = W6K + row_idx * bytes_per_row;
+    device const float* Xm = X + bi * K;   // this position's input vector
 
-    // M accumulators (max 8 batch positions)
-    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float acc = 0.0f;
 
     for (uint sb = lane; sb < superblocks; sb += 32) {
         device const uchar* block = row + sb * Q6K_BLOCK_SIZE;
@@ -119,43 +129,33 @@ kernel void q6k_matvec_batch(
         float d = decode_f16_metal(d_bits);
 
         uint x_base = sb * 256;
+        float block_acc = 0.0f;
 
-        // Dequantize weight values once, dot against M inputs
         for (uint j = 0; j < 16; j++) {
             float sc = d * float(scales[j]);
             uint sub_base = j * 16;
-
             for (uint i = 0; i < 8; i++) {
                 uint qi = sub_base + i * 2;
                 uint byte_idx = qi / 2;
                 uchar lo_byte = ql[byte_idx];
                 uint hi_byte_idx = qi / 4;
                 uchar hi_byte = qh[hi_byte_idx];
-
                 float lo4_0 = float(lo_byte & 0x0F);
                 float lo4_1 = float((lo_byte >> 4) & 0x0F);
                 uint bit_offset_0 = (qi % 4) * 2;
                 uint bit_offset_1 = ((qi + 1) % 4) * 2;
                 float hi2_0 = float((hi_byte >> bit_offset_0) & 0x03);
                 float hi2_1 = float((qh[(qi+1)/4] >> bit_offset_1) & 0x03);
-
-                float w0 = sc * ((lo4_0 + hi2_0 * 16.0f) - 32.0f);
-                float w1 = sc * ((lo4_1 + hi2_1 * 16.0f) - 32.0f);
-
-                // Dot against M input vectors — weight read shared
-                for (uint m = 0; m < M; m++) {
-                    acc[m] += w0 * X[m * K + x_base + qi]
-                            + w1 * X[m * K + x_base + qi + 1];
-                }
+                float val0 = sc * ((lo4_0 + hi2_0 * 16.0f) - 32.0f);
+                float val1 = sc * ((lo4_1 + hi2_1 * 16.0f) - 32.0f);
+                block_acc += val0 * Xm[x_base + qi] + val1 * Xm[x_base + qi + 1];
             }
         }
+        acc += block_acc;
     }
 
-    // SIMD reduce each batch position independently
-    for (uint m = 0; m < M; m++) {
-        float s = simd_sum(acc[m]);
-        if (lane == 0) out[m * N + row_idx] = s;
-    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[bi * N + row_idx] = acc;
 }
 "#;
 

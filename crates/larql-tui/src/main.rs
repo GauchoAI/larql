@@ -444,17 +444,8 @@ fn process_stdout_line(line: &str, state: &mut AppState) {
             state.messages.push(Message::Assistant(text));
             state.assistant_buf.clear();
 
-            // Check for code blocks in the response — show as tool use
-            if let Some(last) = state.messages.last() {
-                if let Message::Assistant(ref text) = last {
-                    if text.contains("```") {
-                        state.messages.push(Message::ToolUse {
-                            tool: "code".into(),
-                            detail: "code block generated (copy to use)".into(),
-                        });
-                    }
-                }
-            }
+            // Execute tool calls found in the response
+            execute_tool_calls(&state.assistant_buf, &mut state.messages);
         }
         if let Some(tok_s) = extract_tok_s(content) {
             state.tok_s = tok_s;
@@ -535,6 +526,102 @@ fn process_stderr_line(line: &str, state: &mut AppState) {
             let cos_end = cos_str.find(' ').unwrap_or(cos_str.len());
             state.status = format!("ready · KNN probe cos={}", &cos_str[..cos_end]);
         }
+    }
+}
+
+fn execute_tool_calls(text: &str, messages: &mut Vec<Message>) {
+    // Parse <tool>write_file</tool> <path>...</path> <content>...</content>
+    if let Some(tool_start) = text.find("<tool>") {
+        let after_tool = &text[tool_start + 6..];
+        if let Some(tool_end) = after_tool.find("</tool>") {
+            let tool_name = after_tool[..tool_end].trim();
+
+            if tool_name == "write_file" {
+                if let (Some(path), Some(content)) = (
+                    extract_tag(text, "path"),
+                    extract_tag(text, "content"),
+                ) {
+                    // Write the file
+                    let workspace = std::env::current_dir().unwrap_or_default();
+                    let full_path = workspace.join(&path);
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent).ok();
+                    }
+                    match std::fs::write(&full_path, &content) {
+                        Ok(()) => {
+                            messages.push(Message::ToolUse {
+                                tool: "write_file".into(),
+                                detail: format!("✓ wrote {} ({} bytes)", full_path.display(), content.len()),
+                            });
+                        }
+                        Err(e) => {
+                            messages.push(Message::ToolUse {
+                                tool: "write_file".into(),
+                                detail: format!("✗ failed: {e}"),
+                            });
+                        }
+                    }
+                }
+            } else if tool_name == "bash" {
+                if let Some(command) = extract_tag(text, "command") {
+                    messages.push(Message::ToolUse {
+                        tool: "bash".into(),
+                        detail: format!("$ {command}"),
+                    });
+                    // Execute the command
+                    match std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(&command)
+                        .output()
+                    {
+                        Ok(output) => {
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            let mut result = String::new();
+                            if !stdout.is_empty() {
+                                result.push_str(&stdout);
+                            }
+                            if !stderr.is_empty() {
+                                if !result.is_empty() { result.push('\n'); }
+                                result.push_str(&stderr);
+                            }
+                            if result.is_empty() {
+                                result = "(no output)".into();
+                            }
+                            // Truncate long output
+                            if result.len() > 500 {
+                                result.truncate(500);
+                                result.push_str("\n...(truncated)");
+                            }
+                            messages.push(Message::System(result));
+                        }
+                        Err(e) => {
+                            messages.push(Message::System(format!("bash error: {e}")));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Also detect markdown code blocks as implicit write_file
+    if text.contains("```") && !text.contains("<tool>") {
+        messages.push(Message::ToolUse {
+            tool: "code".into(),
+            detail: "code block in response (use write_file to save)".into(),
+        });
+    }
+}
+
+fn extract_tag(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text.find(&close)?;
+    if end > start {
+        Some(text[start..end].trim().to_string())
+    } else {
+        None
     }
 }
 

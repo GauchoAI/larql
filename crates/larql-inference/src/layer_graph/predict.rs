@@ -543,8 +543,15 @@ pub fn predict_honest_with_knn_ffn(
                 // Skip the slicing entirely when we're on a post-norm model —
                 // otherwise an empty/dummy mmap slice (the "walk-only with
                 // override" case) would panic at layer offsetting.
-                let force_quant_early = std::env::var("LARQL_FORCE_QUANT_DECODE")
+                // Auto-detect GPU decode: when both Q4_K attention weights AND
+                // Q4_K real FFN weights exist, use GPU decode by default.
+                // Override with LARQL_CPU_DECODE=1 to force CPU path.
+                let cpu_forced = std::env::var("LARQL_CPU_DECODE")
                     .ok().as_deref() == Some("1");
+                let force_quant_env = std::env::var("LARQL_FORCE_QUANT_DECODE")
+                    .ok().as_deref() == Some("1");
+                let force_quant_early = force_quant_env
+                    || (!cpu_forced && has_q4k && gate_index.interleaved_q4k_real_mmap_ref().is_some());
                 let layers: Vec<larql_compute::FullPipelineLayer> =
                     if arch.has_post_norms() && !force_quant_early {
                         Vec::new()
@@ -572,8 +579,7 @@ pub fn predict_honest_with_knn_ffn(
                 // still gets GPU speed on every matmul. Opt out with
                 // LARQL_FORCE_QUANT_DECODE=1 if you need the quant path for
                 // benchmarking or debugging.
-                let force_quant = std::env::var("LARQL_FORCE_QUANT_DECODE")
-                    .ok().as_deref() == Some("1");
+                let force_quant = force_quant_early;
                 if seq_len == 1 && arch.has_post_norms() && !force_quant {
                     // Single-token Gemma 3 decode via f32 attention + Metal matmul
                     // + (either dense or walk) FFN. Reads past K/V from the Metal

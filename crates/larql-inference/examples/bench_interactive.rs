@@ -88,10 +88,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         _ => {
-            let _ = index.load_interleaved(&vindex_path);
-            let _ = index.load_interleaved_q4(&vindex_path);
-            let _ = index.load_interleaved_q4k(&vindex_path);
-            let _ = index.load_interleaved_q4k_real(&vindex_path);
+            // Prefer Q4_K real (GPU decode compatible, validated cos=0.9994).
+            // Only load other formats as fallback.
+            if index.load_interleaved_q4k_real(&vindex_path).is_ok() {
+                eprintln!("[load] interleaved_q4k_real.bin ok (GPU decode default)");
+            } else {
+                let _ = index.load_interleaved(&vindex_path);
+                let _ = index.load_interleaved_q4(&vindex_path);
+                let _ = index.load_interleaved_q4k(&vindex_path);
+            }
         }
     }
     eprintln!("[load] vindex: {:.1}s", t0.elapsed().as_secs_f64());

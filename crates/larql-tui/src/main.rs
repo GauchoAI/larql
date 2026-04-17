@@ -446,14 +446,12 @@ fn process_stdout_line(line: &str, state: &mut AppState) {
 
     // Timing line — finalize the current response
     if content.contains("tok/s") && (content.contains("prefill") || content.contains("decode")) {
-        // Flush accumulated assistant text
+        // Execute tool calls on the accumulated text (don't push again —
+        // the live streaming message is already in state.messages)
         if !state.assistant_buf.is_empty() {
-            let text = state.assistant_buf.clone();
-            state.messages.push(Message::Assistant(text));
+            let buf_copy = state.assistant_buf.clone();
+            execute_tool_calls(&buf_copy, &mut state.messages);
             state.assistant_buf.clear();
-
-            // Execute tool calls found in the response
-            execute_tool_calls(&state.assistant_buf, &mut state.messages);
         }
         if let Some(tok_s) = extract_tok_s(content) {
             state.tok_s = tok_s;

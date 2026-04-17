@@ -1,5 +1,6 @@
 //! Router setup — maps URL paths to handlers.
 
+pub mod chat_completions;
 pub mod describe;
 pub mod explain;
 pub mod generate_stream;
@@ -41,6 +42,7 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/generate", post(generate_stream::handle_generate_stream))
         .route("/v1/health", get(health::handle_health))
         .route("/v1/models", get(models::handle_models))
+        .route("/v1/chat/completions", post(chat_completions::handle_chat_completions))
         .with_state(state)
 }
 

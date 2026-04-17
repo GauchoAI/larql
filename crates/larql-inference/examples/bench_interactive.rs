@@ -229,224 +229,173 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  quit");
             }
             "batch-insert" => {
-                // Scan a folder recursively, extract facts, INSERT each one.
-                // Extracts: markdown headings → content, code docstrings → summaries
+                // File-as-prompt approach: each section's CONTENT is the prompt.
+                // The residual at L26 captures the MEANING of the section.
+                // When a question has similar meaning → KNN fires.
                 let folder = parse_quoted(rest);
                 if folder.is_empty() || !std::path::Path::new(&folder).is_dir() {
                     println!("  usage: batch-insert <folder_path>");
                     print!("> "); stdout.flush().ok(); continue;
                 }
                 let install_layer = num_layers.saturating_sub(8);
-                let mut facts: Vec<(String, String, String)> = Vec::new();
 
-                // Walk the folder
-                fn walk_dir(dir: &std::path::Path, facts: &mut Vec<(String, String, String)>) {
+                // Collect (section_prompt, answer_token, entity_label, file_path)
+                struct Section { prompt: String, answer: String, entity: String, file: String }
+                let mut sections: Vec<Section> = Vec::new();
+
+                fn walk_and_chunk(dir: &std::path::Path, sections: &mut Vec<Section>) {
                     let Ok(entries) = std::fs::read_dir(dir) else { return; };
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_dir() {
-                            walk_dir(&path, facts);
-                        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                            let Ok(content) = std::fs::read_to_string(&path) else { continue; };
-                            let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                            match ext {
-                                "md" | "markdown" => extract_markdown_facts(&file_name, &content, facts),
-                                "py" => extract_python_facts(&file_name, &content, facts),
-                                "rs" => extract_rust_facts(&file_name, &content, facts),
-                                "js" | "ts" => extract_code_facts(&file_name, &content, facts),
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-
-                fn extract_markdown_facts(file: &str, content: &str, facts: &mut Vec<(String, String, String)>) {
-                    let mut current_heading = file.trim_end_matches(".md").to_string();
-                    let mut section_text = String::new();
-
-                    for line in content.lines() {
-                        if line.starts_with('#') {
-                            // Flush previous section
-                            if !section_text.trim().is_empty() {
-                                let summary = first_sentence(&section_text);
-                                if !summary.is_empty() {
-                                    facts.push((current_heading.clone(), "describes".into(), summary));
-                                }
-                            }
-                            current_heading = line.trim_start_matches('#').trim().to_string();
-                            section_text.clear();
+                            walk_and_chunk(&path, sections);
                         } else {
-                            section_text.push_str(line);
-                            section_text.push(' ');
-                        }
-                        // Extract key-value patterns: **Key**: value or Key: value
-                        let trimmed = line.trim();
-                        if let Some(colon_pos) = trimmed.find(':') {
-                            let key = trimmed[..colon_pos].trim().trim_matches('*').trim();
-                            let val = trimmed[colon_pos + 1..].trim();
-                            if !key.is_empty() && !val.is_empty() && key.len() < 40 && val.len() < 100 {
-                                // Skip generic keys
-                                if !key.starts_with("http") && !key.starts_with("//") && !key.starts_with("#") {
-                                    facts.push((key.to_string(), "is".into(), val.to_string()));
+                            let Ok(content) = std::fs::read_to_string(&path) else { continue; };
+                            let fname = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            if !["md", "markdown", "py", "rs", "js", "ts", "txt"].contains(&ext) { continue; }
+
+                            // Split into sections by headings (markdown) or by chunks
+                            let mut current_heading = fname.clone();
+                            let mut current_content = String::new();
+
+                            for line in content.lines() {
+                                if line.starts_with('#') {
+                                    // Flush previous section
+                                    if current_content.trim().len() > 20 {
+                                        // Use the section content as the prompt, heading as entity
+                                        // First significant word from content as the answer token
+                                        let answer = extract_key_answer(&current_content);
+                                        if !answer.is_empty() {
+                                            sections.push(Section {
+                                                prompt: current_content.trim().to_string(),
+                                                answer,
+                                                entity: current_heading.clone(),
+                                                file: fname.clone(),
+                                            });
+                                        }
+                                    }
+                                    current_heading = line.trim_start_matches('#').trim().to_string();
+                                    current_content.clear();
+                                } else if !line.trim().is_empty() {
+                                    current_content.push_str(line.trim());
+                                    current_content.push(' ');
+                                }
+                            }
+                            // Flush last section
+                            if current_content.trim().len() > 20 {
+                                let answer = extract_key_answer(&current_content);
+                                if !answer.is_empty() {
+                                    sections.push(Section {
+                                        prompt: current_content.trim().to_string(),
+                                        answer,
+                                        entity: current_heading,
+                                        file: fname.clone(),
+                                    });
                                 }
                             }
                         }
                     }
-                    // Flush last section
-                    if !section_text.trim().is_empty() {
-                        let summary = first_sentence(&section_text);
-                        if !summary.is_empty() {
-                            facts.push((current_heading, "describes".into(), summary));
-                        }
-                    }
                 }
 
-                fn extract_python_facts(file: &str, content: &str, facts: &mut Vec<(String, String, String)>) {
-                    let module_name = file.trim_end_matches(".py");
-                    // Module docstring
-                    if let Some(doc) = extract_docstring(content) {
-                        facts.push((module_name.to_string(), "module-purpose".into(), first_sentence(&doc)));
-                    }
-                    // Function signatures + docstrings
-                    for line in content.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.starts_with("def ") {
-                            let fn_name = trimmed.strip_prefix("def ").unwrap_or("")
-                                .split('(').next().unwrap_or("").trim();
-                            if !fn_name.is_empty() && !fn_name.starts_with('_') {
-                                // Look for docstring after def
-                                let after_def = content.split(trimmed).nth(1).unwrap_or("");
-                                if let Some(doc) = extract_docstring(after_def) {
-                                    facts.push((fn_name.to_string(), "function-purpose".into(), first_sentence(&doc)));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                fn extract_rust_facts(file: &str, content: &str, facts: &mut Vec<(String, String, String)>) {
-                    let module_name = file.trim_end_matches(".rs");
-                    // //! module doc comments
-                    let mut module_doc = String::new();
-                    for line in content.lines() {
-                        if line.starts_with("//!") {
-                            module_doc.push_str(line.trim_start_matches("//!").trim());
-                            module_doc.push(' ');
-                        } else if !line.trim().is_empty() && !line.starts_with("//") {
-                            break;
-                        }
-                    }
-                    if !module_doc.trim().is_empty() {
-                        facts.push((module_name.to_string(), "module-purpose".into(), first_sentence(&module_doc)));
-                    }
-                }
-
-                fn extract_code_facts(file: &str, content: &str, facts: &mut Vec<(String, String, String)>) {
-                    // Generic: extract // or /* */ comments at top as module description
-                    let mut top_comment = String::new();
-                    for line in content.lines() {
+                /// Extract the most "answerable" word from a section.
+                /// Looks for proper nouns, numbers, URLs, code identifiers.
+                fn extract_key_answer(text: &str) -> String {
+                    // Try to find a specific value after a colon or bold marker
+                    for line in text.lines() {
                         let t = line.trim();
-                        if t.starts_with("//") {
-                            top_comment.push_str(t.trim_start_matches("//").trim());
-                            top_comment.push(' ');
-                        } else if !t.is_empty() { break; }
+                        if let Some(pos) = t.find(':') {
+                            let val = t[pos+1..].trim().trim_matches('`').trim();
+                            if val.len() >= 2 && val.len() <= 60 {
+                                // Return first word/token that looks like an answer
+                                return val.split_whitespace().next().unwrap_or(val)
+                                    .trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '/')
+                                    .to_string();
+                            }
+                        }
                     }
-                    if !top_comment.trim().is_empty() {
-                        let name = file.split('.').next().unwrap_or(file);
-                        facts.push((name.to_string(), "module-purpose".into(), first_sentence(&top_comment)));
+                    // Fallback: first capitalized word or number
+                    for word in text.split_whitespace() {
+                        let w = word.trim_matches(|c: char| !c.is_alphanumeric());
+                        if w.len() >= 2 && (w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                            || w.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)) {
+                            return w.to_string();
+                        }
                     }
+                    String::new()
                 }
 
-                fn extract_docstring(text: &str) -> Option<String> {
-                    let trimmed = text.trim();
-                    if trimmed.starts_with("\"\"\"") {
-                        let end = trimmed[3..].find("\"\"\"").map(|i| i + 3)?;
-                        Some(trimmed[3..end].trim().to_string())
-                    } else if trimmed.starts_with("'''") {
-                        let end = trimmed[3..].find("'''").map(|i| i + 3)?;
-                        Some(trimmed[3..end].trim().to_string())
-                    } else { None }
+                walk_and_chunk(std::path::Path::new(&folder), &mut sections);
+                println!("  scanned {}: {} sections found", folder, sections.len());
+
+                // Build pipeline layers once for GPU capture
+                let gi: &dyn larql_vindex::GateIndex = &index;
+                let ins_mmap = gi.interleaved_q4k_real_mmap_ref()
+                    .or_else(|| gi.interleaved_q4k_mmap_ref())
+                    .unwrap_or(&[][..]);
+                let ins_inter = gi.num_features(0);
+                if ins_mmap.is_empty() || ins_inter == 0 {
+                    println!("  ERROR: no Q4_K FFN weights available");
+                    print!("> "); stdout.flush().ok(); continue;
                 }
+                let ins_q4_per = (ins_inter * weights.hidden_size).div_ceil(256) * 148;
+                let ins_layers = larql_inference::layer_graph::pipeline_layer::build_pipeline_layers(
+                    weights, &index, 0..num_layers,
+                    ins_mmap, ins_q4_per, larql_compute::QuantFormat::Q4_K,
+                );
+                let rope = weights.arch.rope_base_for_layer(0) as f32;
+                let norm_offset = weights.arch.norm_weight_offset();
 
-                fn first_sentence(text: &str) -> String {
-                    let t = text.trim();
-                    let end = t.find(|c: char| c == '.' || c == '\n').map(|i| i + 1).unwrap_or(t.len().min(120));
-                    t[..end].trim().to_string()
-                }
-
-                walk_dir(std::path::Path::new(&folder), &mut facts);
-
-                // Deduplicate and limit
-                facts.sort_by(|a, b| a.0.cmp(&b.0));
-                facts.dedup_by(|a, b| a.0 == b.0 && a.2 == b.2);
-
-                println!("  extracted {} facts from {}", facts.len(), folder);
                 let mut inserted = 0;
-                for (entity, relation, target) in &facts {
-                    // Skip very short or very long targets
-                    if target.len() < 3 || target.len() > 200 { continue; }
-                    let rel_words = relation.replace(['-', '_'], " ");
-                    let prompt = format!("The {rel_words} of {entity} is");
-                    let prompt_enc = match tokenizer.encode(prompt.as_str(), true) {
+                for (i, sec) in sections.iter().enumerate() {
+                    // Tokenize the SECTION CONTENT as the prompt
+                    let prompt_enc = match tokenizer.encode(sec.prompt.as_str(), true) {
                         Ok(e) => e, Err(_) => continue,
                     };
                     let prompt_ids: Vec<u32> = prompt_enc.get_ids().to_vec();
-                    let spaced = format!(" {target}");
-                    let tgt_enc = match tokenizer.encode(spaced.as_str(), false) {
+                    // Limit prompt length (GPU decode gets slow for very long prompts)
+                    if prompt_ids.len() > 128 { continue; }
+
+                    let tgt_enc = match tokenizer.encode(format!(" {}", sec.answer).as_str(), false) {
                         Ok(e) => e, Err(_) => continue,
                     };
-                    let target_id: u32 = tgt_enc.get_ids().first().copied().unwrap_or(0);
+                    let target_id = tgt_enc.get_ids().first().copied().unwrap_or(0);
                     if target_id == 0 { continue; }
 
+                    // Capture residual at L26 by running the section content through GPU decode
                     backend.reset_kv_cache();
-                    // Use GPU decode path for residual capture
-                    if walk_only {
-                        let gi: &dyn larql_vindex::GateIndex = &index;
-                        let ins_mmap = gi.interleaved_q4k_real_mmap_ref()
-                            .or_else(|| gi.interleaved_q4k_mmap_ref())
-                            .unwrap_or(&[][..]);
-                        let ins_inter = gi.num_features(0);
-                        if ins_mmap.is_empty() || ins_inter == 0 { continue; }
-                        let ins_q4_per = (ins_inter * weights.hidden_size).div_ceil(256) * 148;
-                        let ins_layers = larql_inference::layer_graph::pipeline_layer::build_pipeline_layers(
-                            weights, &index, 0..num_layers,
-                            ins_mmap, ins_q4_per, larql_compute::QuantFormat::Q4_K,
-                        );
-                        let embeds = larql_inference::forward::embed_tokens_pub(weights, &prompt_ids);
-                        let rope = weights.arch.rope_base_for_layer(0) as f32;
-                        let mut probe_h = None;
-                        for p in 0..prompt_ids.len() {
-                            let x: Vec<f32> = embeds.row(p).to_vec();
-                            let (_h, ph) = backend.decode_token_with_probe(
-                                &ins_layers, &x, weights.hidden_size, ins_inter,
-                                weights.num_q_heads * weights.head_dim,
-                                weights.num_kv_heads * weights.head_dim,
-                                weights.num_q_heads, weights.num_kv_heads,
-                                weights.head_dim, rope, Some(install_layer),
-                            ).unwrap_or((vec![], None));
-                            if ph.is_some() { probe_h = ph; }
-                        }
-                        if let Some(ph) = probe_h {
-                            let norm_offset = weights.arch.norm_weight_offset();
-                            let ph_arr = ndarray::Array2::from_shape_vec((1, weights.hidden_size), ph).unwrap();
-                            let pre_ffn_key = weights.arch.pre_feedforward_layernorm_key(install_layer);
-                            let normed = match pre_ffn_key {
-                                Some(key) => larql_inference::forward::apply_norm(weights, &ph_arr, &key, norm_offset),
-                                None => ph_arr,
-                            };
-                            let k = normed.row(0).to_vec();
-                            knn_store.add(install_layer, k, target_id, target.clone(),
-                                entity.clone(), relation.clone(), 1.0);
-                            inserted += 1;
-                            print!("  [{inserted}/{} ] {entity} —[{relation}]→ {}\r",
-                                facts.len(), &target[..target.len().min(40)]);
-                            stdout.flush().ok();
-                        }
+                    let embeds = larql_inference::forward::embed_tokens_pub(weights, &prompt_ids);
+                    let mut probe_h = None;
+                    for p in 0..prompt_ids.len() {
+                        let x: Vec<f32> = embeds.row(p).to_vec();
+                        let (_h, ph) = backend.decode_token_with_probe(
+                            &ins_layers, &x, weights.hidden_size, ins_inter,
+                            weights.num_q_heads * weights.head_dim,
+                            weights.num_kv_heads * weights.head_dim,
+                            weights.num_q_heads, weights.num_kv_heads,
+                            weights.head_dim, rope, Some(install_layer),
+                        ).unwrap_or((vec![], None));
+                        if ph.is_some() { probe_h = ph; }
+                    }
+                    if let Some(ph) = probe_h {
+                        let ph_arr = ndarray::Array2::from_shape_vec((1, weights.hidden_size), ph).unwrap();
+                        let pre_ffn_key = weights.arch.pre_feedforward_layernorm_key(install_layer);
+                        let normed = match pre_ffn_key {
+                            Some(key) => larql_inference::forward::apply_norm(weights, &ph_arr, &key, norm_offset),
+                            None => ph_arr,
+                        };
+                        let k = normed.row(0).to_vec();
+                        knn_store.add(install_layer, k, target_id, sec.answer.clone(),
+                            sec.entity.clone(), sec.file.clone(), 1.0);
+                        inserted += 1;
+                        print!("  [{}/{}] {} → \"{}\"\r",
+                            inserted, sections.len(), sec.entity, &sec.answer[..sec.answer.len().min(30)]);
+                        stdout.flush().ok();
                     }
                 }
                 println!();
-                println!("  batch-insert complete: {inserted} facts from {} files",
-                    facts.len());
+                println!("  batch-insert: {} sections inserted from {}",
+                    inserted, folder);
                 println!("  KNN overlay: {} entries across layers {:?}",
                     knn_store.len(), knn_store.layers());
                 backend.reset_kv_cache();

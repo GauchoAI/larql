@@ -70,6 +70,11 @@ pub fn generate_speculative(
     }
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
+    if trace {
+        let amax = last_h.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        eprintln!("[spec] prefill done: seq_len={seq_len} h_amax={amax:.2} layers={}", layers.len());
+    }
+
     // First token from prefill output
     let h_arr = ndarray::Array2::from_shape_vec((1, hidden), last_h).unwrap();
     let h_final = crate::forward::apply_norm(weights, &h_arr, weights.arch.final_norm_key(), norm_offset);
@@ -144,41 +149,81 @@ pub fn generate_speculative(
         total_cycles += 1;
         total_drafted += k;
 
-        // Verify each draft token sequentially
-        let mut accepted = 0usize;
-        let mut bonus_token: Option<(u32, f64)> = None;
+        // Build batch: [current_token, draft[0], draft[1], ..., draft[K-1]]
+        // We verify K+1 positions: current_token produces the first model prediction
+        // (which should match draft[0]); draft[0] produces the second (match draft[1]); etc.
+        let mut verify_ids = Vec::with_capacity(k + 1);
+        verify_ids.push(current_token_id);
+        verify_ids.extend_from_slice(&drafts);
+        let k_plus_1 = verify_ids.len();
 
-        for i in 0..k {
-            let verify_input = if i == 0 { current_token_id } else { drafts[i - 1] };
-            if let Some((_h, model_tid, prob)) = decode_and_predict(verify_input) {
-                if model_tid == drafts[i] {
-                    // Draft matches model — accept
-                    accepted += 1;
-                    let tok_str = tokenizer.decode(&[model_tid], true).unwrap_or_default();
-                    let is_eos = tok_str.trim() == "<eos>" || tok_str.trim() == "</s>";
-                    tokens.push((tok_str, prob));
-                    context.push(model_tid);
-                    if is_eos || tokens.len() >= max_tokens { break; }
-                } else {
-                    // Reject — use model's prediction as the bonus token
-                    bonus_token = Some((model_tid, prob));
-                    // Rollback KV cache: we already appended this token's KV,
-                    // but the DRAFT token for subsequent positions is wrong.
-                    // Rollback the remaining (k - i - 1) un-verified positions.
-                    // (The current position's KV is correct — model processed it.)
-                    break;
-                }
-            } else { break; }
+        // Embed all verify tokens
+        let embeds = crate::forward::embed_tokens_pub(weights, &verify_ids);
+        let x_batch: Vec<f32> = embeds.as_slice().unwrap_or(&[]).to_vec();
+
+        // Batch decode: all K+1 tokens through the model
+        let h_batch = backend.decode_token_batch(
+            layers, &x_batch, k_plus_1,
+            hidden, intermediate, q_dim, kv_dim,
+            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+        );
+
+        let h_batch = match h_batch {
+            Some(h) => h,
+            None => break,
+        };
+
+        // Get model predictions for each position
+        let mut model_tokens = Vec::with_capacity(k_plus_1);
+        let mut model_probs = Vec::with_capacity(k_plus_1);
+        for bi in 0..k_plus_1 {
+            let h_slice = &h_batch[bi * hidden..(bi + 1) * hidden];
+            let h_arr = ndarray::Array2::from_shape_vec((1, hidden), h_slice.to_vec()).unwrap();
+            let h_final = crate::forward::apply_norm(weights, &h_arr, weights.arch.final_norm_key(), norm_offset);
+            let h_1d = h_final.row(0).to_owned();
+            let hits = index.lm_head_knn_backend(&h_1d, 5, backend);
+            if let Some(&(tid, score)) = hits.first() {
+                let prob = super::logits::softmax_prob(score, &hits, logits_scale, final_softcap);
+                model_tokens.push(tid);
+                model_probs.push(prob);
+            } else {
+                model_tokens.push(0);
+                model_probs.push(0.0);
+            }
         }
 
-        // Rollback un-verified draft positions from KV cache
-        let unverified = k - accepted - if bonus_token.is_some() { 0 } else { 0 };
-        // We only ran decode_token for (accepted + 1) tokens if we rejected,
-        // or (accepted) if we ran out. No rollback needed for un-run tokens
-        // since they were never appended to KV cache.
+        // Accept longest matching prefix.
+        // Position 0: model_tokens[0] should match drafts[0]
+        // Position i: model_tokens[i] should match drafts[i]
+        let mut accepted = 0usize;
+        for i in 0..k {
+            if model_tokens[i] == drafts[i] {
+                accepted += 1;
+                let tok_str = tokenizer.decode(&[drafts[i]], true).unwrap_or_default();
+                tokens.push((tok_str, model_probs[i]));
+                context.push(drafts[i]);
+                if tokens.len() >= max_tokens { break; }
+            } else {
+                break;
+            }
+        }
 
-        // Add bonus token (model's prediction at rejection point)
-        if let Some((tid, prob)) = bonus_token {
+        // Rollback un-accepted draft tokens from KV cache.
+        // We appended k+1 tokens total (current + k drafts).
+        // We want to keep: 1 (current) + accepted (matched drafts) + 1 (bonus).
+        // Rollback: (k+1) - (accepted+1) - 1 = k - accepted - 1... but we also
+        // want to keep the bonus token's KV.
+        // Simpler: rollback (k - accepted) positions.
+        let rollback_n = k - accepted;
+        if rollback_n > 0 {
+            backend.rollback_kv_cache(rollback_n);
+        }
+
+        // Bonus token: model's prediction at the rejection point (or after all accepted)
+        let bonus_idx = accepted; // model_tokens[accepted] = what model predicted at draft[accepted]
+        if bonus_idx < k_plus_1 {
+            let tid = model_tokens[bonus_idx];
+            let prob = model_probs[bonus_idx];
             let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
             let is_eos = tok_str.trim() == "<eos>" || tok_str.trim() == "</s>";
             tokens.push((tok_str, prob));
@@ -187,18 +232,6 @@ pub fn generate_speculative(
             if is_eos { break; }
         } else if accepted > 0 {
             current_token_id = drafts[accepted - 1];
-        }
-
-        // If all K drafts accepted, also get the model's prediction at position K
-        if accepted == k && bonus_token.is_none() {
-            if let Some((_h, tid, prob)) = decode_and_predict(drafts[k - 1]) {
-                let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
-                let is_eos = tok_str.trim() == "<eos>" || tok_str.trim() == "</s>";
-                tokens.push((tok_str, prob));
-                context.push(tid);
-                current_token_id = tid;
-                if is_eos { break; }
-            }
         }
 
         total_accepted += accepted;

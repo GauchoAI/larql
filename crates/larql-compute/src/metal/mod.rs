@@ -53,6 +53,8 @@ pub struct MetalBackend {
     q8_quant_pipeline: ComputePipelineState,
     pub kv_attend_pipeline: ComputePipelineState,
     pub kv_append_pipeline: ComputePipelineState,
+    pub kv_attend_batched_pipeline: ComputePipelineState,
+    pub kv_append_batch_pipeline: ComputePipelineState,
     q8_matvec_pipeline: ComputePipelineState,
     pub rms_norm_pipeline: ComputePipelineState,
     pub residual_add_pipeline: ComputePipelineState,
@@ -82,6 +84,9 @@ pub struct MetalBackend {
     pub v_norm_batched_pipeline: ComputePipelineState,
     // Scale vector (per-layer scalar, Gemma 4)
     pub scale_vector_pipeline: ComputePipelineState,
+    // f32 sparse walk (Option C): only top-K rows read from mmap'd f32.
+    pub f32_sparse_matvec_pipeline: ComputePipelineState,
+    pub f32_sparse_vecmat_pipeline: ComputePipelineState,
     /// KV cache for decode mode — initialized on first decode_token call.
     kv_cache: std::sync::Mutex<Option<ops::kv_cache::KVCache>>,
     pub rms_norm_q8_pipeline: ComputePipelineState,
@@ -217,16 +222,27 @@ impl MetalBackend {
         let scale_vector_fn = library.get_function("scale_vector", None).ok()?;
         let scale_vector_pipeline = device.new_compute_pipeline_state_with_function(&scale_vector_fn).ok()?;
 
-        // KV cache attention
+        // KV cache attention (single + batched for speculative decoding)
         let kv_attend_fn = library.get_function("kv_attention", None).ok()?;
         let kv_append_fn = library.get_function("kv_cache_append", None).ok()?;
         let kv_attend_pipeline = device.new_compute_pipeline_state_with_function(&kv_attend_fn).ok()?;
         let kv_append_pipeline = device.new_compute_pipeline_state_with_function(&kv_append_fn).ok()?;
+        let kv_attend_batched_fn = library.get_function("kv_attention_batched", None).ok()?;
+        let kv_append_batch_fn = library.get_function("kv_cache_append_batch", None).ok()?;
+        let kv_attend_batched_pipeline = device.new_compute_pipeline_state_with_function(&kv_attend_batched_fn).ok()?;
+        let kv_append_batch_pipeline = device.new_compute_pipeline_state_with_function(&kv_append_batch_fn).ok()?;
+
+        // Option C — f32 sparse walk
+        let f32_sparse_matvec_fn = library.get_function("f32_sparse_matvec", None).ok()?;
+        let f32_sparse_matvec_pipeline = device.new_compute_pipeline_state_with_function(&f32_sparse_matvec_fn).ok()?;
+        let f32_sparse_vecmat_fn = library.get_function("f32_sparse_vecmat", None).ok()?;
+        let f32_sparse_vecmat_pipeline = device.new_compute_pipeline_state_with_function(&f32_sparse_vecmat_fn).ok()?;
 
         Some(Self {
             queue, bufs, f32_ops, q4, causal_attn_pipeline, fused_attn_pipeline,
             geglu_pipeline, geglu_gelu_tanh_pipeline, q8_quant_pipeline,
             kv_attend_pipeline, kv_append_pipeline,
+            kv_attend_batched_pipeline, kv_append_batch_pipeline,
             q8_matvec_pipeline,
             rms_norm_pipeline, residual_add_pipeline,
             q8_qkv_proj_pipeline,
@@ -241,6 +257,7 @@ impl MetalBackend {
             layer_norm_pipeline, layer_norm_no_bias_pipeline,
             v_norm_pipeline, v_norm_batched_pipeline,
             scale_vector_pipeline,
+            f32_sparse_matvec_pipeline, f32_sparse_vecmat_pipeline,
             kv_cache: std::sync::Mutex::new(None),
             rms_norm_q8_pipeline, residual_norm_pipeline, residual_norm_q8_pipeline,
             flop_threshold: AtomicUsize::new(calibrate::DEFAULT_FLOP_THRESHOLD),

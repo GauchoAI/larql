@@ -129,6 +129,20 @@ pub trait ComputeBackend: Send + Sync {
     /// Used by speculative decoding to undo rejected draft tokens.
     fn rollback_kv_cache(&self, _n: usize) {}
 
+    /// Batch-decode K tokens. Returns [K * hidden] — K output hidden states.
+    /// Used by speculative decoding for parallel verification.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_token_batch(
+        &self,
+        _layers: &[crate::FullPipelineLayer<'_>],
+        _x_batch: &[f32],
+        _batch_size: usize,
+        _hidden: usize, _inter: usize,
+        _q_dim: usize, _kv_dim: usize,
+        _num_q_heads: usize, _num_kv_heads: usize, _head_dim: usize,
+        _rope_base: f32,
+    ) -> Option<Vec<f32>> { None }
+
     /// Diagnostic: read back K and V cache contents for one layer.
     /// Returns (k_flat, v_flat, current_len) or None if unsupported.
     #[allow(clippy::type_complexity)]

@@ -601,20 +601,15 @@ fn main() -> io::Result<()> {
             new_output = true;
         }
 
-        // Tool-result feedback: if bash was executed, feed output back to model
+        // Tool-result feedback: feed summary back to model (no visible user message)
         if let Some(result) = state.pending_tool_result.take() {
-            // Use chatml (multi-line) to send tool output with real newlines
-            let feedback = format!("The command ran successfully. Here is the output:\n{result}\n\nBriefly describe what you see.");
-            state.messages.push(Message::User("[tool result]".into()));
+            let flat = result.replace('\n', " | ");
+            let feedback = format!("Tool output: {flat} --- Based on this, provide a brief commentary.");
+            // No user message shown — this is internal
             state.echo_stripped = true;
             state.assistant_buf.clear();
             state.last_output_time = Instant::now();
-            // Send as chatml with ---END--- delimiter
-            be.send("chatml")?;
-            for line in feedback.lines() {
-                be.send(line)?;
-            }
-            be.send("---END---")?;
+            be.send(&format!("chat {feedback}"))?;
             state.is_generating = true;
             new_output = true;
         }

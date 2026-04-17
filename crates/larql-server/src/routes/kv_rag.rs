@@ -25,13 +25,24 @@ pub struct KvRagInsertRequest {
     pub fact: String,
     #[serde(default)]
     pub category: String,
+    #[serde(default = "default_layer")]
+    pub layer: usize,
+    #[serde(default = "default_head")]
+    pub head: usize,
 }
+
+fn default_layer() -> usize { RETRIEVAL_LAYER }
+fn default_head() -> usize { RETRIEVAL_KV_HEAD }
 
 #[derive(Deserialize)]
 pub struct KvRagQueryRequest {
     pub query: String,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
+    #[serde(default = "default_layer")]
+    pub layer: usize,
+    #[serde(default = "default_head")]
+    pub head: usize,
 }
 
 fn default_top_k() -> usize { 3 }
@@ -211,8 +222,10 @@ pub async fn handle_kv_rag_insert(
     let fact = req.fact.clone();
     let category = req.category.clone();
 
+    let layer = req.layer;
+    let head = req.head;
     let result = tokio::task::spawn_blocking(move || {
-        let k_vec = extract_k_vector(&model, &fact, RETRIEVAL_LAYER, RETRIEVAL_KV_HEAD)
+        let k_vec = extract_k_vector(&model, &fact, layer, head)
             .ok_or_else(|| ServerError::Internal("K vector extraction failed".into()))?;
 
         state.kv_rag_store.insert(KvRagEntry {
@@ -224,8 +237,8 @@ pub async fn handle_kv_rag_insert(
         Ok::<_, ServerError>(serde_json::json!({
             "status": "ok",
             "fact": fact,
-            "layer": RETRIEVAL_LAYER,
-            "kv_head": RETRIEVAL_KV_HEAD,
+            "layer": layer,
+            "kv_head": head,
             "total_facts": state.kv_rag_store.len(),
         }))
     })
@@ -245,8 +258,10 @@ pub async fn handle_kv_rag_query(
     let query = req.query.clone();
     let top_k = req.top_k;
 
+    let layer = req.layer;
+    let head = req.head;
     let result = tokio::task::spawn_blocking(move || {
-        let q_vec = extract_q_vector(&model, &query, RETRIEVAL_LAYER, RETRIEVAL_KV_HEAD)
+        let q_vec = extract_q_vector(&model, &query, layer, head)
             .ok_or_else(|| ServerError::Internal("Q vector extraction failed".into()))?;
 
         let results = state.kv_rag_store.query(&q_vec, top_k);

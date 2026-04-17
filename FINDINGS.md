@@ -46,8 +46,22 @@ The conversation-as-knowledge vision needs **better fact extraction**, not more 
 | KV-RAG (L24 H2) | Precise fact retrieval | ~5s INSERT | 4/5 isolated, 3/9 in mix |
 | Cross-phrasing KNN | Known facts | cos=0.89 | Works for training-data facts |
 
+### Iteration Log
+| Run | Score | Change |
+|-----|-------|--------|
+| Baseline (raw session turns) | 4/11 | — |
+| Assistant-only + sentence split | 5/11 | skip user msgs |
+| + seeded key facts | 7/11 | 10 curated facts |
+| Key facts ONLY (no session noise) | 8/11 | removed 3491 noisy sentences |
+
+### Remaining Failures (3/11)
+- **tok/s**: "GPU decode runs at 35-41 tok/s" fact not retrieved for "how fast is decode"
+- **port 3000**: "server default port is 3000" not retrieved for "what port"
+- **Metal GPU**: "Metal M4 Pro" not retrieved for "what GPU"
+All three: mean-of-token-embeddings doesn't match query→fact at cos>0.55
+
 ### Next Steps
-1. **Fact extraction**: distill conversation turns into key statements before INSERT
-2. **Scenario iteration**: `./tests/rag_scenarios.sh` — fast feedback loop
+1. **Better embeddings**: TF-IDF weighting or keyword-boosted embeddings
+2. **Scenario iteration**: `./tests/rag_scenarios.sh` — 90s feedback loop
 3. **Session loading**: `--session` loads Claude sessions into RAG at startup
 4. **Combine RAG + KV-RAG**: embedding for broad recall, KV for precision

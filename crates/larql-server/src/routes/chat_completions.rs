@@ -93,7 +93,21 @@ pub async fn handle_chat_completions(
     }
 
     let max_tokens = req.max_tokens.unwrap_or(4096);
-    let chat_prompt = messages_to_gemma3_prompt(&req.messages);
+
+    // RAG: retrieve matching facts and inject as context
+    let user_msg = req.messages.last().map(|m| m.content.as_str()).unwrap_or("");
+    let rag_context = super::rag::retrieve_context(&state, &model, user_msg, 0.5);
+    let chat_prompt = if let Some(ref ctx) = rag_context {
+        tracing::info!("[chat] RAG injecting {} chars of context", ctx.len());
+        // Inject RAG context as a system-level addition
+        let mut msgs = req.messages.clone();
+        if let Some(last) = msgs.last_mut() {
+            last.content = format!("{ctx}\n\n{}", last.content);
+        }
+        messages_to_gemma3_prompt(&msgs)
+    } else {
+        messages_to_gemma3_prompt(&req.messages)
+    };
     let request_id = format!("chatcmpl-{}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
 

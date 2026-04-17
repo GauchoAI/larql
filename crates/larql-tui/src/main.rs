@@ -77,6 +77,7 @@ struct Backend {
     stdin: std::process::ChildStdin,
     stdout_rx: std::sync::mpsc::Receiver<String>,
     stderr_rx: std::sync::mpsc::Receiver<String>,
+    log: Arc<Mutex<Option<std::fs::File>>>,
 }
 
 impl Drop for Backend {
@@ -179,12 +180,23 @@ impl Backend {
             }
         });
 
-        Ok(Self { child, stdin: stdin_handle, stdout_rx, stderr_rx })
+        Ok(Self { child, stdin: stdin_handle, stdout_rx, stderr_rx, log: Arc::clone(&log_file) })
     }
 
     fn send(&mut self, cmd: &str) -> io::Result<()> {
+        self.log_msg(&format!("[SEND] {cmd}"));
         writeln!(self.stdin, "{}", cmd)?;
         self.stdin.flush()
+    }
+
+    fn log_msg(&self, msg: &str) {
+        if let Ok(mut guard) = self.log.lock() {
+            if let Some(ref mut f) = *guard {
+                use std::io::Write;
+                let _ = writeln!(f, "{msg}");
+                let _ = f.flush();
+            }
+        }
     }
 
     fn poll_stdout(&self) -> Vec<String> {
@@ -417,6 +429,7 @@ fn main() -> io::Result<()> {
 
         // Timeout: if generating and no output for 3 seconds, assume done
         if state.is_generating && state.last_output_time.elapsed().as_secs() >= 3 {
+            tui_log("[STATE] timeout → is_generating = false");
             if !state.assistant_buf.is_empty() {
                 let buf_copy = state.assistant_buf.clone();
                 execute_tool_calls(&buf_copy, &mut state.messages);
@@ -501,14 +514,23 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+fn tui_log(msg: &str) {
+    let path = std::env::temp_dir().join("larql-tui.log");
+    if let Ok(mut f) = OpenOptions::new().append(true).open(&path) {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
 fn process_stdout_line(line: &str, state: &mut AppState) {
     state.last_output_time = Instant::now();
     // Preserve newlines! Only trim carriage returns, not \n.
     let trimmed = line.trim_end_matches('\r');
     if trimmed.is_empty() { return; }
+    tui_log(&format!("[PROCESS] is_gen={} trimmed={:?}", state.is_generating, &trimmed[..trimmed.len().min(80)]));
     // The "> " prompt from bench_interactive means generation is done
     if trimmed.trim() == ">" || trimmed.trim() == "> " {
         if state.is_generating {
+            tui_log("[STATE] prompt detected → is_generating = false");
             // Finalize
             if !state.assistant_buf.is_empty() {
                 let buf_copy = state.assistant_buf.clone();

@@ -80,12 +80,40 @@ impl InferenceModel {
 
     /// Load in walk-only mode: drops FFN weights after loading.
     /// Requires vindex with down_features.bin + up_features.bin for FFN.
-    /// Saves ~13GB RAM for a 4B model.
+    /// Saves ~13GB RAM for a 4B model. Also drops `lm_head` (2.6 GB on
+    /// Gemma 3 4B) because inference routes through the vindex's
+    /// `lm_head_knn_backend` (Q4 mmap), which doesn't need the eager f32
+    /// copy safetensors loaded.
     pub fn load_walk_only(model: &str) -> Result<Self, InferenceError> {
         let model_path = resolve_model_path(model)?;
+        // Skip loading FFN + lm_head tensors from safetensors entirely.
+        // GPU decode uses Q4_K vindex files instead. Avoids ~13 GB peak RSS.
+        std::env::set_var("LARQL_SKIP_FFN_LOAD", "1");
         let mut weights = load_model_dir(&model_path)?;
-        let freed = weights.drop_ffn_weights();
-        eprintln!("[walk-only] Dropped FFN weights: {:.1} GB freed", freed as f64 / 1e9);
+        std::env::remove_var("LARQL_SKIP_FFN_LOAD");
+        let freed_ffn = weights.drop_ffn_weights();
+        if freed_ffn > 0 {
+            eprintln!("[walk-only] Dropped FFN weights: {:.1} GB freed", freed_ffn as f64 / 1e9);
+        } else {
+            eprintln!("[walk-only] FFN weights skipped at load (LARQL_SKIP_FFN_LOAD)");
+        }
+        let freed_head = weights.drop_lm_head_weight();
+        if freed_head > 0 {
+            eprintln!("[walk-only] Dropped lm_head weight: {:.2} GB freed (vindex lm_head_knn takes over)",
+                freed_head as f64 / 1e9);
+        } else {
+            eprintln!("[walk-only] lm_head skipped at load");
+        }
+        // Note: f32 attention weights kept for now — CPU prefill still uses them.
+        // Once GPU prefill for post-norm models ships, we can skip them at load
+        // (add q_proj/k_proj/v_proj/o_proj to SKIP_FFN_LOAD) for another ~4 GB.
+        // If caller will activate Q6_K attention path (LARQL_ATTN_Q6K=1),
+        // the owned f32 attn tensors are redundant — drop them here.
+        if std::env::var("LARQL_ATTN_Q6K").ok().as_deref() == Some("1") {
+            let freed_attn = weights.drop_attn_weights();
+            eprintln!("[walk-only] Dropped attn weights: {:.2} GB freed (vindex Q6_K attn takes over)",
+                freed_attn as f64 / 1e9);
+        }
         let tokenizer = load_tokenizer(&model_path)?;
         Ok(Self {
             weights,

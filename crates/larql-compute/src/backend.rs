@@ -59,6 +59,22 @@ pub trait ComputeBackend: Send + Sync {
         _intermediate: usize, _hidden: usize,
     ) -> Option<Vec<f32>> { None }
 
+    /// f32 sparse matvec (Option C): out[k] = Σ_h W[indices[k], h] * x[h].
+    /// Reads only K rows of the [N, hidden] f32 matrix — bandwidth ∝ K.
+    /// Used for walk-FFN up projection when the gate-KNN has narrowed to
+    /// top-K features.
+    fn f32_sparse_matvec(
+        &self,
+        _weights: &[f32], _x: &[f32], _indices: &[u32], _hidden: usize,
+    ) -> Option<Vec<f32>> { None }
+
+    /// f32 sparse vecmat (Option C): out[h] = Σ_k activation[k] * W[indices[k], h].
+    /// Used for walk-FFN down projection.
+    fn f32_sparse_vecmat(
+        &self,
+        _weights: &[f32], _activation: &[f32], _indices: &[u32], _hidden: usize,
+    ) -> Option<Vec<f32>> { None }
+
     /// Batched Q4 gate+up for all seq positions in one submission.
     #[allow(clippy::type_complexity)]
     fn q4_matvec_pair_batch(
@@ -127,6 +143,24 @@ pub trait ComputeBackend: Send + Sync {
         _rope_base: f32,
     ) -> Option<Vec<f32>> { None }
 
+    /// Like decode_token but also probes h_post_attn at a specific layer.
+    /// Returns (final_h, Some(probe_h)) when probe_layer is set.
+    /// The probe is a single residual_copy inside the same cmd buffer — zero
+    /// pipeline break, ~0.01 ms cost. Used for KNN overlay checks: caller
+    /// runs the full GPU pipeline, then checks KNN on the probed residual.
+    /// If KNN matches, override the prediction. If not, use the GPU result.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_token_with_probe(
+        &self,
+        _layers: &[crate::FullPipelineLayer<'_>],
+        _x: &[f32],
+        _hidden: usize, _inter: usize,
+        _q_dim: usize, _kv_dim: usize,
+        _num_q_heads: usize, _num_kv_heads: usize, _head_dim: usize,
+        _rope_base: f32,
+        _probe_layer: Option<usize>,
+    ) -> Option<(Vec<f32>, Option<Vec<f32>>)> { None }
+
     /// Q4_K matvec: scores[N] = Q4_K[N,K] @ f32_x[K]. Returns None if not supported.
     fn q4k_matvec(
         &self,
@@ -139,6 +173,84 @@ pub trait ComputeBackend: Send + Sync {
         &self,
         _q6k_data: &[u8], _x: &[f32],
         _num_rows: usize, _hidden: usize,
+    ) -> Option<Vec<f32>> { None }
+
+    /// Two Q4_K matvecs sharing the same input x, dispatched in ONE Metal
+    /// command buffer (one commit + one wait + two reads vs three of each).
+    /// Used by walk-FFN to fuse gate + up projections per layer.
+    /// Returns (a_scores[num_rows], b_scores[num_rows]).
+    #[allow(clippy::too_many_arguments)]
+    fn q4k_matvec_pair(
+        &self,
+        _q4k_a: &[u8], _q4k_b: &[u8],
+        _x: &[f32],
+        _num_rows: usize, _hidden: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> { None }
+
+    /// Three f32 matmul_transb operations sharing the same `a` (input),
+    /// dispatched in ONE Metal command buffer. Used by attention to fuse
+    /// Q + K + V projections at decode time. One upload of `a`, one commit,
+    /// one wait, three reads. Falls through to None if not implemented.
+    /// Each result is `a × b_i^T` where a:[m,k], b_i:[n_i,k] → out_i:[m,n_i].
+    fn matmul_transb_triple_share_a(
+        &self,
+        _a: ArrayView2<f32>,
+        _b_q: ArrayView2<f32>,
+        _b_k: ArrayView2<f32>,
+        _b_v: ArrayView2<f32>,
+    ) -> Option<(Array2<f32>, Array2<f32>, Array2<f32>)> { None }
+
+    /// Fused Q4_K GEGLU + down projection: computes
+    ///   out[h] = Σ_i activation_kind(gate[i]) * up[i] * W_down[h, i]
+    /// in a single Metal kernel. Eliminates the CPU activation loop and the
+    /// gate/up readback that the separate q4k_matvec path requires.
+    /// `activation` selects the activation function: `"silu"` (Llama family)
+    /// or `"gelu_tanh"` (Gemma family). Returns None if backend doesn't have
+    /// the fused kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn q4k_geglu_down(
+        &self,
+        _down_q4k: &[u8],
+        _gate: &[f32],
+        _up: &[f32],
+        _hidden: usize,
+        _intermediate: usize,
+        _activation: &str,
+    ) -> Option<Vec<f32>> { None }
+
+    /// **S1/P11**: Fully fused Q4_K FFN — gate + up + GEGLU + down in ONE
+    /// Metal command buffer with three encoders sharing GPU buffers. Only
+    /// `down_out` is read back to CPU; `gate_out` and `up_out` stay GPU-resident
+    /// between encoders. Eliminates two readbacks + two re-uploads + one
+    /// `wait_until_completed` per layer vs the q4k_matvec_pair + q4k_geglu_down
+    /// chain.
+    /// Returns the down projection output `out[hidden]` or None if unsupported.
+    #[allow(clippy::too_many_arguments)]
+    fn q4k_ffn_full(
+        &self,
+        _gate_q4k: &[u8],
+        _up_q4k: &[u8],
+        _down_q4k: &[u8],
+        _x: &[f32],
+        _hidden: usize,
+        _intermediate: usize,
+        _activation: &str,
+    ) -> Option<Vec<f32>> { None }
+
+    /// Metal fused multi-token attention: causal Q·K^T → softmax → @V with GQA.
+    /// Caller has already applied RoPE and QK-norm on Q/K. `softcap = 0.0` disables
+    /// softcap (Gemma 3). Input layouts (row-major):
+    ///   q: [seq_len, num_q * head_dim]
+    ///   k: [seq_len, num_kv * head_dim]
+    ///   v: [seq_len, num_kv * head_dim]
+    /// Returns out: [seq_len * num_q * head_dim] or None if unsupported.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_attention_prefill(
+        &self,
+        _q: &[f32], _k: &[f32], _v: &[f32],
+        _seq_len: usize,
+        _num_q: usize, _num_kv: usize, _head_dim: usize,
+        _scale: f32, _softcap: f32,
     ) -> Option<Vec<f32>> { None }
 
     /// Prefill: full pipeline for seq>1 with KV cache population.

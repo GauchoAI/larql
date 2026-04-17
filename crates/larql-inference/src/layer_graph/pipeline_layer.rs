@@ -86,6 +86,7 @@ pub fn build_arch_params<'a>(
         k_norm_weight: arch.attn_k_norm_key(layer)
             .and_then(|k| weights.vectors.get(&k)).map(|v| v.as_slice()),
         post_attn_norm_bias: None,
+        softcap: arch.attn_logit_softcapping().unwrap_or(0.0),
         ffn_up_bias: arch.ffn_up_bias_key(layer)
             .and_then(|k| weights.vectors.get(&k)).map(|v| v.as_slice()),
         ffn_down_bias: arch.ffn_down_bias_key(layer)

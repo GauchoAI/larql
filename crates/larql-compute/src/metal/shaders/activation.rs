@@ -28,7 +28,10 @@ kernel void gelu_tanh(
     if (tid >= N) return;
     float x = input[tid];
     float c = 0.7978845608f; // sqrt(2/pi)
-    float t = tanh(c * (x + 0.044715f * x * x * x));
-    out[tid] = 0.5f * x * (1.0f + t);
+    // Clamp tanh argument: Metal tanh() returns NaN for |arg| > ~44 because
+    // (e^2*arg) overflows f32 and (inf-1)/(inf+1) = NaN. tanh saturates to
+    // ±1 within 1e-9 by |arg|=10, so clamping here is safe.
+    float arg = clamp(c * (x + 0.044715f * x * x * x), -10.0f, 10.0f);
+    out[tid] = 0.5f * x * (1.0f + tanh(arg));
 }
 "#;

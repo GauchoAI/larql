@@ -1,13 +1,20 @@
 //! Q4_K matrix-vector multiply — multi-row optimization.
 //!
-//! Each simdgroup processes 2 output rows (nr0=2), reading the input vector
-//! once and reusing it across both rows. Input stays in L1 cache since all
-//! lanes within the simdgroup read the same X addresses.
+//! Each simdgroup processes NR0 output rows, reading the input vector once
+//! and reusing it across all rows. Input stays in L1 cache since all lanes
+//! within the simdgroup read the same X addresses.
 //!
-//! 4 simdgroups × 2 rows = 8 rows per threadgroup, 128 threads total.
+//! Empirically tuned NR0 sweep (Gemma 3 4B walk-only, N=10240, K=2560 on M4 Pro):
+//!   NR0=2  → 13.75 tok/s (baseline)
+//!   NR0=4  → 14.85 tok/s (+8 %)
+//!   NR0=8  → 15.11 tok/s (+10 %)  ← chosen
+//!   NR0=16 → 13.79 tok/s (regressed — register-pressure spill)
+//!
+//! 4 simdgroups × 8 rows = 32 rows per threadgroup, 128 threads total. 4× fewer
+//! threadgroups vs NR0=2, 4× X-read reuse, 8× X bandwidth amortisation.
 
 pub const SHADER: &str = r#"
-constant uint Q4K_NR0 = 2;
+constant uint Q4K_NR0 = 8;
 constant uint Q4K_BLOCK_SIZE = 148;
 
 kernel void q4k_matvec(
@@ -35,7 +42,10 @@ kernel void q4k_matvec(
         uint j = sub % 8;
         uint xi = sb * 256 + j * 32;
 
-        // Process both rows with the same input values (L1-cached)
+        // Process all NR0 rows. X values are shared across rows and stay in L1
+        // cache (all 32 lanes in this simdgroup read the same X addresses).
+        // Tried explicit X-hoisting into local xv[32] — regressed because the
+        // local array spilled to thread memory at NR0=8.
         for (uint r = 0; r < Q4K_NR0; r++) {
             uint row_idx = first_row + r;
             if (row_idx >= N) break;
@@ -79,5 +89,5 @@ kernel void q4k_matvec(
 }
 "#;
 
-pub const ROWS_PER_TG: u64 = 8;
-pub const THREADS_PER_TG: u64 = 128;  // 4 simdgroups × 32 lanes, each sg does 2 rows
+pub const ROWS_PER_TG: u64 = 32; // 4 simdgroups × NR0=8 rows
+pub const THREADS_PER_TG: u64 = 128;  // 4 simdgroups × 32 lanes

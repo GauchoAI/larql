@@ -118,6 +118,8 @@ pub struct FullPipelineLayer<'a> {
     pub has_v_norm: bool,
     /// Per-layer scalar multiplier. 0.0 = disabled (no scaling). Gemma 4: learned scalar.
     pub layer_scalar: f32,
+    /// Attention logit softcapping. 0.0 = disabled. Gemma 3: 50.0.
+    pub softcap: f32,
     /// FFN bias on up projection (StarCoder2). None = no bias.
     pub ffn_up_bias: Option<&'a [f32]>,
     /// FFN bias on down projection (StarCoder2). None = no bias.

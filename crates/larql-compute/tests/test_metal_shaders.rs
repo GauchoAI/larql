@@ -1552,7 +1552,7 @@ fn full_pipeline_seq1_produces_nonzero() {
             input_norm_bias: None,
             q_norm_weight: None, k_norm_weight: None, post_attn_norm_bias: None,
             ffn_up_bias: None,
-            ffn_down_bias: None,
+            ffn_down_bias: None, softcap: 0.0,
     };
 
     let result = metal.full_pipeline_q4(
@@ -1921,7 +1921,7 @@ fn decode_token_gemma3_produces_finite() {
         input_norm_bias: None,
         q_norm_weight: None, k_norm_weight: None, post_attn_norm_bias: None,
         ffn_up_bias: None,
-        ffn_down_bias: None,
+        ffn_down_bias: None, softcap: 0.0,
     };
 
     // Simulate CPU prefill populating KV for 3 positions. The K values are
@@ -2072,13 +2072,25 @@ fn decode_token_real_layer0_produces_finite() {
     let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210;
     let num_layers_in_file = 34;
     let file_per_layer = inter_mmap.len() / num_layers_in_file;
-    let (gate_bytes_per, up_bytes_per, down_bytes_per, layer_gate_fmt, layer_up_fmt) =
+    let (gate_bytes_per, up_bytes_per, down_bytes_per, layer_gate_fmt, layer_up_fmt, layer_down_fmt) =
         if file_per_layer == 2 * q4kf_bytes_per_matrix + q6k_bytes_per_matrix {
             (q4kf_bytes_per_matrix, q4kf_bytes_per_matrix, q6k_bytes_per_matrix,
-             larql_compute::QuantFormat::Q4_KF, larql_compute::QuantFormat::Q4_KF)
+             larql_compute::QuantFormat::Q4_KF, larql_compute::QuantFormat::Q4_KF,
+             larql_compute::QuantFormat::Q6_K)
         } else if file_per_layer == 2 * q4k_bytes_per_matrix + q6k_bytes_per_matrix {
             (q4k_bytes_per_matrix, q4k_bytes_per_matrix, q6k_bytes_per_matrix,
-             larql_compute::QuantFormat::Q4_K, larql_compute::QuantFormat::Q4_K)
+             larql_compute::QuantFormat::Q4_K, larql_compute::QuantFormat::Q4_K,
+             larql_compute::QuantFormat::Q6_K)
+        } else if file_per_layer == 3 * q6k_bytes_per_matrix {
+            // Uniform Q6_K — current Gemma 3 4B vindex layout (interleaved_q4k.bin
+            // despite the name actually contains Q6_K).
+            (q6k_bytes_per_matrix, q6k_bytes_per_matrix, q6k_bytes_per_matrix,
+             larql_compute::QuantFormat::Q6_K, larql_compute::QuantFormat::Q6_K,
+             larql_compute::QuantFormat::Q6_K)
+        } else if file_per_layer == 3 * q4k_bytes_per_matrix {
+            (q4k_bytes_per_matrix, q4k_bytes_per_matrix, q4k_bytes_per_matrix,
+             larql_compute::QuantFormat::Q4_K, larql_compute::QuantFormat::Q4_K,
+             larql_compute::QuantFormat::Q4_K)
         } else {
             panic!("unknown FFN layout file_per_layer={file_per_layer}")
         };
@@ -2100,7 +2112,7 @@ fn decode_token_real_layer0_produces_finite() {
         wo: larql_compute::QuantWeight { data: wo_bytes, scales: Some(&q8_scales), format: o_fmt },
         gate: larql_compute::QuantWeight { data: gate_bytes, scales: None, format: layer_gate_fmt },
         up: larql_compute::QuantWeight { data: up_bytes, scales: None, format: layer_up_fmt },
-        down: larql_compute::QuantWeight { data: down_bytes, scales: None, format: larql_compute::QuantFormat::Q6_K },
+        down: larql_compute::QuantWeight { data: down_bytes, scales: None, format: layer_down_fmt },
         input_norm: &input_norm,
         post_attn_norm: &post_attn_norm,
         pre_ffn_norm: Some(&pre_ffn_norm),
@@ -2126,7 +2138,7 @@ fn decode_token_real_layer0_produces_finite() {
         input_norm_bias: None,
         post_attn_norm_bias: None,
         ffn_up_bias: None,
-        ffn_down_bias: None,
+        ffn_down_bias: None, softcap: 0.0,
     };
 
     // ── 5. Real post-embed-scale-sized input, like real Gemma 3 embedding output ──
@@ -2182,7 +2194,7 @@ fn decode_token_real_layer0_produces_finite() {
             rope_base: 10000.0, rotary_dim: 0, sliding_window: 0,
             has_v_norm: false, layer_scalar: 0.0,
             input_norm_bias: None, post_attn_norm_bias: None,
-            ffn_up_bias: None, ffn_down_bias: None,
+            ffn_up_bias: None, ffn_down_bias: None, softcap: 0.0,
         }).collect();
         be.reset_kv_cache();
         let r = be.decode_token(
@@ -3198,7 +3210,7 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
             sliding_window: sliding_window_for(l),
             has_v_norm: false, layer_scalar: 0.0,
             input_norm_bias: None, post_attn_norm_bias: None,
-            ffn_up_bias: None, ffn_down_bias: None,
+            ffn_up_bias: None, ffn_down_bias: None, softcap: 0.0,
         }
     }).collect();
 

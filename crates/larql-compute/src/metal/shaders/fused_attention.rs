@@ -131,9 +131,14 @@ kernel void fused_attention(
 
         dot *= scale;
 
-        // Optional softcap
+        // Optional softcap. Clamp argument to [-30, 30] where tanh saturates
+        // to ±1 within 1e-13 — defensive: Metal tanh() returns NaN for
+        // |arg| > ~44 (e^88 > f32 max → (inf-1)/(inf+1)). Realistic attention
+        // scores stay well within ±30/softcap, but the clamp costs nothing
+        // and rules out a silent NaN under weird inputs.
         if (softcap > 0.0f) {
-            dot = tanh(dot / softcap) * softcap;
+            float arg = clamp(dot / softcap, -30.0f, 30.0f);
+            dot = tanh(arg) * softcap;
         }
 
         tg_scores[k] = dot;

@@ -438,8 +438,9 @@ fn main() -> io::Result<()> {
 }
 
 fn process_stdout_line(line: &str, state: &mut AppState) {
-    let trimmed = line.trim_end();
-    if trimmed.is_empty() || trimmed == ">" || trimmed == "> " { return; }
+    // Preserve newlines! Only trim carriage returns, not \n.
+    let trimmed = line.trim_end_matches('\r');
+    if trimmed.is_empty() || trimmed.trim() == ">" || trimmed.trim() == "> " { return; }
 
     // Strip leading "> " prompt marker
     let content = if trimmed.starts_with("> ") { &trimmed[2..] } else { trimmed };

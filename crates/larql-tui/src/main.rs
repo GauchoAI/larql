@@ -657,16 +657,11 @@ fn main() -> io::Result<()> {
                             state.echo_stripped = true;
                             state.assistant_buf.clear();
 
-                            // Auto-inject matching skills from .skills/ (local + global)
+                            // Auto-inject matching skills as single-line chat
                             let skill_context = match_skills(&input);
                             if !skill_context.is_empty() {
-                                // Use chatml for multi-line skill context
-                                let full = format!("{skill_context}\n\n---\n\nUser request: {input}");
-                                be.send("chatml")?;
-                                for line in full.lines() {
-                                    be.send(line)?;
-                                }
-                                be.send("---END---")?;
+                                let flat_skill = skill_context.replace('\n', " ");
+                                be.send(&format!("chat {flat_skill} --- User request: {input}"))?;
                             } else {
                                 be.send(&format!("chat {input}"))?;
                             }

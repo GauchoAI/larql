@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/larql-tui",
+    "crates/gc-markdown",
     "crates/larql-models",
     "crates/larql-compute",
     "crates/larql-core",
@@ -15,6 +16,7 @@ members = [
 ]
 default-members = [
     "crates/larql-tui",
+    "crates/gc-markdown",
     "crates/larql-models",
     "crates/larql-compute",
     "crates/larql-core",

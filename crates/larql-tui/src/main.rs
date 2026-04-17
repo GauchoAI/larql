@@ -1103,17 +1103,20 @@ fn execute_tool_calls(text: &str, messages: &mut Vec<Message>) -> Option<String>
 }
 
 /// Extract content from a fenced code block with a specific language tag.
-/// e.g., extract_fenced_block(text, "tool") finds ```tool\n...\n```
+/// Handles both multi-line (```tool\ncontent\n```) and single-line (```tool content```)
 fn extract_fenced_block(text: &str, lang: &str) -> Option<String> {
     let open = format!("```{lang}");
     let start_pos = text.find(&open)?;
     let after_open = &text[start_pos + open.len()..];
-    // Skip to the next line after the opening fence
-    let content_start = after_open.find('\n').map(|i| i + 1).unwrap_or(0);
-    let content = &after_open[content_start..];
-    // Find the closing ```
-    let end = content.find("```")?;
-    Some(content[..end].to_string())
+
+    // Find the closing ``` FIRST (before deciding about newlines)
+    let close_pos = after_open.find("```")?;
+    let content = after_open[..close_pos].trim();
+
+    // If content starts with newline, skip it
+    let content = content.trim_start_matches('\n');
+    if content.is_empty() { return None; }
+    Some(content.to_string())
 }
 
 fn extract_tag(text: &str, tag: &str) -> Option<String> {

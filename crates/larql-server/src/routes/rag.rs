@@ -181,7 +181,7 @@ pub fn retrieve_context(
     if state.rag_store.len() == 0 { return None; }
 
     let query_embed = sentence_embedding(&model.tokenizer, &model.embeddings, user_msg)?;
-    let results = state.rag_store.query(&query_embed, 5, threshold);
+    let results = state.rag_store.query(&query_embed, 8, threshold);
 
     if results.is_empty() { return None; }
 

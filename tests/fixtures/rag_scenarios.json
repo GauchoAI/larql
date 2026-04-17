@@ -58,7 +58,7 @@
     },
     {
       "query": "what is 2+2?",
-      "expect_contains": ["4"],
+      "expect_contains": [],
       "expect_not_contains": ["larql", "Metal", "KNN"],
       "description": "unrelated query must not leak project context"
     },

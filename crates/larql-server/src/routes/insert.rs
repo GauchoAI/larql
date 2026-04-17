@@ -14,6 +14,9 @@ use serde::Deserialize;
 use crate::error::ServerError;
 use crate::state::{AppState, LoadedModel};
 
+// Re-export for GPU pipeline path in KNN insert
+use larql_inference::ComputeBackend;
+
 #[derive(Deserialize)]
 pub struct InsertRequest {
     pub entity: String,
@@ -30,6 +33,11 @@ pub struct InsertRequest {
     /// store via Metal f32 residual capture, ~400 ms).
     #[serde(default = "default_insert_mode")]
     pub mode: String,
+    /// Optional raw prompt. When set, overrides the default template
+    /// `"The {relation} of {entity} is"`. Use this to capture residuals
+    /// from chat-formatted prompts so the KNN key matches the chat path.
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 fn default_alpha() -> f32 { 0.25 }
@@ -196,9 +204,15 @@ fn run_insert_knn(
     let install_layer: usize = req.layer.unwrap_or_else(||
         model.config.num_layers.saturating_sub(8));
 
-    // Canonical prompt.
-    let rel_words = req.relation.replace(['-', '_'], " ");
-    let prompt = format!("The {rel_words} of {} is", req.entity);
+    // Prompt: use custom prompt if provided (e.g. chat-formatted),
+    // otherwise the canonical "The {relation} of {entity} is" template.
+    let prompt = match &req.prompt {
+        Some(p) => p.clone(),
+        None => {
+            let rel_words = req.relation.replace(['-', '_'], " ");
+            format!("The {rel_words} of {} is", req.entity)
+        }
+    };
     let prompt_enc = model.tokenizer.encode(prompt.as_str(), true)
         .map_err(|e| ServerError::Internal(format!("tokenize error: {e}")))?;
     let token_ids: Vec<u32> = prompt_enc.get_ids().to_vec();
@@ -209,39 +223,47 @@ fn run_insert_knn(
         .map_err(|e| ServerError::Internal(format!("tokenize target: {e}")))?;
     let target_id: u32 = tgt_enc.get_ids().first().copied().unwrap_or(0);
 
-    // Capture residual via Metal forward. When walk_only is set, the dense
-    // FFN tensors were dropped — use a WalkFfn so capture reads from the
-    // vindex mmap. The stored key is in the pre_ffn_norm(h_post_attn) stage
-    // regardless of which FFN ran, so cosine queries stay comparable.
+    // Capture residual using the SAME GPU path as chat inference
+    // (predict_honest_with_knn_ffn → decode_token_with_probe). This
+    // ensures the stored KNN key matches what the decode path produces.
     let key = {
         let backend = model.get_or_init_backend();
-        // Use lock_ignore_poison pattern: the mutex only serializes; no
-        // invariant is broken by a prior panic.
         let _guard = match model.inference_lock.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         backend.reset_kv_cache();
 
+        // Use capture_knn_key_gpu — runs the SAME Q4_K decode_token_with_probe
+        // pipeline as chat inference. Residuals match exactly, so cosine will
+        // be high when the same prompt fires during generation.
         let patched = model.patched.blocking_read();
-        let walk_ffn = if model.walk_only {
-            Some(larql_inference::WalkFfn::new_with_backend(
-                weights, patched.base(), 1024, &**backend,
-            ))
-        } else { None };
-        let ffn_override: Option<&dyn larql_inference::ffn::FfnBackend> =
-            walk_ffn.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
-
-        let k = larql_inference::capture_residual_post_attn_norm_ffn(
-            weights, &token_ids, install_layer, &**backend, ffn_override,
-        );
-        backend.reset_kv_cache();
-        k
+        larql_inference::capture_knn_key_gpu(
+            weights, &token_ids, install_layer, patched.base(), &**backend,
+        )
     };
     let key = key.ok_or_else(|| ServerError::Internal(
         "residual capture failed (non-post-norm model or layer out of range)".into(),
     ))?;
 
+    // Store via shared helper.
+    return Ok(store_knn_key(
+        state, model, req, session_id, install_layer,
+        key, target_id, start,
+    ));
+}
+
+/// Store a KNN key in the session or global KNN store.
+fn store_knn_key(
+    state: &AppState,
+    model: &LoadedModel,
+    req: &InsertRequest,
+    session_id: Option<&str>,
+    install_layer: usize,
+    key: Vec<f32>,
+    target_id: u32,
+    start: std::time::Instant,
+) -> serde_json::Value {
     // Store. Session-scoped if X-Session-Id present; else global.
     if let Some(sid) = session_id {
         let mut sessions = state.sessions.sessions_blocking_write();
@@ -266,7 +288,7 @@ fn run_insert_knn(
     }
 
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-    Ok(serde_json::json!({
+    serde_json::json!({
         "entity": req.entity,
         "relation": req.relation,
         "target": req.target,
@@ -274,7 +296,7 @@ fn run_insert_knn(
         "mode": "knn",
         "session": session_id,
         "latency_ms": (latency_ms * 10.0).round() / 10.0,
-    }))
+    })
 }
 
 fn run_insert(

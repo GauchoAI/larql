@@ -45,7 +45,7 @@ struct Cli {
     dir: Option<PathBuf>,
 
     /// Listen port.
-    #[arg(long, default_value = "8080")]
+    #[arg(long, default_value = "3000")]
     port: u16,
 
     /// Bind address.
@@ -141,13 +141,20 @@ fn load_single_vindex(path_str: &str, no_infer: bool, walk_only: bool) -> Result
     }
     if let Ok(()) = index.load_up_features(&path) { info!("  Up features: loaded (full mmap FFN)") }
     // Tiers the Metal fast path needs: lm_head (for finalize_logits), q4k/q8
-    // attn weights, interleaved Q4/Q4_K FFN mmaps. Matches bench_interactive.
+    // attn weights, interleaved Q4_K FFN mmaps. Matches bench_interactive.
     let _ = index.load_lm_head(&path);
     let _ = index.load_lm_head_q4(&path);
     let _ = index.load_attn_q4k(&path);
     let _ = index.load_attn_q8(&path);
-    let _ = index.load_interleaved_q4(&path);
-    let _ = index.load_interleaved_q4k(&path);
+    // Prefer interleaved_q4k_real.bin (true Q4_K, validated cos=0.9994 on
+    // Gemma 3 4B) over interleaved_q4k.bin (Q6_K — cos=0.84/layer, garbage).
+    // Only load fallback formats if the preferred format isn't available.
+    if index.load_interleaved_q4k_real(&path).is_ok() {
+        info!("  FFN: interleaved_q4k_real.bin (GPU decode default)");
+    } else {
+        let _ = index.load_interleaved_q4(&path);
+        let _ = index.load_interleaved_q4k(&path);
+    }
     index.warmup();
     info!("  Warmup: done");
 

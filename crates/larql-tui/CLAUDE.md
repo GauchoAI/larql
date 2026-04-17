@@ -19,15 +19,18 @@ Server runs separately. TUI connects instantly. Restart TUI without reloading mo
 ## Running
 
 ```bash
-# Terminal 1: start server (model loads once)
-cargo run --release --features metal -p larql-server
+# Terminal 1: start server (model loads once, ~40s warmup)
+cargo run --release -p larql-server -- /path/to/gemma3-4b.vindex
 
 # Terminal 2: TUI connects instantly
 ./target/release/larql
 
-# Or with custom server URL
-LARQL_SERVER=http://localhost:8080 ./target/release/larql
+# Or with custom server URL (default: http://localhost:3000)
+LARQL_SERVER=http://other-host:3000 ./target/release/larql
 ```
+
+Metal GPU is the default feature. Server loads `interleaved_q4k_real.bin` for
+GPU decode (~20 tok/s via Metal Q4_K pipeline).
 
 ## Rendering
 

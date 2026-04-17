@@ -46,6 +46,10 @@ pub struct PredictResult {
     /// Raw (token_id, logit, prob) for callers that need token IDs without re-encoding.
     /// Same order as `predictions`. Empty when not populated (back-compat).
     pub raw_predictions: Vec<(u32, f32, f64)>,
+    /// When a KNN override fires, the full target string (may be multi-token).
+    /// The caller should tokenize this and force-inject ALL tokens, not just
+    /// the first. None when no KNN override occurred.
+    pub knn_override: Option<String>,
 }
 
 /// Prediction result with per-layer residual capture.

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 larql-vindex = { path = "../larql-vindex" }
 larql-inference = { path = "../larql-inference" }
+larql-compute = { path = "../larql-compute" }
 larql-models = { path = "../larql-models" }
 
 axum = { version = "0.8", features = ["ws"] }
@@ -33,7 +34,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [features]
-default = []
+default = ["metal"]
 metal = ["larql-inference/metal"]
 
 [build-dependencies]

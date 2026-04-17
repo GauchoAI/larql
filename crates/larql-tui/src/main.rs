@@ -5,7 +5,6 @@
 //! Skills loaded from ~/.larql/skills/ and ./.skills/
 
 use std::io;
-use std::time::Instant;
 
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyModifiers, KeyEventKind};
 use crossterm::terminal::{
@@ -19,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -30,7 +29,12 @@ enum Message {
     System(String),
     ToolUse { tool: String, detail: String },
     ToolResult { summary: String },
-    Metrics { tok_s: f64, tokens: usize },
+}
+
+enum StreamEvent {
+    Token(String),
+    Done,
+    Error(String),
 }
 
 struct AppState {
@@ -48,12 +52,41 @@ impl AppState {
             input: String::new(),
             cursor: 0,
             messages: vec![Message::System(
-                "larql — LLM as a Database. Connect to server, type questions, use skills.".into()
+                "larql — LLM as a Database. Type questions, use tools.".into()
             )],
             status: format!("connecting to {server_url}..."),
             is_generating: false,
             server_url: server_url.to_string(),
         }
+    }
+
+    /// Build the OpenAI messages array from conversation history.
+    fn build_chat_messages(&self) -> Vec<ChatMsg> {
+        let mut msgs = Vec::new();
+
+        for msg in &self.messages {
+            match msg {
+                Message::User(text) => {
+                    msgs.push(ChatMsg { role: "user".into(), content: text.clone() });
+                }
+                Message::Assistant(text) if !text.is_empty() => {
+                    msgs.push(ChatMsg { role: "assistant".into(), content: text.clone() });
+                }
+                Message::ToolResult { summary } => {
+                    msgs.push(ChatMsg {
+                        role: "user".into(),
+                        content: format!("[Tool output]\n{summary}"),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Cap context to avoid unbounded prefill growth
+        let max_msgs = 12;
+        let start = msgs.len().saturating_sub(max_msgs);
+        msgs.drain(..start);
+        msgs
     }
 }
 
@@ -72,17 +105,20 @@ struct ChatMsg {
     content: String,
 }
 
-/// Send a chat request to the server and collect the streamed response.
-/// Returns the full assistant response text.
+/// Send chat messages to the server, streaming tokens via `tx`.
 async fn chat_stream(
     url: &str,
-    user_msg: &str,
-    tx: &tokio::sync::mpsc::Sender<String>,
+    messages: Vec<ChatMsg>,
+    tx: &tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
     let req = ChatRequest {
         model: "gemma-3-4b".into(),
-        messages: vec![ChatMsg { role: "user".into(), content: user_msg.into() }],
+        messages,
         stream: true,
     };
 
@@ -96,7 +132,6 @@ async fn chat_stream(
         return Err(format!("server error: {}", resp.status()));
     }
 
-    // Read SSE stream
     use futures::StreamExt;
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
@@ -106,7 +141,6 @@ async fn chat_stream(
         let text = String::from_utf8_lossy(&chunk);
         buf.push_str(&text);
 
-        // Process complete SSE lines
         while let Some(newline_pos) = buf.find('\n') {
             let line = buf[..newline_pos].to_string();
             buf = buf[newline_pos + 1..].to_string();
@@ -118,16 +152,24 @@ async fn chat_stream(
                 if data.trim() == "[DONE]" {
                     return Ok(());
                 }
-                // Parse OpenAI delta format
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
                     if let Some(content) = v["choices"][0]["delta"]["content"].as_str() {
-                        let _ = tx.send(content.to_string()).await;
+                        let _ = tx.send(StreamEvent::Token(content.to_string())).await;
                     }
                 }
             }
         }
     }
     Ok(())
+}
+
+fn spawn_chat(url: String, messages: Vec<ChatMsg>, tx: tokio::sync::mpsc::Sender<StreamEvent>) {
+    tokio::spawn(async move {
+        match chat_stream(&url, messages, &tx).await {
+            Ok(()) => { let _ = tx.send(StreamEvent::Done).await; }
+            Err(e) => { let _ = tx.send(StreamEvent::Error(e)).await; }
+        }
+    });
 }
 
 // ── Skills ────────────────────────────────────────────────────────────────
@@ -137,53 +179,7 @@ fn home_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
 }
 
-fn match_skills(input: &str) -> String {
-    let input_lower = input.to_lowercase();
-    let mut context = String::new();
-
-    let skills_dirs = vec![
-        std::env::current_dir().unwrap_or_default().join(".skills"),
-        home_dir().join(".larql/skills"),
-    ];
-
-    for dir in &skills_dirs {
-        if !dir.is_dir() { continue; }
-        let Ok(entries) = std::fs::read_dir(dir) else { continue; };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() { continue; }
-            let skill_name = path.file_name().unwrap_or_default()
-                .to_string_lossy().to_lowercase();
-
-            let matches = input_lower.contains(&skill_name) || match skill_name.as_str() {
-                "list" => ["list", "files", "directory", "folder", "ls", "what's here", "show me"]
-                    .iter().any(|k| input_lower.contains(k)),
-                "search" => ["search", "find", "grep", "look for", "where is"]
-                    .iter().any(|k| input_lower.contains(k)),
-                "stats" => ["stats", "statistics", "metrics", "how many", "count", "overview"]
-                    .iter().any(|k| input_lower.contains(k)),
-                "du" => ["disk", "space", "storage", "size", "how big", "usage"]
-                    .iter().any(|k| input_lower.contains(k)),
-                "git" => ["git", "commit", "branch", "changes", "diff", "status"]
-                    .iter().any(|k| input_lower.contains(k)),
-                _ => false,
-            };
-
-            if matches {
-                let skill_md = path.join("skill.md");
-                if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                    if !context.is_empty() { context.push_str(" "); }
-                    context.push_str(&format!("[Skill: {}] {}", skill_name,
-                        content.replace('\n', " ")));
-                }
-            }
-        }
-    }
-    context
-}
-
 fn execute_skill_tool(text: &str, messages: &mut Vec<Message>) -> Option<String> {
-    // Look for ```tool skill_name args```
     let open = "```tool";
     let start = text.find(open)?;
     let after = &text[start + open.len()..];
@@ -194,7 +190,6 @@ fn execute_skill_tool(text: &str, messages: &mut Vec<Message>) -> Option<String>
     let skill_name = parts.first()?;
     let skill_args = parts.get(1).unwrap_or(&"");
 
-    // Find tool.sh
     let skills_dirs = vec![
         std::env::current_dir().unwrap_or_default().join(".skills"),
         home_dir().join(".larql/skills"),
@@ -207,8 +202,8 @@ fn execute_skill_tool(text: &str, messages: &mut Vec<Message>) -> Option<String>
 
     let path = tool_path?;
     messages.push(Message::ToolUse {
-        tool: format!("skill:{skill_name}"),
-        detail: format!("{skill_args}"),
+        tool: format!("{skill_name}"),
+        detail: skill_args.chars().take(70).collect(),
     });
 
     match std::process::Command::new("bash").arg(&path)
@@ -217,14 +212,11 @@ fn execute_skill_tool(text: &str, messages: &mut Vec<Message>) -> Option<String>
         Ok(output) => {
             let tool_output = String::from_utf8_lossy(&output.stdout).to_string();
 
-            // Route blocks
             if let Some(summary) = extract_block(&tool_output, "summary") {
                 messages.push(Message::ToolResult { summary: summary.clone() });
-                // chartjs goes to TUI rendering
                 if let Some(chart) = extract_block(&tool_output, "chartjs") {
-                    messages.push(Message::ToolUse {
-                        tool: "chart".into(), detail: chart,
-                    });
+                    let chart_md = format!("```chartjs\n{chart}\n```");
+                    messages.push(Message::ToolResult { summary: chart_md });
                 }
                 return Some(summary);
             }
@@ -277,7 +269,6 @@ fn draw_messages(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 lines.push(Line::from(""));
             }
             Message::Assistant(text) => {
-                // Use gc-markdown for rich rendering
                 lines.extend(gc_markdown::render_markdown(text, gc_markdown::Theme::Dark));
                 lines.push(Line::from(""));
             }
@@ -291,26 +282,26 @@ fn draw_messages(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 lines.push(Line::from(vec![
                     Span::styled("  ⚡ ", Style::default().fg(Color::Magenta)),
                     Span::styled(tool.as_str(), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!(" {}", &detail[..detail.len().min(70)]), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!(" {detail}"), Style::default().fg(Color::DarkGray)),
                 ]));
             }
             Message::ToolResult { summary } => {
-                // Render tool result as markdown too
                 lines.extend(gc_markdown::render_markdown(summary, gc_markdown::Theme::Dark));
-                lines.push(Line::from(""));
-            }
-            Message::Metrics { tok_s, tokens } => {
-                lines.push(Line::from(Span::styled(
-                    format!("  ↳ {tok_s:.1} tok/s · {tokens} tokens"),
-                    Style::default().fg(Color::DarkGray),
-                )));
                 lines.push(Line::from(""));
             }
         }
     }
 
+    // Scroll: estimate wrapped line count for proper auto-scroll.
+    // Each Line can wrap across multiple screen rows. Use the inner
+    // width (area minus borders) to approximate the wrapped height.
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let wrapped_height: usize = lines.iter().map(|line| {
+        let content_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+        if content_len == 0 { 1 } else { content_len.div_ceil(inner_width.max(1)) }
+    }).sum();
     let visible = area.height.saturating_sub(2) as usize;
-    let scroll = if lines.len() > visible { (lines.len() - visible) as u16 } else { 0 };
+    let scroll = if wrapped_height > visible { (wrapped_height - visible) as u16 } else { 0 };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -377,32 +368,55 @@ async fn main() -> io::Result<()> {
         _ => {
             state.status = "server not reachable — start larql-server first".into();
             state.messages.push(Message::System(
-                format!("Cannot reach {server_url}. Start the server:\n  cargo run --release --features metal -p larql-server")
+                format!("Cannot reach {server_url}. Start the server:\n  cargo run --release -p larql-server -- /path/to/vindex")
             ));
         }
     }
     draw(&mut terminal, &state);
 
-    // ── Event loop ──
-    let (token_tx, mut token_rx) = tokio::sync::mpsc::channel::<String>(256);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<StreamEvent>(256);
 
     loop {
-        // Poll incoming tokens from streaming response
         let mut new_output = false;
-        while let Ok(token) = token_rx.try_recv() {
-            if let Some(Message::Assistant(ref mut text)) = state.messages.last_mut() {
-                text.push_str(&token);
-            } else {
-                state.messages.push(Message::Assistant(token));
+        while let Ok(ev) = ev_rx.try_recv() {
+            match ev {
+                StreamEvent::Token(tok) => {
+                    if let Some(Message::Assistant(ref mut text)) = state.messages.last_mut() {
+                        text.push_str(&tok);
+                    } else {
+                        state.messages.push(Message::Assistant(tok));
+                    }
+                    new_output = true;
+                }
+                StreamEvent::Done => {
+                    let response_text = match state.messages.last() {
+                        Some(Message::Assistant(text)) => text.clone(),
+                        _ => String::new(),
+                    };
+
+                    if let Some(_summary) = execute_skill_tool(&response_text, &mut state.messages) {
+                        // Tool executed. The ToolResult is now in messages.
+                        // Send full conversation history so model has context.
+                        state.messages.push(Message::Assistant(String::new()));
+                        let chat_msgs = state.build_chat_messages();
+                        spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone());
+                    } else {
+                        state.is_generating = false;
+                    }
+                    new_output = true;
+                }
+                StreamEvent::Error(e) => {
+                    state.messages.push(Message::System(format!("Error: {e}")));
+                    state.is_generating = false;
+                    new_output = true;
+                }
             }
-            new_output = true;
         }
 
         if new_output {
             draw(&mut terminal, &state);
         }
 
-        // Poll keyboard
         if event::poll(std::time::Duration::from_millis(30))? {
             if let CEvent::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press { continue; }
@@ -419,28 +433,14 @@ async fn main() -> io::Result<()> {
                             break;
                         }
 
-                        state.messages.push(Message::User(input.clone()));
+                        state.messages.push(Message::User(input));
                         state.is_generating = true;
+                        state.messages.push(Message::Assistant(String::new()));
                         draw(&mut terminal, &state);
 
-                        // Inject skills if matched
-                        let skill_context = match_skills(&input);
-                        let full_msg = if !skill_context.is_empty() {
-                            format!("{skill_context} --- User request: {input}")
-                        } else {
-                            input
-                        };
-
-                        // Send async request
-                        let url = state.server_url.clone();
-                        let tx = token_tx.clone();
-                        let is_gen_tx = token_tx.clone(); // signal completion
-                        tokio::spawn(async move {
-                            match chat_stream(&url, &full_msg, &tx).await {
-                                Ok(()) => { let _ = tx.send("\n__DONE__".to_string()).await; }
-                                Err(e) => { let _ = tx.send(format!("\n__ERROR__:{e}")).await; }
-                            }
-                        });
+                        // Send full conversation history
+                        let chat_msgs = state.build_chat_messages();
+                        spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone());
                     }
                     KeyCode::Char(c) if !state.is_generating => {
                         state.input.insert(state.cursor, c);
@@ -455,48 +455,6 @@ async fn main() -> io::Result<()> {
                     KeyCode::Left if state.cursor > 0 => { state.cursor -= 1; draw(&mut terminal, &state); }
                     KeyCode::Right if state.cursor < state.input.len() => { state.cursor += 1; draw(&mut terminal, &state); }
                     _ => {}
-                }
-            }
-        }
-
-        // Check for completion signal
-        if state.is_generating {
-            if let Some(Message::Assistant(ref text)) = state.messages.last() {
-                if text.ends_with("\n__DONE__") || text.contains("\n__ERROR__:") {
-                    // Clean up signal markers
-                    if let Some(Message::Assistant(ref mut text)) = state.messages.last_mut() {
-                        if let Some(pos) = text.find("\n__DONE__") {
-                            text.truncate(pos);
-                        }
-                        if let Some(pos) = text.find("\n__ERROR__:") {
-                            let err = text[pos + 11..].to_string();
-                            text.truncate(pos);
-                            state.messages.push(Message::System(format!("Error: {err}")));
-                        }
-                    }
-
-                    // Check for tool calls in the response
-                    let response_text = if let Some(Message::Assistant(ref text)) = state.messages.last() {
-                        text.clone()
-                    } else { String::new() };
-
-                    if let Some(summary) = execute_skill_tool(&response_text, &mut state.messages) {
-                        // Feed summary back to model
-                        let url = state.server_url.clone();
-                        let tx = token_tx.clone();
-                        let feedback = format!("Tool output: {} --- Briefly comment on the results.", summary.replace('\n', " | "));
-                        state.messages.push(Message::Assistant(String::new()));
-                        tokio::spawn(async move {
-                            match chat_stream(&url, &feedback, &tx).await {
-                                Ok(()) => { let _ = tx.send("\n__DONE__".to_string()).await; }
-                                Err(e) => { let _ = tx.send(format!("\n__ERROR__:{e}")).await; }
-                            }
-                        });
-                        // Stay in generating state for the follow-up
-                    } else {
-                        state.is_generating = false;
-                    }
-                    draw(&mut terminal, &state);
                 }
             }
         }

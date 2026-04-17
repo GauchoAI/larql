@@ -73,7 +73,7 @@ pub fn predict_with_graph_vindex_logits(
         })
         .collect();
 
-    crate::forward::PredictResult { predictions, raw_predictions: Vec::new() }
+    crate::forward::PredictResult { predictions, raw_predictions: Vec::new(), knn_override: None }
 }
 
 /// Run a full forward pass using a LayerGraph for per-layer routing.
@@ -265,7 +265,7 @@ pub fn predict_split_pass(
         })
         .collect();
 
-    crate::forward::PredictResult { predictions, raw_predictions: Vec::new() }
+    crate::forward::PredictResult { predictions, raw_predictions: Vec::new(), knn_override: None }
 }
 
 /// Split pass using cached attention residuals — exact output at GPU speed.
@@ -318,7 +318,7 @@ pub fn predict_split_cached(
         })
         .collect();
 
-    crate::forward::PredictResult { predictions, raw_predictions: Vec::new() }
+    crate::forward::PredictResult { predictions, raw_predictions: Vec::new(), knn_override: None }
 }
 
 /// Honest production pipeline: real computation, no over-caching.
@@ -346,6 +346,97 @@ pub fn capture_residual_post_attn_norm(
     backend: &dyn ComputeBackend,
 ) -> Option<Vec<f32>> {
     capture_residual_post_attn_norm_ffn(weights, token_ids, target_layer, backend, None)
+}
+
+/// Capture the normed probe residual at `probe_layer` using the SAME GPU
+/// path as `predict_honest_with_knn_ffn` (Q4_K decode_token_with_probe).
+/// Returns the pre_ffn_norm(h_post_attn) vector — identical to what the
+/// KNN overlay checks during inference. Use for INSERT so stored keys
+/// match the inference path exactly.
+///
+/// Resets the KV cache, runs GPU sequential prefill through all prompt
+/// tokens, captures the probe on the last token.
+pub fn capture_knn_key_gpu(
+    weights: &ModelWeights,
+    token_ids: &[u32],
+    probe_layer: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+) -> Option<Vec<f32>> {
+    let arch = &*weights.arch;
+    if !arch.has_post_norms() { return None; }
+    let hidden = weights.hidden_size;
+    let norm_offset = arch.norm_weight_offset();
+
+    let gate_index: &dyn larql_vindex::GateIndex = index;
+    let intermediate = gate_index.num_features(0);
+    let has_q4k = gate_index.attn_q4k_layer_data(0).is_some();
+
+    // Find Q4_K FFN mmap — same priority as predict_honest
+    let (q4_ffn, ffn_is_q4k) = if let Some(mmap) = gate_index.interleaved_q4k_real_mmap_ref() {
+        (Some(mmap), true)
+    } else if let Some(mmap) = gate_index.interleaved_q4k_mmap_ref() {
+        (Some(mmap), true)
+    } else if let Some(mmap) = gate_index.interleaved_q4_mmap_ref() {
+        (Some(mmap), false)
+    } else {
+        return None;
+    };
+    let q4_ffn = q4_ffn?;
+    if !has_q4k || intermediate == 0 { return None; }
+
+    let q4_per_matrix = if ffn_is_q4k {
+        (intermediate * hidden).div_ceil(256) * 148
+    } else {
+        intermediate * hidden / 32 * 18
+    };
+    let ffn_format = if ffn_is_q4k {
+        larql_compute::QuantFormat::Q4_K
+    } else {
+        larql_compute::QuantFormat::Q4_0
+    };
+    let layers = super::pipeline_layer::build_pipeline_layers(
+        weights, index, 0..weights.num_layers,
+        q4_ffn, q4_per_matrix, ffn_format,
+    );
+    if layers.is_empty() { return None; }
+
+    let q_dim = weights.num_q_heads * weights.head_dim;
+    let kv_dim = weights.num_kv_heads * weights.head_dim;
+    let rope = arch.rope_base_for_layer(0) as f32;
+
+    backend.reset_kv_cache();
+    let embeds = crate::forward::embed_tokens_pub(weights, token_ids);
+    let seq_len = token_ids.len();
+
+    for p in 0..seq_len {
+        let x: Vec<f32> = embeds.row(p).to_vec();
+        let is_last = p == seq_len - 1;
+        let probe = if is_last { Some(probe_layer) } else { None };
+        if let Some((_result, probe_h)) = backend.decode_token_with_probe(
+            &layers, &x, hidden, intermediate, q_dim, kv_dim,
+            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+            probe,
+        ) {
+            if let Some(ph) = probe_h {
+                // Apply pre_ffn_norm — same norm the KNN check uses
+                let probe_arr = ndarray::Array2::from_shape_vec((1, hidden), ph).unwrap();
+                let pre_ffn_key = if arch.has_post_norms() {
+                    arch.pre_feedforward_layernorm_key(probe_layer)
+                } else {
+                    Some(arch.post_attention_layernorm_key(probe_layer))
+                };
+                let h_ffn = match pre_ffn_key {
+                    Some(key) => crate::forward::apply_norm(weights, &probe_arr, &key, norm_offset),
+                    None => crate::residual::rms_norm(&probe_arr, None, norm_offset),
+                };
+                backend.reset_kv_cache();
+                return Some(h_ffn.row(0).to_vec());
+            }
+        }
+    }
+    backend.reset_kv_cache();
+    None
 }
 
 /// Same as `capture_residual_post_attn_norm` but with an FFN backend override.
@@ -637,6 +728,7 @@ pub fn predict_honest_with_knn_ffn(
                                         return crate::forward::PredictResult {
                                             predictions: vec![(label, cosine as f64)],
                                             raw_predictions: vec![(entry.target_id, cosine, cosine as f64)],
+                                            knn_override: Some(entry.target_token.clone()),
                                         };
                                     }
                                 }
@@ -737,6 +829,7 @@ pub fn predict_honest_with_knn_ffn(
                                     return crate::forward::PredictResult {
                                         predictions: vec![(label, cosine as f64)],
                                         raw_predictions: vec![(entry.target_id, cosine, cosine as f64)],
+                                        knn_override: Some(entry.target_token.clone()),
                                     };
                                 }
                             }
@@ -854,6 +947,7 @@ pub fn predict_honest_with_knn_ffn(
                                 return crate::forward::PredictResult {
                                     predictions: vec![(label, cosine as f64)],
                                     raw_predictions: vec![(entry.target_id, cosine, cosine as f64)],
+                                    knn_override: Some(entry.target_token.clone()),
                                 };
                             }
                         }
@@ -978,6 +1072,7 @@ pub fn predict_honest_with_knn_ffn(
                                         return crate::forward::PredictResult {
                                             predictions: vec![(label, cosine as f64)],
                                             raw_predictions: vec![(entry.target_id, cosine, cosine as f64)],
+                                            knn_override: Some(entry.target_token.clone()),
                                         };
                                     }
                                 }

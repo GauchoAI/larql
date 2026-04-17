@@ -476,6 +476,7 @@ async fn main() -> io::Result<()> {
     }
 
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<StreamEvent>(256);
+    let mut tool_depth: usize = 0; // prevent infinite tool execution chains
 
     loop {
         let mut new_output = false;
@@ -495,12 +496,20 @@ async fn main() -> io::Result<()> {
                         _ => String::new(),
                     };
 
-                    if let Some(_summary) = execute_skill_tool(&response_text, &mut state.messages) {
-                        state.messages.push(Message::Assistant(String::new()));
-                        let chat_msgs = state.build_chat_messages();
-                        spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone());
+                    // Only execute tools on first response, not follow-ups
+                    if tool_depth == 0 {
+                        if let Some(_summary) = execute_skill_tool(&response_text, &mut state.messages) {
+                            tool_depth += 1;
+                            state.messages.push(Message::Assistant(String::new()));
+                            let chat_msgs = state.build_chat_messages();
+                            spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone());
+                        } else {
+                            state.is_generating = false;
+                            tool_depth = 0;
+                        }
                     } else {
                         state.is_generating = false;
+                        tool_depth = 0;
 
                         // Auto-INSERT conversation turn into RAG store.
                         // Both user message and assistant response become

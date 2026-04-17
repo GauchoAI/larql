@@ -372,14 +372,9 @@ async fn load_session_into_rag(server_url: &str, session_id: &str) -> Result<usi
         let ts = obj.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
         let ts_short = &ts[..ts.len().min(19)];
 
+        // Only insert assistant messages — they contain the actual knowledge.
+        // User messages are short/rambling and pollute the embedding space.
         let fact = match entry_type {
-            "user" => {
-                let content = obj.pointer("/message/content")
-                    .and_then(|v| v.as_str()).unwrap_or("");
-                if content.len() > 20 && !content.starts_with("<task") {
-                    Some(format!("[{}] User: {}", ts_short, &content[..content.char_indices().take(300).last().map(|(i,c)| i + c.len_utf8()).unwrap_or(0)]))
-                } else { None }
-            }
             "assistant" => {
                 let blocks = obj.pointer("/message/content")
                     .and_then(|v| v.as_array());
@@ -392,8 +387,8 @@ async fn load_session_into_rag(server_url: &str, session_id: &str) -> Result<usi
                         })
                         .collect::<Vec<_>>()
                         .join(" ");
-                    if text.len() > 30 {
-                        Some(format!("[{}] Assistant: {}", ts_short, &text[..text.char_indices().take(300).last().map(|(i,c)| i + c.len_utf8()).unwrap_or(0)]))
+                    if text.len() > 50 {
+                        Some(format!("[{}] {}", ts_short, &text[..text.char_indices().take(300).last().map(|(i,c)| i + c.len_utf8()).unwrap_or(0)]))
                     } else { None }
                 } else { None }
             }

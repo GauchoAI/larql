@@ -25,21 +25,34 @@ with open('$TRANSCRIPT') as f:
 
 inserted = 0
 for turn in data['turns']:
+    # Only assistant messages — they have the actual knowledge.
+    # Split into sentences for focused embeddings.
+    if turn['role'] != 'assistant':
+        continue
     ts = turn.get('timestamp', '')
-    role = turn['role']
     content = turn['content']
-    # Truncate safely
-    fact = content[:500] if len(content) <= 500 else content[:500]
-    fact_text = f'[{ts}] [{role}] {fact}'
+    if len(content) < 30:
+        continue
 
-    r = subprocess.run(
-        ['curl', '-s', '--max-time', '2', '$SERVER/v1/rag/insert',
-         '-H', 'Content-Type: application/json',
-         '-d', json.dumps({'fact': fact_text, 'category': 'session'})],
-        capture_output=True, text=True
-    )
-    if '\"ok\"' in r.stdout:
-        inserted += 1
+    # Split into sentences (period/newline boundaries)
+    import re
+    sentences = re.split(r'(?<=[.!?\n])\s+', content)
+    for sent in sentences:
+        sent = sent.strip()
+        if len(sent) < 20 or len(sent) > 200:
+            continue
+        # Skip meta-commentary
+        if any(skip in sent.lower() for skip in ['let me', 'i\'ll', 'here\'s', 'looking at']):
+            continue
+        fact_text = f'[{ts}] {sent}'
+        r = subprocess.run(
+            ['curl', '-s', '--max-time', '2', '$SERVER/v1/rag/insert',
+             '-H', 'Content-Type: application/json',
+             '-d', json.dumps({'fact': fact_text, 'category': 'session'})],
+            capture_output=True, text=True
+        )
+        if '\"ok\"' in r.stdout:
+            inserted += 1
 
 print(inserted)
 ")

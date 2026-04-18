@@ -1,5 +1,87 @@
 # Findings — Conversation as Knowledge
 
+## Community Research — Long Conversation Retrieval Without Labeling
+
+### EM-LLM: Surprise-Based Episodic Segmentation (ICLR 2025)
+**Paper**: [arxiv.org/abs/2407.09450](https://arxiv.org/abs/2407.09450)
+**Code**: [github.com/em-llm/EM-LLM-model](https://github.com/em-llm/EM-LLM-model)
+
+Segments conversation into "episodic events" using Bayesian surprise — no labels.
+When tokens are information-dense (surprising), a boundary is placed. Retrieval
+is two-stage: similarity-based + temporally contiguous (retrieve nearby events too).
+
+- Scales to 10M tokens (~7,500 pages)
+- Up to 40% improvement in retrieval/QA vs baselines
+- Surpasses full-context models in most tasks
+- Event boundaries correlate with human-perceived events
+- **Key for us**: auto-segmentation without labeling, pure content-driven
+
+### Pichay: Cooperative Memory Paging (2026)
+**Paper**: [arxiv.org/abs/2604.12376](https://arxiv.org/abs/2604.12376)
+**Blog**: [fsgeek.ca/2026/03/25/pichay-treating-llm-context-as-virtual-memory/](https://fsgeek.ca/2026/03/25/pichay-treating-llm-context-as-virtual-memory/)
+
+Treats context window like OS virtual memory. Evicts old segments, replaces with
+tiny keyword bookmarks (`[p3: Metal GPU, tok/s, 41]` — 8-24 tokens each). Model
+gets a `recall()` tool to page segments back in on demand.
+
+- Minimal bookmarks work BETTER than verbose ones (verbose gives false confidence)
+- LLMs are cooperative agents — they follow paging instructions
+- Operates on conversation content, not tool outputs
+- **Key for us**: immediately actionable — auto-extract keywords per turn,
+  model decides what to recall. Our RAG but with active model-driven retrieval.
+
+### InfLLM: Training-Free Streaming Memory (2024)
+**Paper**: [openreview.net/forum?id=bTHFrqhASY](https://openreview.net/forum?id=bTHFrqhASY)
+
+Stores distant context in memory units, looks up token-relevant units for
+attention computation. No training needed. Scales to 1M+ tokens.
+
+- Training-free — works on any pretrained LLM
+- Efficient memory lookup during attention
+- Comparable to continual-training baselines
+- **Key for us**: closest to chuk-lazurus window-replay approach
+
+### MemoryBank: Long-Term Memory with Forgetting (2023)
+**Paper**: [arxiv.org/abs/2305.10250](https://arxiv.org/abs/2305.10250)
+
+Ebbinghaus forgetting curve — memories decay, important ones reinforced.
+Continuous memory updates, personality adaptation from past interactions.
+
+- **Key for us**: forgetting mechanism prevents store bloat over long sessions
+
+### GAM: Dual-Agent Memory Architecture (2026)
+**Coverage**: [VentureBeat](https://venturebeat.com/ai/gam-takes-aim-at-context-rot-a-dual-agent-memory-architecture/)
+
+Addresses "context rot" — degradation when context grows too long.
+Two agents: one manages memory, one generates responses.
+
+- **Key for us**: separation of memory management from generation
+
+### Survey: Memory in the Age of AI Agents
+**Collection**: [github.com/Shichun-Liu/Agent-Memory-Paper-List](https://github.com/Shichun-Liu/Agent-Memory-Paper-List)
+
+Comprehensive paper list covering all memory approaches for LLM agents.
+
+### Common Thread
+None use explicit labeling. All auto-segment based on content:
+- **Surprise boundaries** (EM-LLM) — information density drives segmentation
+- **Keyword extraction** (Pichay) — lightweight bookmarks, model-driven recall
+- **Attention patterns** (InfLLM) — token-relevant memory lookup
+- **Temporal decay** (MemoryBank) — forgetting curve prunes old facts
+
+### Applicability to larql
+| Approach | Effort | Matches Our Stack | Key Benefit |
+|----------|--------|-------------------|-------------|
+| Pichay bookmarks | S | Yes — keyword extraction + recall tool | Immediately actionable, model-driven |
+| EM-LLM segmentation | M | Partial — need surprise metric from model | Best retrieval quality, no labels |
+| InfLLM memory units | L | Yes — fits our KV cache architecture | Training-free, proven at 1M tokens |
+| MemoryBank forgetting | S | Yes — add decay to RAG store | Prevents bloat in long sessions |
+
+**Recommended order**: Pichay bookmarks first (S effort, immediate), then
+EM-LLM segmentation (M effort, best quality), then InfLLM if scale needed.
+
+---
+
 ## Session: 2026-04-17
 
 ### KNN Token Override (PROVEN)

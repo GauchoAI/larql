@@ -80,6 +80,40 @@ None use explicit labeling. All auto-segment based on content:
 **Recommended order**: Pichay bookmarks first (S effort, immediate), then
 EM-LLM segmentation (M effort, best quality), then InfLLM if scale needed.
 
+### Three Variants Tested — All Score 6/11 (2026-04-18)
+Implemented all three chunking strategies with token-mean embedding retrieval:
+- EM-LLM surprise segmentation: 6/11
+- Pichay page table: 6/11
+- InfLLM per-turn memory units: 6/11
+
+All identical. **Chunking doesn't matter when the matching is token-mean embeddings.**
+The papers' innovation is neural matching, not text structuring.
+
+### Key Insight: Retrieval ≠ Inference (2026-04-18)
+Two separate paths, two separate precision requirements:
+- **Inference**: Q4_K Metal GPU at 35+ tok/s — production, stays as-is
+- **Retrieval**: needs bf16 precision at the copy head (L29 H4)
+
+The bf16 forward pass is needed ONLY for:
+- INSERT: once per fact (extract K vector)
+- QUERY: once per user question (extract Q vector)
+- NOT per decode token
+
+A 1-second bf16 retrieval pass before 35 tok/s Q4_K decode is fine.
+The copy head (L29 H4, Δ=+0.35) works for intra-prompt matching.
+The retrieval needs to happen WITHIN the same forward pass context.
+
+### Next Step: bf16 Retrieval via MLX
+Use chuk-lazurus MLX infrastructure for bf16 retrieval:
+1. Load Gemma 3 4B in bf16 via MLX (already downloaded)
+2. Prefill facts as one window, extract K at L29 H4 per position
+3. On query, prefill query appended to fact window, extract Q at L29 H4
+4. Q·K matching within the same context → proper copy head retrieval
+5. Return matched fact text → inject via Q4_K RAG or vec_inject
+
+This separates retrieval (MLX bf16, slow but accurate) from
+inference (Rust Q4_K Metal, fast). Two processes, two precisions.
+
 ---
 
 ## Session: 2026-04-17

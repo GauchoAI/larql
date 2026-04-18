@@ -60,8 +60,13 @@ pub async fn handle_precompute(
             Ok(g) => g, Err(p) => p.into_inner(),
         };
 
-        // Tokenize
-        let encoding = model.tokenizer.encode(text.as_str(), true)
+        // Wrap in Gemma 3 chat template so KV matches inference format.
+        // The text becomes the system message content.
+        let system = "You are a helpful assistant. Answer questions based on the conversation history provided.";
+        let chat_prompt = format!(
+            "<start_of_turn>system\n{system}\n\nConversation history:\n{text}<end_of_turn>\n"
+        );
+        let encoding = model.tokenizer.encode(chat_prompt.as_str(), true)
             .map_err(|e| ServerError::Internal(format!("tokenize: {e}")))?;
         let token_ids: Vec<u32> = encoding.get_ids().to_vec();
         let num_tokens = token_ids.len();

@@ -97,17 +97,26 @@ pub async fn handle_chat_completions(
 
     // RAG: retrieve matching facts and inject as context
     let user_msg = req.messages.last().map(|m| m.content.as_str()).unwrap_or("");
-    let rag_context = super::rag::retrieve_context(&state, &model, user_msg, 0.55);
-    let chat_prompt = if let Some(ref ctx) = rag_context {
-        tracing::info!("[chat] RAG injecting {} chars of context", ctx.len());
-        // Inject RAG context as a system-level addition
-        let mut msgs = req.messages.clone();
-        if let Some(last) = msgs.last_mut() {
-            last.content = format!("{ctx}\n\n{}", last.content);
-        }
-        messages_to_gemma3_prompt(&msgs)
+    // When KV cache is preloaded, skip system prompt (it's in the KV already).
+    // Only tokenize the user turn + model marker.
+    let has_kv = state.kv_cache_store.saved.read().unwrap().is_some();
+    let chat_prompt = if has_kv {
+        // KV has system + conversation history. Just add user turn.
+        let user_content = req.messages.last()
+            .map(|m| m.content.as_str()).unwrap_or("");
+        format!("<start_of_turn>user\n{user_content}<end_of_turn>\n<start_of_turn>model\n")
     } else {
-        messages_to_gemma3_prompt(&req.messages)
+        let rag_context = super::rag::retrieve_context(&state, &model, user_msg, 0.55);
+        if let Some(ref ctx) = rag_context {
+            tracing::info!("[chat] RAG injecting {} chars of context", ctx.len());
+            let mut msgs = req.messages.clone();
+            if let Some(last) = msgs.last_mut() {
+                last.content = format!("{ctx}\n\n{}", last.content);
+            }
+            messages_to_gemma3_prompt(&msgs)
+        } else {
+            messages_to_gemma3_prompt(&req.messages)
+        }
     };
     let request_id = format!("chatcmpl-{}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());

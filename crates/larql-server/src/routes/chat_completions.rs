@@ -55,11 +55,11 @@ fn default_temperature() -> f32 { 0.7 }
 fn messages_to_gemma3_prompt(messages: &[ChatMessage]) -> String {
     let has_memory = true; // TODO: check if RAG store has entries
     let recall_instruction = if has_memory {
-        " You have access to conversation memory. Before answering questions about \
-        past work, output a search block: ```recall\nkeyword1 keyword2 keyword3\n``` \
-        with 3-5 specific technical terms that would appear in the answer. \
-        For example, if asked 'what GPU?', search for 'Metal Apple M4 GPU'. \
-        The system will inject matching memories and you can then answer."
+        " You have access to conversation memory. ONLY when asked about our \
+        previous work or project details, output: ```recall\nkeyword1 keyword2\n``` \
+        with specific technical terms that would appear in the answer. \
+        Do NOT use recall for general knowledge questions (math, jokes, coding help). \
+        Only recall when you genuinely need information from our past conversation."
     } else { "" };
     let system = format!("You are a local coding assistant running directly on the user's machine. \
         You have full access to their filesystem and can run bash commands. \

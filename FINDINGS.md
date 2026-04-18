@@ -340,4 +340,60 @@ Metal, ratatui, port 3000, clone are in LATER turns not included.
 With the full 2257-turn conversation in KV, the model would attend
 to all facts naturally. Just need to precompute more turns.
 
-**Next: precompute full conversation (~2257 turns), measure score.**
+### KV Replay Scale Test (2026-04-18 — continuation)
+
+Fixed KV restore for multi-token prefill: when precomputed KV exists, process
+user query tokens one-by-one through KV-cached attention (reads past K/V,
+appends at correct position) instead of multi-token prefill (which overwrites
+KV from position 0). Previous "garbled output" was from overwriting.
+
+| Precomputed tokens | KV size | Quality | Notes |
+|--------------------|---------|---------|-------|
+| 40                 | 10.6 MB | Perfect | "Paris" — exact |
+| 168                | 44.6 MB | Perfect | 20 capitals — all correct |
+| 387                | 102.8 MB| Perfect | 50 capitals — all correct |
+| 533                | 141.6 MB| Perfect | "BUTTERFLY" code word, "Oscar Niemeyer" |
+| 925                | 245.7 MB| Perfect | 5/5 including exact password + color |
+| 1800               | 478.1 MB| Degraded| Early ✓, late ✗ ("333" hallucination) |
+| 1890               | 502.0 MB| Degraded| Early ✓, middle/late loses precision |
+| 2270               | 603.0 MB| Poor    | 1/9 recall on raw conversation dump |
+| 158 (compact facts)| 42.0 MB | **10/11** | Focused context → near-perfect |
+
+**The mechanism works perfectly. The limit is attention distance, not KV.**
+
+Gemma 3 4B attention reliably retrieves facts up to ~925 tokens. Beyond that,
+"lost in the middle" causes progressive degradation — the model produces
+coherent but incorrect answers (e.g., "333" for everything, wrong dates).
+
+**Compact context is the key:** 158 tokens of focused facts → 10/11 (vs 6/11
+with RAG, vs 1/9 with 2270 raw tokens). The optimal strategy:
+
+1. **RAG → KV**: use RAG to select ~200 tokens of relevant context per query
+2. **Summary → KV**: precompute a compact conversation summary into KV
+3. **Pichay bookmarks**: minimal keyword bookmarks (~24 tokens) as persistent KV
+
+| Approach                | Score  | Context | Latency |
+|-------------------------|--------|---------|---------|
+| Compact KV (158 tok)    | 10/11  | Focused | 36ms restore |
+| Conv KV (4120 tok)      | **7/11** | Full conv | 36ms restore |
+| RAG → context inject    | 5-6/11 | Selective | 2-5ms |
+| Raw conv KV (2270 tok)  | 3/11   | Dense dump| 36ms restore |
+| No context (baseline)   | 2/11   | None    | 0ms |
+
+### Root Cause of `<unused>` Garbled Output (2026-04-18)
+
+The `<unused>` token garbage at 4000+ tokens was caused by **Metal shader
+threadgroup buffer overflow**:
+
+- `kv_attention` shader had `threadgroup float tg_scores[1024]`
+- KV-cached decode with T > 1024 wrote past the end of `tg_scores`
+- This silently corrupted threadgroup memory → garbage attention weights
+- At T < 1024 (decode from scratch), attention worked correctly
+- At T > 1024 (KV restore with 4000+ precomputed tokens), overflow → garbled
+
+**Fix**: Increased `tg_scores` to 8160 entries (32,640 bytes — within Metal's
+32KB threadgroup memory limit). Also increased KV cache buffers from 4096 to
+8160 max_seq to support 8K context.
+
+Additional fix: KV buffer size was 4096 max_seq (16 MB/layer), which panicked
+at 4120+ tokens. Increased to 8160 (32 MB/layer, total ~2.1 GB for 34 layers).

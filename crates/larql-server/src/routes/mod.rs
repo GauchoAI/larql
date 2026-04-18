@@ -58,6 +58,7 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/vec/insert", post(vec_inject::handle_vec_insert))
         .route("/v1/vec/query", post(vec_inject::handle_vec_query))
         .route("/v1/kv/precompute", post(kv_cache::handle_precompute))
+        .route("/v1/kv/compact", post(kv_cache::handle_compact))
         .route("/v1/kv/stats", get(kv_cache::handle_kv_stats))
         .with_state(state)
 }

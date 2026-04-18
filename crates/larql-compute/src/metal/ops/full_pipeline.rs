@@ -667,7 +667,7 @@ pub fn dispatch_full_pipeline(
             let lhd = layers[l].head_dim;
             while kv.layers.len() <= l {
                 kv.layers.push(super::kv_cache::LayerKVCache::new(
-                    bufs, 4096, num_kv_heads, lhd));
+                    bufs, crate::metal::KV_MAX_SEQ, num_kv_heads, lhd));
             }
             let total_kv = seq_len * num_kv_heads * lhd;
             let k_src = k_outs[l].contents() as *const f32;

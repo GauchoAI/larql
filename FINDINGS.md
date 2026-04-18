@@ -306,3 +306,17 @@ Step 3 (vec_inject at L30)    ← can test with RAG text before this
     ↓
 Step 4 (session index file)   ← persistence
 ```
+
+### Comprehensive Results Table (2026-04-18)
+| Method                           | Score | Honest? | Blocked By |
+|----------------------------------|-------|---------|------------|
+| Token-mean embedding RAG         | 6/11  | ✓       | Embedding gap |
+| BM25 + embedding hybrid          | 6/11  | ✓       | Keyword gap |
+| EM-LLM neural segmentation       | 6/11  | ✓       | Still embedding RAG underneath |
+| Full 20-turn context             | 6/11  | ✓       | Right turns by luck only |
+| Cooperative model recall          | 5/11  | ✓       | Generic keywords |
+| RAG select → context inject      | 5/11  | ✓       | Wrong turns selected |
+| Full 4000-token context          | 2/11  | ✓       | Prefill timeout (100s) |
+| Copy head Q·K cross-prompt       | 2/5   | ✓       | Q·K doesn't match cross-prompt |
+
+**6/11 is the ceiling. Next: KV precompute + selective replay.**

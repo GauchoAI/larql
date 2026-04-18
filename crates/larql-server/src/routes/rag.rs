@@ -59,15 +59,63 @@ impl RagStore {
     }
 
     pub fn query(&self, query_embed: &[f32], top_k: usize, threshold: f32) -> Vec<(RagEntry, f32)> {
+        self.query_hybrid(query_embed, "", top_k, threshold)
+    }
+
+    /// Hybrid retrieval: BM25 keyword matching + embedding cosine.
+    /// BM25 handles exact keyword matches ("port" → "3000").
+    /// Embedding handles semantic matches ("speculative decoding" → related facts).
+    /// Final score = 0.5 * embedding_cosine + 0.5 * bm25_normalized.
+    pub fn query_hybrid(&self, query_embed: &[f32], query_text: &str, top_k: usize, threshold: f32) -> Vec<(RagEntry, f32)> {
         let entries = self.entries.read().unwrap();
+        if entries.is_empty() { return Vec::new(); }
+
         let q_norm = l2_norm(query_embed);
+
+        // BM25-style keyword scoring
+        let query_lower = query_text.to_lowercase();
+        let query_terms: Vec<&str> = query_lower.split_whitespace()
+            .filter(|w| w.len() > 2) // skip short words
+            .collect();
+
+        // IDF: log(N / (1 + df)) for each query term
+        let n = entries.len() as f32;
+        let term_idfs: Vec<f32> = query_terms.iter().map(|term| {
+            let df = entries.iter()
+                .filter(|e| e.fact.to_lowercase().contains(term))
+                .count() as f32;
+            (n / (1.0 + df)).ln().max(0.0)
+        }).collect();
 
         let mut scored: Vec<(RagEntry, f32)> = entries.iter()
             .map(|e| {
                 let cos = cosine(&q_norm, &e.embedding);
-                (e.clone(), cos)
+
+                // BM25 term frequency score
+                let fact_lower = e.fact.to_lowercase();
+                let mut bm25 = 0.0f32;
+                for (term, idf) in query_terms.iter().zip(term_idfs.iter()) {
+                    if fact_lower.contains(term) {
+                        // Simple TF: count occurrences
+                        let tf = fact_lower.matches(term).count() as f32;
+                        // BM25 saturation: tf / (tf + 1.2)
+                        bm25 += idf * (tf / (tf + 1.2));
+                    }
+                }
+
+                // Normalize BM25 to 0..1 range (rough)
+                let bm25_norm = (bm25 / 3.0).min(1.0);
+
+                // Hybrid: blend embedding + BM25
+                let hybrid = if query_terms.is_empty() {
+                    cos // no keywords → pure embedding
+                } else {
+                    0.4 * cos + 0.6 * bm25_norm // favor keywords for precision
+                };
+
+                (e.clone(), hybrid)
             })
-            .filter(|(_, cos)| *cos >= threshold)
+            .filter(|(_, score)| *score >= threshold)
             .collect();
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -387,7 +435,7 @@ pub fn retrieve_context(
     if state.rag_store.len() == 0 { return None; }
 
     let query_embed = sentence_embedding(&model.tokenizer, &model.embeddings, user_msg)?;
-    let results = state.rag_store.query(&query_embed, 3, threshold);
+    let results = state.rag_store.query_hybrid(&query_embed, user_msg, 3, threshold);
 
     if results.is_empty() { return None; }
 

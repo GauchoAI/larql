@@ -1053,12 +1053,13 @@ pub fn predict_honest_with_knn_ffn(
                     } else { false }
                 } else if force_quant_early && arch.has_post_norms() {
                     // GPU sequential prefill: process each prompt token through
-                    // decode_token one at a time. Uses the proven GPU decode path
-                    // (validated at cos=0.9994) instead of dispatch_full_pipeline
-                    // (which NaNs for post-norm). Cost: seq_len × decode_time
-                    // (~11 × 26ms = 286ms vs 763ms CPU). KV cache populated
-                    // correctly by decode_token's internal kv_cache_append.
-                    backend.reset_kv_cache();
+                    // decode_token one at a time.
+                    // Skip reset if KV cache already has precomputed context.
+                    let (_, _, existing_len) = backend.debug_read_kv_layer(0)
+                        .unwrap_or((Vec::new(), Vec::new(), 0));
+                    if existing_len == 0 {
+                        backend.reset_kv_cache();
+                    }
                     let embeds = crate::forward::embed_tokens_pub(weights, token_ids);
                     let t_prefill = std::time::Instant::now();
                     let mut last_h = vec![0.0f32; hidden];
@@ -1121,9 +1122,12 @@ pub fn predict_honest_with_knn_ffn(
                     true
                 } else {
                     // Post-norm models (Gemma3): CPU prefill (correct) → GPU logits (fast)
-                    // CPU handles post-norms correctly. Use CPU hidden state, GPU for logits only.
-                    // KV cache populated for future decode_token calls (token generation).
-                    backend.reset_kv_cache();
+                    // Skip reset if KV cache already has precomputed context.
+                    let (_, _, existing_len) = backend.debug_read_kv_layer(0)
+                        .unwrap_or((Vec::new(), Vec::new(), 0));
+                    if existing_len == 0 {
+                        backend.reset_kv_cache();
+                    }
 
                     // Prefill FFN: swap the slow CPU walk (all ~348K features per
                     // layer) for the f32-weights + Metal-matmul FFN that the

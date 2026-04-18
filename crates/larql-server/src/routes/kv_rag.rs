@@ -17,10 +17,12 @@ use crate::state::AppState;
 /// Which attention head to use for retrieval.
 /// For Gemma 3 4B: layer 26, kv_head 0 is a reasonable starting point.
 /// Chuk-lazurus uses layer 29, head 4 for Gemma 4B.
-/// Best retrieval config from head sweep (4/5 hits, gap=+0.022):
-/// L24 H2 — discriminates Miguel, Gemma, port 3000, ratatui.
-const RETRIEVAL_LAYER: usize = 24;
-const RETRIEVAL_KV_HEAD: usize = 2;
+/// Gemma 3 4B copy head — confirmed by calibrate_arch.py ablation:
+///   query_head=4 (mean Δ=+0.35, coverage=67%)
+///   retrieval_layer=29, injection_layer=30
+///   GQA maps query_head 4 → KV head 2 (8Q / 4KV = 2 Q per KV)
+const RETRIEVAL_LAYER: usize = 29;
+const RETRIEVAL_KV_HEAD: usize = 2; // query_head 4 → kv_head 2
 
 #[derive(Deserialize)]
 pub struct KvRagInsertRequest {

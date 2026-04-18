@@ -1116,79 +1116,77 @@ impl MetalBackend {
 
             let new_h = if l % 2 == 0 { &h_a } else { &h_b };
 
-            // ── Per-position dispatches (loop over K) ──
+            // ── Phase 1: Input norms for ALL K positions ──
+            // Must complete before batch QKV projection reads norm_buf.
+            {
+                let len_val = hidden as u32;
+                enc.set_compute_pipeline_state(&self.rms_norm_pipeline);
+                enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+                enc.set_buffer(1, Some(&input_norm_bufs[l]), 0);
+                for bi in 0..k {
+                    let h_off = (bi * hidden * 4) as u64;
+                    let norm_off_bi = (bi * hidden * 4) as u64;
+                    enc.set_buffer(0, Some(h_buf), h_off);
+                    enc.set_buffer(2, Some(&norm_buf), norm_off_bi);
+                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
+                }
+            }
+
+            // ── Phase 2: Batched QKV projection (shared weight reads) ──
+            {
+                let k_val = hidden as u32;
+                let m_val = k as u32;
+                let dispatch_batch_proj = |enc: &metal::ComputeCommandEncoderRef,
+                                           w_buf: &metal::Buffer,
+                                           in_buf: &metal::Buffer,
+                                           out_buf: &metal::Buffer,
+                                           rows: usize, fmt: crate::QuantFormat| {
+                    let n_val = rows as u32;
+                    match fmt {
+                        crate::QuantFormat::Q6_K => {
+                            let n_tgs = (rows as u64).div_ceil(q6k::ROWS_PER_TG);
+                            enc.set_compute_pipeline_state(&self.q6k_matvec_batch_pipeline);
+                            enc.set_buffer(0, Some(w_buf), 0);
+                            enc.set_buffer(1, Some(in_buf), 0);
+                            enc.set_buffer(2, Some(out_buf), 0);
+                            enc.set_bytes(3, 4, &n_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
+                            enc.dispatch_thread_groups(
+                                MTLSize::new(n_tgs, m_val as u64, 1),
+                                MTLSize::new(q6k::THREADS_PER_TG, 1, 1),
+                            );
+                        }
+                        _ => {
+                            let n_tgs = (rows as u64).div_ceil(q4k::ROWS_PER_TG);
+                            enc.set_compute_pipeline_state(&self.q4k_matvec_batch_pipeline);
+                            enc.set_buffer(0, Some(w_buf), 0);
+                            enc.set_buffer(1, Some(in_buf), 0);
+                            enc.set_buffer(2, Some(out_buf), 0);
+                            enc.set_bytes(3, 4, &n_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
+                            enc.dispatch_thread_groups(
+                                MTLSize::new(n_tgs, m_val as u64, 1),
+                                MTLSize::new(q4k::THREADS_PER_TG, 1, 1),
+                            );
+                        }
+                    }
+                };
+                dispatch_batch_proj(enc, &wq_bufs[l], &norm_buf, &q_out, layer_q_dim, layer.wq.format);
+                dispatch_batch_proj(enc, &wk_bufs[l], &norm_buf, &k_out, kv_dim, layer.wk.format);
+                dispatch_batch_proj(enc, &wv_bufs[l], &norm_buf, &v_out, kv_dim, layer.wv.format);
+            }
+
+            // ── Phase 3: Per-position QK-norm, RoPE, V-norm ──
             for bi in 0..k {
-                let h_off = (bi * hidden * 4) as u64;
-                let norm_off_bi = (bi * hidden * 4) as u64;
                 let q_off = (bi * q_dim * 4) as u64;
                 let k_off = (bi * kv_dim * 4) as u64;
                 let v_off = (bi * kv_dim * 4) as u64;
 
-                // Step 1: Input norm (direct dispatch with per-position offsets)
-                let len_val = hidden as u32;
-                enc.set_compute_pipeline_state(&self.rms_norm_pipeline);
-                enc.set_buffer(0, Some(h_buf), h_off);
-                enc.set_buffer(1, Some(&input_norm_bufs[l]), 0);
-                enc.set_buffer(2, Some(&norm_buf), norm_off_bi);
-                enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
-                enc.set_bytes(5, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
-                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
-
-                // Step 2: QKV projection — batched matvec (shared weight reads)
-                // For bi==0, dispatch ONE batched matvec for all K positions.
-                // Subsequent bi iterations skip this step.
-                if bi == 0 {
-                    let k_val = hidden as u32;
-                    let m_val = k as u32;
-                    let dispatch_batch_proj = |enc: &metal::ComputeCommandEncoderRef,
-                                               w_buf: &metal::Buffer,
-                                               in_buf: &metal::Buffer,  // [K, hidden]
-                                               out_buf: &metal::Buffer, // [K, rows] or [rows, K]
-                                               rows: usize, fmt: crate::QuantFormat| {
-                        let n_val = rows as u32;
-                        // Use batched pipeline: reads weights once, dots against K inputs
-                        // 2D grid: (n_tgs, M, 1) — different batch positions
-                        // on different GPU cores, sharing weight data via L2.
-                        match fmt {
-                            crate::QuantFormat::Q6_K => {
-                                let n_tgs = (rows as u64).div_ceil(q6k::ROWS_PER_TG);
-                                enc.set_compute_pipeline_state(&self.q6k_matvec_batch_pipeline);
-                                enc.set_buffer(0, Some(w_buf), 0);
-                                enc.set_buffer(1, Some(in_buf), 0);
-                                enc.set_buffer(2, Some(out_buf), 0);
-                                enc.set_bytes(3, 4, &n_val as *const u32 as *const std::ffi::c_void);
-                                enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
-                                enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
-                                enc.dispatch_thread_groups(
-                                    MTLSize::new(n_tgs, m_val as u64, 1),
-                                    MTLSize::new(q6k::THREADS_PER_TG, 1, 1),
-                                );
-                            }
-                            _ => {
-                                let n_tgs = (rows as u64).div_ceil(q4k::ROWS_PER_TG);
-                                enc.set_compute_pipeline_state(&self.q4k_matvec_batch_pipeline);
-                                enc.set_buffer(0, Some(w_buf), 0);
-                                enc.set_buffer(1, Some(in_buf), 0);
-                                enc.set_buffer(2, Some(out_buf), 0);
-                                enc.set_bytes(3, 4, &n_val as *const u32 as *const std::ffi::c_void);
-                                enc.set_bytes(4, 4, &k_val as *const u32 as *const std::ffi::c_void);
-                                enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
-                                enc.dispatch_thread_groups(
-                                    MTLSize::new(n_tgs, m_val as u64, 1),
-                                    MTLSize::new(q4k::THREADS_PER_TG, 1, 1),
-                                );
-                            }
-                        }
-                    };
-                    // Input: norm_buf [K, hidden]. Output: q_out [q_dim, K], k_out [kv_dim, K], v_out [kv_dim, K]
-                    // Note: batch output layout is [row, M] (row-major, M batch positions per row)
-                    dispatch_batch_proj(enc, &wq_bufs[l], &norm_buf, &q_out, layer_q_dim, layer.wq.format);
-                    dispatch_batch_proj(enc, &wk_bufs[l], &norm_buf, &k_out, kv_dim, layer.wk.format);
-                    dispatch_batch_proj(enc, &wv_bufs[l], &norm_buf, &v_out, kv_dim, layer.wv.format);
-                }
-
-                // Step 3: QK-norm (Gemma 3)
+                // QK-norm (Gemma 3)
                 if layer.q_norm_weight.is_some() {
                     let hd_val = layer_hd as u32;
                     let qk_off_val = layer.qk_norm_offset;
@@ -1213,7 +1211,7 @@ impl MetalBackend {
                     }
                 }
 
-                // Step 4: RoPE
+                // RoPE
                 {
                     let pos = (kv_cache.layers[l].current_len + bi) as u32;
                     let hd = layer_hd as u32;
@@ -1240,7 +1238,7 @@ impl MetalBackend {
                     );
                 }
 
-                // Step 5: V-norm (if needed)
+                // V-norm (if needed)
                 if layer.has_v_norm {
                     let hd_val = layer_hd as u32;
                     let num_kv = layer_nkv as u32;
@@ -1354,7 +1352,7 @@ impl MetalBackend {
                 // Step 9: FFN — fused GEGLU+down (Q4_K path)
                 let down_is_q6k = layer.down.format == crate::QuantFormat::Q6_K;
                 if !down_is_q6k && layer.is_gated() {
-                    // Gate + Up (separate dispatches for now)
+                    // Gate + Up (per-position)
                     let n_tgs_inter = (inter as u64).div_ceil(q4k::ROWS_PER_TG);
                     enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline);
                     enc.set_buffer(0, Some(&gate_bufs[l]), 0);
@@ -1410,7 +1408,7 @@ impl MetalBackend {
                     enc.set_compute_pipeline_state(geglu);
                     enc.set_buffer(0, Some(&gate_out), gate_off_bi);
                     enc.set_buffer(1, Some(&up_out), gate_off_bi);
-                    enc.set_buffer(2, Some(&up_out), gate_off_bi); // reuse as act_buf
+                    enc.set_buffer(2, Some(&up_out), gate_off_bi);
                     enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
                     enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
 

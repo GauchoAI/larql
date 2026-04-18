@@ -1053,8 +1053,7 @@ pub fn predict_honest_with_knn_ffn(
                         true
                     } else { false }
                 } else if force_quant_early && arch.has_post_norms() {
-                    // GPU sequential prefill: process each prompt token through
-                    // decode_token one at a time.
+                    // GPU prefill for post-norm models (Gemma 3).
                     // Skip reset if KV cache already has precomputed context.
                     let (_, _, existing_len) = backend.debug_read_kv_layer(0)
                         .unwrap_or((Vec::new(), Vec::new(), 0));
@@ -1064,11 +1063,35 @@ pub fn predict_honest_with_knn_ffn(
                     let embeds = crate::forward::embed_tokens_pub(weights, token_ids);
                     let t_prefill = std::time::Instant::now();
                     let mut last_h = vec![0.0f32; hidden];
-                    // KNN probe: on the LAST token, use decode_token_with_probe
-                    // to capture h_post_attn at the KNN layer for override check.
                     let knn_probe_layer_prefill: Option<usize> = knn_store
                         .and_then(|s| s.layers().into_iter().next());
                     let mut prefill_probe: Option<Vec<f32>> = None;
+
+                    // Batch prefill: process all tokens through all layers in
+                    // one Metal command buffer. ~24ms total vs ~24ms × seq_len
+                    // for sequential. Falls back to sequential if batch fails.
+                    let batch_ok = if seq_len > 1 {
+                        let x_batch: Vec<f32> = embeds.as_slice().unwrap_or(&[]).to_vec();
+                        if let Some(h_out) = backend.decode_token_batch(
+                            &layers, &x_batch, seq_len,
+                            hidden, intermediate, q_dim, kv_dim,
+                            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+                        ) {
+                            // Extract last position's hidden state
+                            let last_off = (seq_len - 1) * hidden;
+                            last_h = h_out[last_off..last_off + hidden].to_vec();
+                            let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+                            if std::env::var("LARQL_TRACE_PREFILL_TIME").ok().as_deref() == Some("1")
+                                || seq_len > 5 {
+                                eprintln!("[gpu-batch-prefill] {seq_len} tokens in {prefill_ms:.0}ms ({:.1}ms/tok, existing_kv={existing_len})",
+                                    prefill_ms / seq_len as f64);
+                            }
+                            true
+                        } else { false }
+                    } else { false };
+
+                    // Sequential fallback (single token or batch unavailable)
+                    if !batch_ok {
                     for p in 0..seq_len {
                         let x: Vec<f32> = embeds.row(p).to_vec();
                         let is_last = p == seq_len - 1;
@@ -1081,6 +1104,7 @@ pub fn predict_honest_with_knn_ffn(
                             last_h = result;
                             if ph.is_some() { prefill_probe = ph; }
                         }
+                    }
                     }
                     // KNN override check on prefill probe
                     if let (Some(probe), Some(store), Some(pl)) = (&prefill_probe, knn_store, knn_probe_layer_prefill) {

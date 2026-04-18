@@ -319,4 +319,25 @@ Step 4 (session index file)   ← persistence
 | Full 4000-token context          | 2/11  | ✓       | Prefill timeout (100s) |
 | Copy head Q·K cross-prompt       | 2/5   | ✓       | Q·K doesn't match cross-prompt |
 
-**6/11 is the ceiling. Next: KV precompute + selective replay.**
+**6/11 is the ceiling for retrieval-based approaches.**
+
+### KV Cache Precompute + Replay (BREAKTHROUGH, 2026-04-18)
+Precompute conversation KV cache ONCE, restore per query via memcpy.
+
+| Metric | Before (re-prefill) | After (KV replay) |
+|--------|--------------------|--------------------|
+| Prefill cost per query | 30-45s | **36ms** |
+| Decode speed | 30-35 tok/s | **34-36 tok/s** |
+| One-time precompute | — | 30.6s for 1048 tokens |
+| KV state size | — | 278 MB (34 layers) |
+| Score | 6/11 (20 turns) | **6/11 (20 turns)** |
+
+Same accuracy, 10× faster. The model perceives restored KV as context
+(confirmed: answers "Gemma 3 4B IT" from KV context).
+
+The 6/11 limit is NOT retrieval — it's the 20-turn window.
+Metal, ratatui, port 3000, clone are in LATER turns not included.
+With the full 2257-turn conversation in KV, the model would attend
+to all facts naturally. Just need to precompute more turns.
+
+**Next: precompute full conversation (~2257 turns), measure score.**

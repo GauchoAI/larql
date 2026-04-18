@@ -16,6 +16,7 @@ pub mod stream;
 pub mod kv_rag;
 pub mod probe;
 pub mod rag;
+pub mod vec_inject;
 pub mod walk;
 pub mod walk_ffn;
 
@@ -53,6 +54,8 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/rag/query-deep", post(rag::handle_rag_query_deep))
         .route("/v1/kv-rag/insert", post(kv_rag::handle_kv_rag_insert))
         .route("/v1/kv-rag/query", post(kv_rag::handle_kv_rag_query))
+        .route("/v1/vec/insert", post(vec_inject::handle_vec_insert))
+        .route("/v1/vec/query", post(vec_inject::handle_vec_query))
         .with_state(state)
 }
 

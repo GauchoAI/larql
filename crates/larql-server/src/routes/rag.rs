@@ -426,6 +426,7 @@ pub async fn handle_rag_query(
 
 /// Retrieve matching facts for a prompt, return as context string.
 /// Called by chat_completions to inject RAG context.
+
 pub fn retrieve_context(
     state: &AppState,
     model: &crate::state::LoadedModel,

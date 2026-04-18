@@ -53,9 +53,17 @@ fn default_temperature() -> f32 { 0.7 }
 
 /// Convert OpenAI messages to Gemma 3 chat template.
 fn messages_to_gemma3_prompt(messages: &[ChatMessage]) -> String {
-    let system = "You are a local coding assistant running directly on the user's machine. \
+    let has_memory = true; // TODO: check if RAG store has entries
+    let recall_instruction = if has_memory {
+        " You have access to conversation memory. Before answering questions about \
+        past work, output a search block: ```recall\nkeyword1 keyword2 keyword3\n``` \
+        with 3-5 specific technical terms that would appear in the answer. \
+        For example, if asked 'what GPU?', search for 'Metal Apple M4 GPU'. \
+        The system will inject matching memories and you can then answer."
+    } else { "" };
+    let system = format!("You are a local coding assistant running directly on the user's machine. \
         You have full access to their filesystem and can run bash commands. \
-        Always give complete answers with working code.";
+        Always give complete answers with working code.{recall_instruction}");
 
     let mut prompt = format!("<start_of_turn>system\n{system}<end_of_turn>\n");
 
@@ -196,9 +204,10 @@ pub async fn handle_chat_completions(
         let first_tok = model_cl.tokenizer.decode(&[next], true).unwrap_or_default();
         if tx.blocking_send(Ok(oai_chunk(&req_id, &first_tok))).is_err() { return; }
 
-        // Decode loop
+        // Decode loop — accumulate text to detect recall blocks
         let t_decode = std::time::Instant::now();
-        let mut token_count = 1usize; // first token already sent
+        let mut token_count = 1usize;
+        let mut generated_text = first_tok.clone();
         for _step in 1..max_tokens {
             let input = vec![next];
             let r = larql_inference::predict_honest_with_knn_ffn(
@@ -246,6 +255,58 @@ pub async fn handle_chat_completions(
                         break;
                     }
                     let tok = model_cl.tokenizer.decode(&[tid], true).unwrap_or_default();
+                    generated_text.push_str(&tok);
+
+                    // Check for recall block: ```recall\nkeywords\n```
+                    if generated_text.contains("```recall") {
+                        if let Some(end) = generated_text.rfind("```") {
+                            let start = generated_text.find("```recall").unwrap();
+                            if end > start + 9 {
+                                let recall_content = &generated_text[start + 9..end].trim();
+                                if !recall_content.is_empty() {
+                                    tracing::info!("[chat] {} recall: {:?}", req_id, recall_content);
+                                    // Search RAG with the model's keywords
+                                    let query_embed = super::rag::sentence_embedding(
+                                        &model_cl.tokenizer, &model_cl.embeddings, recall_content,
+                                    );
+                                    if let Some(qe) = query_embed {
+                                        let results = state.rag_store.query_hybrid(
+                                            &qe, recall_content, 3, 0.3,
+                                        );
+                                        if !results.is_empty() {
+                                            let context: String = results.iter()
+                                                .map(|(e, _)| {
+                                                    let clean: String = e.fact.replace("```", "")
+                                                        .chars().take(200).collect();
+                                                    format!("- {clean}")
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join("\n");
+                                            // Inject recall results as tokens
+                                            let inject = format!("\n[Memory found:]\n{context}\n\n");
+                                            let inject_enc = model_cl.tokenizer.encode(inject.as_str(), false).ok();
+                                            if let Some(enc) = inject_enc {
+                                                for &itid in enc.get_ids() {
+                                                    let itok = model_cl.tokenizer.decode(&[itid], true).unwrap_or_default();
+                                                    let _ = tx.blocking_send(Ok(oai_chunk(&req_id, &itok)));
+                                                    let _r = larql_inference::predict_honest_with_knn_ffn(
+                                                        weights, &model_cl.tokenizer, &[itid], 1,
+                                                        patched.base(), &**backend, &cache,
+                                                        0..weights.num_layers, knn_opt, ffn_override,
+                                                    );
+                                                    token_count += 1;
+                                                }
+                                                next = *enc.get_ids().last().unwrap_or(&tid);
+                                                generated_text.clear();
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if tx.blocking_send(Ok(oai_chunk(&req_id, &tok))).is_err() {
                         tracing::warn!("[chat] {} client disconnected at token {}", req_id, token_count);
                         return;

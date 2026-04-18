@@ -80,9 +80,45 @@ impl RagStore {
     }
 }
 
-/// Compute sentence embedding: mean of token embeddings from the model's
-/// embedding matrix. No forward pass — just lookup + average.
+/// Compute sentence embedding using the model's hidden state at a middle
+/// layer (L12). Runs a forward pass to get contextual representations,
+/// then averages the last position's hidden state. Much richer than
+/// mean-of-token-embeddings because it captures semantic relationships.
+///
+/// Falls back to mean-of-token-embeddings when backend is unavailable.
 pub fn sentence_embedding(
+    tokenizer: &larql_vindex::tokenizers::Tokenizer,
+    embeddings: &larql_vindex::ndarray::Array2<f32>,
+    text: &str,
+) -> Option<Vec<f32>> {
+    sentence_embedding_token_mean(tokenizer, embeddings, text)
+}
+
+/// Rich embedding via model forward pass. Captures at the specified layer.
+/// Returns the hidden state at the last token position — contextual, not bag-of-words.
+pub fn sentence_embedding_model(
+    tokenizer: &larql_vindex::tokenizers::Tokenizer,
+    weights: &larql_models::ModelWeights,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn larql_compute::ComputeBackend,
+    text: &str,
+    layer: usize,
+) -> Option<Vec<f32>> {
+    let encoding = tokenizer.encode(text, true).ok()?;
+    let ids: Vec<u32> = encoding.get_ids().to_vec();
+    if ids.is_empty() { return None; }
+
+    // Use the probe endpoint's capture — runs GPU prefill,
+    // returns pre_ffn_norm(h_post_attn) at the probe layer.
+    let vec = larql_inference::capture_knn_key_gpu(
+        weights, &ids, layer, index, backend,
+    )?;
+
+    Some(l2_norm(&vec))
+}
+
+/// Fallback: mean of token embeddings (no forward pass).
+fn sentence_embedding_token_mean(
     tokenizer: &larql_vindex::tokenizers::Tokenizer,
     embeddings: &larql_vindex::ndarray::Array2<f32>,
     text: &str,
@@ -124,6 +160,102 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 // ── Handlers ──
+
+/// Deep INSERT — uses model forward pass for embedding (slower but richer).
+pub async fn handle_rag_insert_deep(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RagInsertRequest>,
+) -> Result<Json<serde_json::Value>, ServerError> {
+    let model = state.model(None)
+        .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
+    let model = Arc::clone(model);
+    let fact = req.fact.clone();
+    let category = req.category.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let weights = model.get_or_load_weights()
+            .map_err(ServerError::InferenceUnavailable)?;
+        let backend = model.get_or_init_backend();
+        let _guard = match model.inference_lock.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        backend.reset_kv_cache();
+
+        let patched = model.patched.blocking_read();
+        let embed = sentence_embedding_model(
+            &model.tokenizer, weights, patched.base(), &**backend,
+            &fact, 12, // L12 — middle layer, semantic but not output-specific
+        ).ok_or_else(|| ServerError::Internal("model embedding failed".into()))?;
+
+        backend.reset_kv_cache();
+
+        state.rag_store.insert(RagEntry {
+            fact: fact.clone(),
+            category: category.clone(),
+            embedding: embed,
+        });
+
+        Ok::<_, ServerError>(serde_json::json!({
+            "status": "ok",
+            "fact": fact,
+            "method": "deep-L12",
+            "total_facts": state.rag_store.len(),
+        }))
+    })
+    .await
+    .map_err(|e| ServerError::Internal(e.to_string()))??;
+
+    Ok(Json(result))
+}
+
+/// Deep QUERY — uses model forward pass for query embedding.
+pub async fn handle_rag_query_deep(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RagQueryRequest>,
+) -> Result<Json<serde_json::Value>, ServerError> {
+    let model = state.model(None)
+        .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
+    let model = Arc::clone(model);
+    let query = req.query.clone();
+    let top_k = req.top_k;
+    let threshold = req.threshold;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let weights = model.get_or_load_weights()
+            .map_err(ServerError::InferenceUnavailable)?;
+        let backend = model.get_or_init_backend();
+        let _guard = match model.inference_lock.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        backend.reset_kv_cache();
+
+        let patched = model.patched.blocking_read();
+        let query_embed = sentence_embedding_model(
+            &model.tokenizer, weights, patched.base(), &**backend,
+            &query, 12,
+        ).ok_or_else(|| ServerError::Internal("model embedding failed".into()))?;
+
+        backend.reset_kv_cache();
+
+        let results = state.rag_store.query(&query_embed, top_k, threshold);
+
+        Ok::<_, ServerError>(serde_json::json!({
+            "query": query,
+            "method": "deep-L12",
+            "results": results.iter().map(|(e, cos)| serde_json::json!({
+                "fact": e.fact,
+                "category": e.category,
+                "cosine": (cos * 1000.0).round() / 1000.0,
+            })).collect::<Vec<_>>(),
+        }))
+    })
+    .await
+    .map_err(|e| ServerError::Internal(e.to_string()))??;
+
+    Ok(Json(result))
+}
 
 pub async fn handle_rag_insert(
     State(state): State<Arc<AppState>>,

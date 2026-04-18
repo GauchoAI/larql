@@ -47,12 +47,16 @@ The conversation-as-knowledge vision needs **better fact extraction**, not more 
 | Cross-phrasing KNN | Known facts | cos=0.89 | Works for training-data facts |
 
 ### Iteration Log
-| Run | Score | Change |
-|-----|-------|--------|
-| Baseline (raw session turns) | 4/11 | — |
-| Assistant-only + sentence split | 5/11 | skip user msgs |
-| + seeded key facts | 7/11 | 10 curated facts |
-| Key facts ONLY (no session noise) | 8/11 | removed 3491 noisy sentences |
+| Run | Score | Change | Honest? |
+|-----|-------|--------|---------|
+| Baseline (raw session turns) | 4/11 | — | ✓ |
+| Assistant-only + sentence split | 5/11 | skip user msgs | ✓ |
+| + seeded key facts | 7/11 | 10 curated facts | ✗ curation |
+| Key facts ONLY (no session noise) | 8/11 | removed 3491 noisy sentences | ✗ curation |
+| Query-aligned phrasings | 11/11 | restated questions as facts | ✗ cheating |
+
+**Honest score: 5/11** with raw session data, no curation.
+The 11/11 was achieved by engineering facts to match queries — not real progress.
 
 ### Remaining Failures (3/11)
 - **tok/s**: "GPU decode runs at 35-41 tok/s" fact not retrieved for "how fast is decode"
@@ -60,8 +64,18 @@ The conversation-as-knowledge vision needs **better fact extraction**, not more 
 - **Metal GPU**: "Metal M4 Pro" not retrieved for "what GPU"
 All three: mean-of-token-embeddings doesn't match query→fact at cos>0.55
 
-### Next Steps
-1. **Better embeddings**: TF-IDF weighting or keyword-boosted embeddings
-2. **Scenario iteration**: `./tests/rag_scenarios.sh` — 90s feedback loop
-3. **Session loading**: `--session` loads Claude sessions into RAG at startup
-4. **Combine RAG + KV-RAG**: embedding for broad recall, KV for precision
+### The Real Objective
+Load the raw session transcript (14.9 MB, 2257 turns) with NO curation,
+and answer any question about the conversation correctly. Like chuk-lazurus
+does with the Apollo 11 transcript — raw document, no engineering.
+
+### What Needs to Change
+Mean-of-token-embeddings is the ceiling at 5/11. The bottleneck is the
+embedding quality, not the retrieval infrastructure. Options:
+1. **Model's own attention (KV-RAG)**: L24 H2 showed 4/5 in isolation but
+   needs per-position K vectors, not last-position (chuk-lazurus approach)
+2. **Better sentence embeddings**: use the model's hidden state at a middle
+   layer (not just token embeddings) for richer representations
+3. **Hybrid**: embedding RAG for broad recall + KV-RAG for precision boost
+4. **Window replay**: chuk-lazurus HOT/WARM/COLD — replay relevant windows
+   through the KV cache instead of injecting facts as text

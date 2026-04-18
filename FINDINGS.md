@@ -103,74 +103,43 @@ chuk-lazurus extracts from **bf16 raw attention projections** (pre-RoPE).
 Q4_K quantization destroys the copy head's K vector quality.
 The copy head mechanism works in bf16 — we need bf16 K extraction.
 
-### What Needs to Change
-The copy head (L29 H4) is confirmed. The retrieval mechanism is known.
-The blocker is extracting K vectors in bf16 (not Q4_K from the KV cache).
+### Copy Head Q·K Is NOT a General Retrieval Mechanism (2026-04-18)
+The copy head does INTRA-prompt fact copying, not cross-prompt retrieval.
+Tested in pure bf16 via MLX — still weak for arbitrary fact matching.
 
-**Plan — three steps to conversation-as-knowledge:**
+| Test | Score | Notes |
+|------|-------|-------|
+| Cross-prompt Q·K (bf16) | 1/5 | "Miguel" dominates everything |
+| Answer-position K (bf16) | 2/5 | name + speed correct |
+| Same-context Q·K (bf16, one window) | 2/5 | port + speed — numbers only |
+| Q4_K KV cache K vectors | 2/5 | quantization makes it worse |
 
-1. **bf16 K extraction at L29 H4**
-   - Load bf16 attention weights for L29 (just Q/K projections, ~20 MB)
-   - Run K projection in bf16 on the hidden state at L29
-   - Store per-position K vectors for each conversation turn
-   - This is what chuk-lazurus does in `calibrate_arch.py`
+The copy head retrieves NUMBER tokens well (3000, 35) but not entity names.
+The calibration used fictional tokens (Voltara, Cerulion) — not representative
+of real conversation facts.
 
-2. **Q·K retrieval at inference time**
-   - On each user query, compute Q at L29 H4 (bf16 projection)
-   - Cosine score against stored K vectors
-   - Top-k retrieval with adaptive threshold
-   - Inject matched facts as RAG context OR vec_inject at L30
+### Revised Architecture — Retrieval ≠ Injection
+Retrieval and injection are SEPARATE mechanisms:
+- **Retrieval**: embedding RAG (token-mean, 5/11 honest) — the best we have
+- **Injection**: vec_inject at L30 (12 bytes/fact, zero prefill) — zero tokens
+- The copy head is for injection (coefficient extraction), not retrieval
+- Retrieval can use any mechanism — embeddings, BM25, hybrid
 
-3. **Session loading via K-vector index**
-   - Each conversation turn → K vectors at L29 H4 for each token position
-   - Store as vec_inject.npz (12 bytes per fact: token_id + coefficient)
-   - Load at startup, retrieve in <1ms (Metal matmul)
-   - Same format as chuk-lazurus — interoperable
+### Revised Plan (2026-04-18)
 
-### Vec_inject vs RAG — Decision Made
-RAG text injection costs prefill tokens (8 tokens/fact × 1000 facts = 200s).
-Vec_inject costs 12 bytes/fact, zero prefill. At scale, vec_inject wins by orders of magnitude.
+**Two independent tracks:**
 
-**Decision: implement vec_inject.** RAG text injection is the fallback.
+#### Track A: Improve Retrieval (embedding RAG) [M]
+The honest score is 5/11 with token-mean embeddings. The copy head Q·K
+doesn't work for cross-prompt retrieval. Better embeddings are the path:
 
-## Implementation Plan — Vec_inject for Conversation as Knowledge
+1. **BM25 keyword matching** — simple, handles "port" → "3000" directly
+2. **Hybrid BM25 + embedding** — BM25 for precision, embedding for recall
+3. **Better chunking** — sentence-level facts, not paragraph-level
+4. **Test with scenario suite** — `./tests/rag_scenarios.sh` (64s cycle)
 
-### Step 1: bf16 K extraction at L29 H4 [M]
-**Goal**: capture the copy head's K vector for each fact during INSERT.
-
-- Load f32/bf16 attention weights for L29 Q/K projections (~20 MB from SafeTensors)
-- Forward pass through layers 0–29 (can use existing Q4_K GPU pipeline for L0–28,
-  then bf16 Q/K projection at L29 only)
-- Extract K at query_head=4 (256-dim vector) for the last token position
-- Also extract coefficient: `c = dot(h_L30[last_pos], embed(answer_token))`
-  where answer_token is the key entity in the fact
-- Store per fact: `{k_vector: [256 floats], token_id: u32, coefficient: f32}`
-
-**Files**: `crates/larql-server/src/routes/kv_rag.rs` (update extract_k_vector),
-`crates/larql-inference/src/attention/gpu.rs` (bf16 Q/K projection at L29)
-
-**What exists**: f32 attention weights in SafeTensors (loaded as `weights.tensors`),
-embed matrix in `model.embeddings`. The per-layer decode path already runs
-through individual layers. Just need to do the K projection in f32 at L29
-instead of reading from Q4_K KV cache.
-
-### Step 2: Q·K retrieval at inference [S]
-**Goal**: find matching facts in <1ms using Metal matmul.
-
-- On each decode step, extract Q at L29 H4 (same bf16 projection)
-- `scores = K_matrix @ q_norm` — one Metal matmul (N_facts × 256)
-- Top-k with adaptive threshold: `max(0.15, mean_score × 2.0)`
-  (from chuk-lazurus: fixed thresholds fail at N>50)
-- Return matched fact indices + coefficients
-
-**Files**: `crates/larql-server/src/routes/kv_rag.rs` (query path),
-or integrate directly into predict.rs per-layer path
-
-**What exists**: KvRagStore already has cosine scoring. Need to switch
-from KV-cache K to bf16 K, and add Q extraction.
-
-### Step 3: Vec_inject at L30 [S]
-**Goal**: inject matched facts into residual stream, zero prefill tokens.
+#### Track B: Vec_inject for Zero-Token Injection [M]
+Once retrieval finds the right facts, inject them at zero cost:
 
 The injection formula (from chuk-lazurus):
 ```

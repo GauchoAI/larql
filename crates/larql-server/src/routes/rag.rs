@@ -94,8 +94,9 @@ pub fn sentence_embedding(
     sentence_embedding_token_mean(tokenizer, embeddings, text)
 }
 
-/// Rich embedding via model forward pass. Captures at the specified layer.
-/// Returns the hidden state at the last token position — contextual, not bag-of-words.
+/// Rich embedding via model forward pass. Mean-pools hidden states
+/// across ALL token positions at the specified layer.
+/// This gives a true contextual sentence embedding, not just last-position.
 pub fn sentence_embedding_model(
     tokenizer: &larql_vindex::tokenizers::Tokenizer,
     weights: &larql_models::ModelWeights,
@@ -108,13 +109,86 @@ pub fn sentence_embedding_model(
     let ids: Vec<u32> = encoding.get_ids().to_vec();
     if ids.is_empty() { return None; }
 
-    // Use the probe endpoint's capture — runs GPU prefill,
-    // returns pre_ffn_norm(h_post_attn) at the probe layer.
-    let vec = larql_inference::capture_knn_key_gpu(
-        weights, &ids, layer, index, backend,
-    )?;
+    let arch = &*weights.arch;
+    let hidden = weights.hidden_size;
+    let norm_offset = arch.norm_weight_offset();
 
-    Some(l2_norm(&vec))
+    // GPU prefill to populate KV cache with all positions
+    let gate_index: &dyn larql_vindex::GateIndex = index;
+    let (q4_ffn, ffn_is_q4k) = if let Some(mmap) = gate_index.interleaved_q4k_real_mmap_ref() {
+        (Some(mmap), true)
+    } else if let Some(mmap) = gate_index.interleaved_q4k_mmap_ref() {
+        (Some(mmap), true)
+    } else {
+        return None;
+    };
+    let q4_ffn = q4_ffn?;
+    let intermediate = gate_index.num_features(0);
+    let has_q4k = gate_index.attn_q4k_layer_data(0).is_some();
+    if !has_q4k || intermediate == 0 { return None; }
+
+    let q4_per_matrix = if ffn_is_q4k {
+        (intermediate * hidden).div_ceil(256) * 148
+    } else {
+        intermediate * hidden / 32 * 18
+    };
+    let ffn_format = if ffn_is_q4k {
+        larql_compute::QuantFormat::Q4_K
+    } else {
+        larql_compute::QuantFormat::Q4_0
+    };
+    let layers = larql_inference::layer_graph::pipeline_layer::build_pipeline_layers(
+        weights, index, 0..weights.num_layers,
+        q4_ffn, q4_per_matrix, ffn_format,
+    );
+    if layers.is_empty() { return None; }
+
+    let q_dim = weights.num_q_heads * weights.head_dim;
+    let kv_dim = weights.num_kv_heads * weights.head_dim;
+    let rope = arch.rope_base_for_layer(0) as f32;
+
+    backend.reset_kv_cache();
+    let embeds = larql_inference::forward::embed_tokens_pub(weights, &ids);
+    let seq_len = ids.len();
+
+    // Prefill all tokens, capture probe at target layer for EACH position
+    let mut mean = vec![0.0f32; hidden];
+    for p in 0..seq_len {
+        let x: Vec<f32> = embeds.row(p).to_vec();
+        if let Some((_result, probe_h)) = backend.decode_token_with_probe(
+            &layers, &x, hidden, intermediate, q_dim, kv_dim,
+            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+            Some(layer),
+        ) {
+            if let Some(ph) = probe_h {
+                // Apply pre_ffn_norm
+                let probe_arr = larql_inference::ndarray::Array2::from_shape_vec(
+                    (1, hidden), ph).unwrap();
+                let pre_ffn_key = if arch.has_post_norms() {
+                    arch.pre_feedforward_layernorm_key(layer)
+                } else {
+                    Some(arch.post_attention_layernorm_key(layer))
+                };
+                let h_ffn = match pre_ffn_key {
+                    Some(key) => larql_inference::forward::apply_norm(
+                        weights, &probe_arr, &key, norm_offset),
+                    None => probe_arr,
+                };
+                // Accumulate for mean pooling
+                for j in 0..hidden {
+                    mean[j] += h_ffn[[0, j]];
+                }
+            }
+        }
+    }
+
+    backend.reset_kv_cache();
+
+    // Mean pool
+    let inv = 1.0 / seq_len as f32;
+    for v in &mut mean { *v *= inv; }
+
+    Some(l2_norm(&mean))
 }
 
 /// Fallback: mean of token embeddings (no forward pass).

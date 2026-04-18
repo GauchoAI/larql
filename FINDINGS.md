@@ -79,13 +79,57 @@ does with the Apollo 11 transcript — raw document, no engineering.
 
 **Conclusion**: generic embeddings (token-mean, hidden states) can't do semantic retrieval on this model. Need the model's **specialized retrieval head** — the attention head trained to do fact lookup. This requires ablation analysis to find it.
 
+### Copy Head Discovery (CONFIRMED)
+calibrate_arch.py ablation on Gemma 3 4B IT (bf16):
+```
+  Head    mean Δ    coverage
+  H0:    -0.014      0%
+  H1:    -0.008      0%
+  H2:    +0.012      0%
+  H3:    +0.021     17%
+  H4:    +0.351     67%    ← THE COPY HEAD
+  H5:    +0.002     17%
+  H6:    +0.005     17%
+  H7:    +0.038     33%
+```
+- **query_head=4, retrieval_layer=29, injection_layer=30**
+- Zeroing H4: answer prob drops 0.80→0.20, 0.94→0.27, 0.53→0.08
+- H4 is 9× stronger than the next head (H7 at +0.038)
+- GQA mapping: query_head 4 → kv_head 2
+
+### Why Our KV-RAG Scored Low (2/5 at L29 H2)
+We extracted K from the **Q4_K quantized KV cache** (post-RoPE).
+chuk-lazurus extracts from **bf16 raw attention projections** (pre-RoPE).
+Q4_K quantization destroys the copy head's K vector quality.
+The copy head mechanism works in bf16 — we need bf16 K extraction.
+
 ### What Needs to Change
-Mean-of-token-embeddings is the ceiling at 5/11. The bottleneck is the
-embedding quality, not the retrieval infrastructure. Options:
-1. **Model's own attention (KV-RAG)**: L24 H2 showed 4/5 in isolation but
-   needs per-position K vectors, not last-position (chuk-lazurus approach)
-2. **Better sentence embeddings**: use the model's hidden state at a middle
-   layer (not just token embeddings) for richer representations
-3. **Hybrid**: embedding RAG for broad recall + KV-RAG for precision boost
-4. **Window replay**: chuk-lazurus HOT/WARM/COLD — replay relevant windows
-   through the KV cache instead of injecting facts as text
+The copy head (L29 H4) is confirmed. The retrieval mechanism is known.
+The blocker is extracting K vectors in bf16 (not Q4_K from the KV cache).
+
+**Plan — three steps to conversation-as-knowledge:**
+
+1. **bf16 K extraction at L29 H4**
+   - Load bf16 attention weights for L29 (just Q/K projections, ~20 MB)
+   - Run K projection in bf16 on the hidden state at L29
+   - Store per-position K vectors for each conversation turn
+   - This is what chuk-lazurus does in `calibrate_arch.py`
+
+2. **Q·K retrieval at inference time**
+   - On each user query, compute Q at L29 H4 (bf16 projection)
+   - Cosine score against stored K vectors
+   - Top-k retrieval with adaptive threshold
+   - Inject matched facts as RAG context OR vec_inject at L30
+
+3. **Session loading via K-vector index**
+   - Each conversation turn → K vectors at L29 H4 for each token position
+   - Store as vec_inject.npz (12 bytes per fact: token_id + coefficient)
+   - Load at startup, retrieve in <1ms (Metal matmul)
+   - Same format as chuk-lazurus — interoperable
+
+**Key question**: do we need the full chuk-lazurus vec_inject pipeline
+(12 bytes/fact, residual injection at L30), or is RAG context injection
+(text prepended to prompt) sufficient once retrieval quality improves?
+
+RAG is simpler (no residual surgery) but costs prefill tokens.
+Vec_inject is zero-token but requires per-fact coefficient extraction.

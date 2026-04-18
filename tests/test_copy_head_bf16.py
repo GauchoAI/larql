@@ -143,43 +143,178 @@ def cosine(a, b):
     d = sum(x*y for x,y in zip(a,b))
     return d  # already L2-normalized
 
+def extract_all_k_from_window(model, tokenizer, config, text):
+    """Prefill ALL facts as one window, extract K at L29 H4 for every position.
+    Returns list of (position, token_id, k_vector)."""
+    input_ids_list = tokenizer.encode(text)
+    input_ids = mx.array(input_ids_list)[None, :]
+
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = list(model.model.layers)
+        embed = model.model.embed_tokens
+    else:
+        layers = list(model.layers)
+        embed = model.embed_tokens
+
+    scale = getattr(config, "embedding_scale", None)
+    h = embed(input_ids)
+    if scale:
+        h = h * scale
+
+    seq_len = input_ids.shape[1]
+    mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len).astype(h.dtype)
+
+    for idx, lyr in enumerate(layers):
+        if idx == RETRIEVAL_LAYER:
+            attn = lyr.self_attn if hasattr(lyr, 'self_attn') else lyr
+            h_norm = lyr.input_layernorm(h) if hasattr(lyr, 'input_layernorm') else h
+            k = attn.k_proj(h_norm)  # (1, seq_len, kv_dim)
+            mx.eval(k)
+
+            kv_head = QUERY_HEAD // (8 // 4)
+            results = []
+            for pos in range(seq_len):
+                k_pos = k[0, pos, :]
+                num_kv_heads = k_pos.shape[0] // HEAD_DIM
+                k_heads = k_pos.reshape(num_kv_heads, HEAD_DIM)
+                vec = k_heads[kv_head].tolist()
+                norm = math.sqrt(sum(x*x for x in vec))
+                if norm > 1e-12:
+                    vec = [x / norm for x in vec]
+                results.append((pos, int(input_ids_list[pos]), vec))
+            return results
+
+        try:
+            out = lyr(h, mask=mask)
+        except TypeError:
+            out = lyr(h)
+        h = out.hidden_states if hasattr(out, "hidden_states") else (out[0] if isinstance(out, tuple) else out)
+
+    return []
+
+def extract_q_from_query(model, tokenizer, config, query_text, fact_window_text):
+    """Run query APPENDED to the fact window, extract Q at L29 H4 at query's last position.
+    This way Q attends to the facts in the same KV context."""
+    # Concatenate: facts window + separator + query
+    full_text = fact_window_text + "\n\n" + query_text
+    input_ids_list = tokenizer.encode(full_text)
+    input_ids = mx.array(input_ids_list)[None, :]
+
+    # Find where the query starts
+    fact_ids = tokenizer.encode(fact_window_text)
+    query_start = len(fact_ids) + len(tokenizer.encode("\n\n"))
+
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = list(model.model.layers)
+        embed = model.model.embed_tokens
+    else:
+        layers = list(model.layers)
+        embed = model.embed_tokens
+
+    scale = getattr(config, "embedding_scale", None)
+    h = embed(input_ids)
+    if scale:
+        h = h * scale
+
+    seq_len = input_ids.shape[1]
+    mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len).astype(h.dtype)
+
+    for idx, lyr in enumerate(layers):
+        if idx == RETRIEVAL_LAYER:
+            attn = lyr.self_attn if hasattr(lyr, 'self_attn') else lyr
+            h_norm = lyr.input_layernorm(h) if hasattr(lyr, 'input_layernorm') else h
+            q = attn.q_proj(h_norm)  # (1, seq_len, q_dim)
+            k = attn.k_proj(h_norm)  # (1, seq_len, kv_dim) — K for the full context
+            mx.eval(q, k)
+
+            # Q at the last position (query's last token)
+            q_last = q[0, -1, :]
+            num_q_heads = q_last.shape[0] // HEAD_DIM
+            q_heads = q_last.reshape(num_q_heads, HEAD_DIM)
+            q_vec = q_heads[QUERY_HEAD].tolist()
+            q_norm = math.sqrt(sum(x*x for x in q_vec))
+            if q_norm > 1e-12:
+                q_vec = [x / q_norm for x in q_vec]
+
+            # Also extract K for ALL positions in the fact window
+            kv_head = QUERY_HEAD // (8 // 4)
+            k_vecs = []
+            for pos in range(len(fact_ids)):
+                k_pos = k[0, pos, :]
+                num_kv_heads = k_pos.shape[0] // HEAD_DIM
+                k_heads = k_pos.reshape(num_kv_heads, HEAD_DIM)
+                vec = k_heads[kv_head].tolist()
+                norm = math.sqrt(sum(x*x for x in vec))
+                if norm > 1e-12:
+                    vec = [x / norm for x in vec]
+                k_vecs.append((pos, int(input_ids_list[pos]), vec))
+
+            return q_vec, k_vecs
+
+        try:
+            out = lyr(h, mask=mask)
+        except TypeError:
+            out = lyr(h)
+        h = out.hidden_states if hasattr(out, "hidden_states") else (out[0] if isinstance(out, tuple) else out)
+
+    return None, []
+
 def main():
     model, tokenizer, config = load_model()
 
-    # Answer tokens for each fact (the key entity)
     ANSWERS = ["Miguel", "Gemma", "3000", "35", "Metal"]
 
-    print("\n=== Extracting K vectors at answer position (bf16) ===")
-    k_vecs = []
-    for fact, answer in zip(FACTS, ANSWERS):
-        t0 = time.time()
-        k = extract_qk(model, tokenizer, config, fact, is_query=False, answer_token=answer)
-        elapsed = time.time() - t0
-        print(f"  K: {fact[:40]:40s} @ '{answer}' ({elapsed:.1f}s)")
-        k_vecs.append(k)
+    # Build one fact window with all facts
+    fact_window = "\n".join(FACTS)
+    print(f"\n=== Fact window ({len(tokenizer.encode(fact_window))} tokens) ===")
+    print(fact_window)
 
-    print("\n=== Q·K scoring ===")
-    print(f"{'Query':<35s} " + " ".join(f"{f[:8]:>8s}" for f in FACTS))
-    print("-" * (35 + 9 * len(FACTS)))
-
+    # For each query: run it appended to the fact window,
+    # extract Q at the query's last position,
+    # score Q against K at every fact-window position,
+    # find the highest-scoring position and which fact it belongs to.
+    print(f"\n=== Q·K retrieval (same-context, bf16) ===")
     hits = 0
     for query, keyword in QUERIES:
         t0 = time.time()
-        q = extract_qk(model, tokenizer, config, query, is_query=True)
-        scores = [cosine(q, k) for k in k_vecs]
-        elapsed = time.time() - t0
+        q_vec, k_vecs = extract_q_from_query(model, tokenizer, config, query, fact_window)
+        if q_vec is None:
+            print(f"  {query}: FAILED")
+            continue
 
-        best_idx = scores.index(max(scores))
+        # Score Q against each K position
+        scores = [(pos, tid, cosine(q_vec, kv)) for pos, tid, kv in k_vecs]
+        scores.sort(key=lambda x: -x[2])
+
+        # Find which fact the top position belongs to
+        fact_token_ids = tokenizer.encode(fact_window)
+        top_pos = scores[0][0]
+        top_score = scores[0][2]
+        top_token = tokenizer.decode([scores[0][1]])
+
+        # Map position back to fact index
+        running = 0
+        matched_fact = -1
+        for i, fact in enumerate(FACTS):
+            fact_len = len(tokenizer.encode(fact + "\n"))
+            if top_pos < running + fact_len:
+                matched_fact = i
+                break
+            running += fact_len
+
         correct_idx = next(i for i, f in enumerate(FACTS) if keyword.lower() in f.lower())
-        hit = "✓" if best_idx == correct_idx else "✗"
-        if best_idx == correct_idx:
+        hit = "✓" if matched_fact == correct_idx else "✗"
+        if matched_fact == correct_idx:
             hits += 1
 
-        score_strs = []
-        for i, s in enumerate(scores):
-            marker = "←" if i == best_idx else " "
-            score_strs.append(f"{s:+.3f}{marker}")
-        print(f"{query:<35s} {' '.join(score_strs)} {hit} ({elapsed:.1f}s)")
+        elapsed = time.time() - t0
+        matched_name = FACTS[matched_fact][:30] if matched_fact >= 0 else "?"
+        print(f"  {query:<35s} → score={top_score:.3f} pos={top_pos} tok='{top_token.strip()}' fact='{matched_name}' {hit} ({elapsed:.1f}s)")
+
+        # Show top 3
+        for pos, tid, sc in scores[:3]:
+            tok = tokenizer.decode([tid]).strip()
+            print(f"    pos={pos:3d} score={sc:.3f} tok='{tok}'")
 
     print(f"\n=== {hits}/{len(QUERIES)} correct ===")
 

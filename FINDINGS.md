@@ -69,6 +69,16 @@ Load the raw session transcript (14.9 MB, 2257 turns) with NO curation,
 and answer any question about the conversation correctly. Like chuk-lazurus
 does with the Apollo 11 transcript — raw document, no engineering.
 
+### Embedding Experiments (all failed to beat token-mean)
+| Method | Cosine Range | Discrimination | Verdict |
+|--------|-------------|----------------|---------|
+| Token-mean (bag of words) | 0.55-0.65 | some | **best so far** (5/11) |
+| L12 last-position hidden state | 0.37-0.52 | none | worse — encodes next-token, not meaning |
+| L12 mean-pooled all positions | 0.87-0.91 | none (everything matches) | worst — encodes conversation position |
+| KV-RAG L24 H2 (K vectors) | 0.72-0.81 | weak | 4/5 isolated, 3/9 in mix |
+
+**Conclusion**: generic embeddings (token-mean, hidden states) can't do semantic retrieval on this model. Need the model's **specialized retrieval head** — the attention head trained to do fact lookup. This requires ablation analysis to find it.
+
 ### What Needs to Change
 Mean-of-token-embeddings is the ceiling at 5/11. The bottleneck is the
 embedding quality, not the retrieval infrastructure. Options:

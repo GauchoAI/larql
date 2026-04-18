@@ -162,7 +162,9 @@ fn extract_k_and_coef(
     let mut last_hidden = vec![0.0f32; hidden];
     for p in 0..token_ids.len() {
         let x: Vec<f32> = embeds.row(p).to_vec();
-        let probe = if p == token_ids.len() - 1 { Some(RETRIEVAL_LAYER) } else { None };
+        // Probe at RETRIEVAL_LAYER - 1 to get h BEFORE L29's attention
+        // (output of L28 = input to L29). Then we apply L29's input norm + K/Q proj.
+        let probe = if p == token_ids.len() - 1 { Some(RETRIEVAL_LAYER - 1) } else { None };
         if let Some((result, probe_h)) = backend.decode_token_with_probe(
             &layers, &x, hidden, intermediate, q_dim, kv_dim,
             weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
@@ -269,7 +271,9 @@ fn extract_q(
 
     for p in 0..token_ids.len() {
         let x: Vec<f32> = embeds.row(p).to_vec();
-        let probe = if p == token_ids.len() - 1 { Some(RETRIEVAL_LAYER) } else { None };
+        // Probe at RETRIEVAL_LAYER - 1 to get h BEFORE L29's attention
+        // (output of L28 = input to L29). Then we apply L29's input norm + K/Q proj.
+        let probe = if p == token_ids.len() - 1 { Some(RETRIEVAL_LAYER - 1) } else { None };
         if let Some((_result, probe_h)) = backend.decode_token_with_probe(
             &layers, &x, hidden, intermediate, q_dim, kv_dim,
             weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,

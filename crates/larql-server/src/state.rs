@@ -91,6 +91,8 @@ pub struct AppState {
     pub rag_store: crate::routes::rag::RagStore,
     /// K-vector RAG store — attention-based retrieval.
     pub kv_rag_store: crate::routes::kv_rag::KvRagStore,
+    /// Vec_inject store — copy-head retrieval + residual injection.
+    pub vec_store: crate::routes::vec_inject::VecStore,
 }
 
 impl AppState {

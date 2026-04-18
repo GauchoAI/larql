@@ -338,6 +338,7 @@ async fn main() -> Result<(), BoxError> {
         describe_cache: DescribeCache::new(cli.cache_ttl),
         rag_store: routes::rag::RagStore::new(),
         kv_rag_store: routes::kv_rag::KvRagStore::new(),
+        vec_store: routes::vec_inject::VecStore::new(),
     });
 
     if cli.cache_ttl > 0 {

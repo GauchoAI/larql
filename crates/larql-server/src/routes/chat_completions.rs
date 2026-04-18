@@ -53,14 +53,7 @@ fn default_temperature() -> f32 { 0.7 }
 
 /// Convert OpenAI messages to Gemma 3 chat template.
 fn messages_to_gemma3_prompt(messages: &[ChatMessage]) -> String {
-    let has_memory = true; // TODO: check if RAG store has entries
-    let recall_instruction = if has_memory {
-        " You have access to conversation memory. ONLY when asked about our \
-        previous work or project details, output: ```recall\nkeyword1 keyword2\n``` \
-        with specific technical terms that would appear in the answer. \
-        Do NOT use recall for general knowledge questions (math, jokes, coding help). \
-        Only recall when you genuinely need information from our past conversation."
-    } else { "" };
+    let recall_instruction = "";
     let system = format!("You are a local coding assistant running directly on the user's machine. \
         You have full access to their filesystem and can run bash commands. \
         Always give complete answers with working code.{recall_instruction}");
@@ -157,7 +150,26 @@ pub async fn handle_chat_completions(
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        backend.reset_kv_cache();
+        // Auto-restore precomputed KV cache if available.
+        // This gives the model full conversation context without re-prefilling.
+        let kv_restored = {
+            let saved = state.kv_cache_store.saved.read().unwrap();
+            if let Some(ref s) = *saved {
+                super::kv_cache::restore_kv_cache(
+                    &**backend, s,
+                    weights.num_kv_heads, weights.head_dim,
+                );
+                tracing::info!("[chat] {} KV restored: {} tokens from {} layers",
+                    req_id, s.total_tokens, s.num_layers);
+                true
+            } else {
+                backend.reset_kv_cache();
+                false
+            }
+        };
+        if !kv_restored {
+            backend.reset_kv_cache();
+        }
 
         let cache = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
         let patched = model_cl.patched.blocking_read();

@@ -699,6 +699,7 @@ pub fn predict_honest_with_knn_ffn(
     // GPU pipeline: decode (seq=1) uses decode_token/full_pipeline_q4,
     // prefill (seq>1) uses prefill_q4 for GPU-accelerated multi-position inference.
     let seq_len = h.shape()[0];
+    let trace_path = std::env::var("LARQL_TRACE_PATH").ok().as_deref() == Some("1");
     let used_gpu = if backend.has_q4() {
         let gate_index: &dyn larql_vindex::GateIndex = index;
         // Prefer Q4_K FFN (Ollama-compatible) over Q4_0.
@@ -1159,6 +1160,47 @@ pub fn predict_honest_with_knn_ffn(
                     let mut t_kv_total = 0u128;
                     let mut t_ffn_total = 0u128;
                     let mut t_knn_total = 0u128;
+
+                    // When KV cache has precomputed context (from KV replay),
+                    // process each user token one at a time through KV-cached
+                    // attention. This correctly reads past K/V and appends at
+                    // position [existing_len + i], preserving the precomputed
+                    // context. The multi-token `run_attention_with_kv_backend_opt`
+                    // ignores the KV cache entirely and would overwrite it.
+                    if existing_len > 0 {
+                        use crate::ffn::WeightFfnGpu;
+                        let dense_ffn = WeightFfnGpu { weights, backend };
+                        let ffn: &dyn crate::ffn::FfnBackend = match ffn_override {
+                            Some(f) => f,
+                            None => &dense_ffn,
+                        };
+                        let embeds = crate::forward::embed_tokens_pub(weights, token_ids);
+                        let t_prefill = std::time::Instant::now();
+                        eprintln!("[kv-replay-prefill] processing {} user tokens with {} precomputed KV entries",
+                            seq_len, existing_len);
+                        for p in 0..seq_len {
+                            let h_tok = embeds.slice(ndarray::s![p..p+1, ..]).to_owned();
+                            for (rel_idx, abs_layer) in layer_range.clone().enumerate() {
+                                let h_in = if rel_idx == 0 { &h_tok } else { &h_cpu };
+                                let (h_post_attn, _past_len) =
+                                    crate::attention::gpu::run_attention_kv_cached_f32_opt(
+                                        weights, h_in, abs_layer, rel_idx, backend,
+                                        Some(index as &dyn larql_vindex::GateIndex))
+                                        .unwrap();
+                                let (h_out, _) = crate::forward::run_ffn(
+                                    weights, &h_post_attn, abs_layer, ffn, false);
+                                h_cpu = h_out;
+                            }
+                        }
+                        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+                        eprintln!("[kv-replay-prefill] {} tokens in {:.0}ms ({:.1}ms/tok)",
+                            seq_len, prefill_ms, prefill_ms / seq_len as f64);
+                        let hidden = h.shape()[1];
+                        let mut row = h.row_mut(seq_len - 1);
+                        for j in 0..hidden { row[j] = h_cpu[[0, j]]; }
+                        true
+                    } else {
+                    // Standard multi-token prefill (no precomputed KV).
                     for (rel_idx, abs_layer) in layer_range.clone().enumerate() {
                         let t_layer = std::time::Instant::now();
                         let t_a = std::time::Instant::now();
@@ -1272,6 +1314,7 @@ pub fn predict_honest_with_knn_ffn(
                     // Use correct CPU hidden state, finalize with GPU logits
                     h = h_cpu;
                     return finalize_logits(weights, tokenizer, &h, top_k, index, backend, norm_offset);
+                    } // end of else (standard prefill, no precomputed KV)
                 }
             } else { false }
         } else { false }

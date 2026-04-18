@@ -538,11 +538,11 @@ impl ComputeBackend for MetalBackend {
         let num_layers = layers.len();
         let mut cache_guard = self.kv_cache.lock().unwrap();
         if cache_guard.is_none() {
-            *cache_guard = Some(self.create_kv_cache(num_layers, 4096, num_kv_heads, head_dim));
+            *cache_guard = Some(self.create_kv_cache(num_layers, super::KV_MAX_SEQ, num_kv_heads, head_dim));
         }
         let kv = cache_guard.as_mut().unwrap();
         while kv.layers.len() < num_layers {
-            kv.layers.push(ops::kv_cache::LayerKVCache::new(&self.bufs, 4096, num_kv_heads, head_dim));
+            kv.layers.push(ops::kv_cache::LayerKVCache::new(&self.bufs, super::KV_MAX_SEQ, num_kv_heads, head_dim));
         }
         let geglu = if layers.first().is_some_and(|l| l.activation == crate::Activation::GeluTanh) {
             &self.geglu_gelu_tanh_pipeline
@@ -592,12 +592,12 @@ impl ComputeBackend for MetalBackend {
         let mut cache_guard = self.kv_cache.lock().unwrap();
         // Ensure KV cache exists with enough layers
         if cache_guard.is_none() {
-            *cache_guard = Some(self.create_kv_cache(layer + 1, 4096, num_kv_heads, head_dim));
+            *cache_guard = Some(self.create_kv_cache(layer + 1, super::KV_MAX_SEQ, num_kv_heads, head_dim));
         }
         let kv = cache_guard.as_mut().unwrap();
         // Extend if needed
         while kv.layers.len() <= layer {
-            kv.layers.push(ops::kv_cache::LayerKVCache::new(&self.bufs, 4096, num_kv_heads, head_dim));
+            kv.layers.push(ops::kv_cache::LayerKVCache::new(&self.bufs, super::KV_MAX_SEQ, num_kv_heads, head_dim));
         }
 
         let lc = &mut kv.layers[layer];
@@ -638,7 +638,7 @@ impl ComputeBackend for MetalBackend {
         let num_layers = layers.len();
         let mut cache_guard = self.kv_cache.lock().unwrap();
         if cache_guard.is_none() {
-            *cache_guard = Some(self.create_kv_cache(num_layers, 4096, num_kv_heads, head_dim));
+            *cache_guard = Some(self.create_kv_cache(num_layers, super::KV_MAX_SEQ, num_kv_heads, head_dim));
         }
         let kv = cache_guard.as_mut().unwrap();
         Some(MetalBackend::decode_token_batch(self, kv, layers, x_batch, batch_size,
@@ -669,7 +669,7 @@ impl ComputeBackend for MetalBackend {
         // Lazily initialize KV cache
         let mut cache_guard = self.kv_cache.lock().unwrap();
         if cache_guard.is_none() {
-            *cache_guard = Some(self.create_kv_cache(num_layers, 4096, num_kv_heads, head_dim));
+            *cache_guard = Some(self.create_kv_cache(num_layers, super::KV_MAX_SEQ, num_kv_heads, head_dim));
         }
         let kv = cache_guard.as_mut().unwrap();
         Some(MetalBackend::decode_token(self, kv, layers, x, hidden, inter, q_dim, kv_dim,
@@ -689,7 +689,7 @@ impl ComputeBackend for MetalBackend {
         let num_layers = layers.len();
         let mut cache_guard = self.kv_cache.lock().unwrap();
         if cache_guard.is_none() {
-            *cache_guard = Some(self.create_kv_cache(num_layers, 4096, num_kv_heads, head_dim));
+            *cache_guard = Some(self.create_kv_cache(num_layers, super::KV_MAX_SEQ, num_kv_heads, head_dim));
         }
         let kv = cache_guard.as_mut().unwrap();
         Some(MetalBackend::decode_token_with_probe(self, kv, layers, x, hidden, inter,

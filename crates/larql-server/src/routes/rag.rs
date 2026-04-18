@@ -126,6 +126,11 @@ impl RagStore {
     pub fn len(&self) -> usize {
         self.entries.read().unwrap().len()
     }
+
+    /// Return all stored fact texts (for compact KV rendering).
+    pub fn all_facts(&self) -> Vec<String> {
+        self.entries.read().unwrap().iter().map(|e| e.fact.clone()).collect()
+    }
 }
 
 /// Compute sentence embedding using the model's hidden state at a middle

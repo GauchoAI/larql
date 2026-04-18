@@ -40,6 +40,11 @@ use buffers::BufferCache;
 use f32_ops::F32Ops;
 use ops::q4_common::Q4Pipelines;
 
+/// Maximum sequence length for KV cache allocation.
+/// Gemma 3 4B supports 8K context. Limited to 8160 by the kv_attention
+/// shader's threadgroup scores array (32KB Metal threadgroup memory limit).
+pub const KV_MAX_SEQ: usize = 8160;
+
 /// Metal GPU compute backend.
 pub struct MetalBackend {
     queue: CommandQueue,
@@ -288,7 +293,7 @@ impl MetalBackend {
     pub fn kv_cache_mut(&self, num_layers: usize, num_kv_heads: usize, head_dim: usize) -> std::sync::MutexGuard<'_, Option<ops::kv_cache::KVCache>> {
         let mut guard = self.kv_cache.lock().unwrap();
         if guard.is_none() {
-            *guard = Some(self.create_kv_cache(num_layers, 4096, num_kv_heads, head_dim));
+            *guard = Some(self.create_kv_cache(num_layers, KV_MAX_SEQ, num_kv_heads, head_dim));
         }
         guard
     }

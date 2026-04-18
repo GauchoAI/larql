@@ -147,6 +147,121 @@ pub async fn handle_kv_stats(
     }
 }
 
+/// Render all RAG facts as compact bullet points, precompute into KV.
+/// This is the "compact facts" pipeline: focused context → near-perfect recall.
+pub async fn handle_compact(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ServerError> {
+    let facts = state.rag_store.all_facts();
+    if facts.is_empty() {
+        return Ok(Json(serde_json::json!({"status": "empty", "facts": 0})));
+    }
+
+    // Render facts as compact bullet points, capped at ~2000 chars (~500 tokens).
+    // Dedup and truncate individual facts.
+    let mut seen = std::collections::HashSet::new();
+    let mut rendered = String::new();
+    let mut included = 0usize;
+    for fact in &facts {
+        let trimmed = fact.trim();
+        if trimmed.is_empty() { continue; }
+        // Normalize for dedup: lowercase, strip trailing punctuation
+        let key: String = trimmed.to_lowercase()
+            .trim_end_matches(|c: char| c.is_ascii_punctuation())
+            .to_string();
+        if seen.contains(&key) { continue; }
+        seen.insert(key);
+        // Cap individual facts at 200 chars
+        let capped: String = trimmed.chars().take(200).collect();
+        let line = format!("- {capped}\n");
+        if rendered.len() + line.len() > 2000 { break; }
+        rendered.push_str(&line);
+        included += 1;
+    }
+
+    tracing::info!("[compact] rendering {} facts ({} unique) into {} chars",
+        facts.len(), included, rendered.len());
+
+    // Precompute into KV via the existing precompute pipeline
+    let model = state.model(None)
+        .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
+    let model = Arc::clone(model);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let weights = model.get_or_load_weights()
+            .map_err(ServerError::InferenceUnavailable)?;
+        let backend = model.get_or_init_backend();
+        let _guard = match model.inference_lock.lock() {
+            Ok(g) => g, Err(p) => p.into_inner(),
+        };
+
+        let system = "You are a helpful assistant. Use the following facts to answer questions accurately.";
+        let chat_prompt = format!(
+            "<start_of_turn>system\n{system}\n\nKnown facts:\n{rendered}<end_of_turn>\n"
+        );
+        let encoding = model.tokenizer.encode(chat_prompt.as_str(), true)
+            .map_err(|e| ServerError::Internal(format!("tokenize: {e}")))?;
+        let token_ids: Vec<u32> = encoding.get_ids().to_vec();
+        let num_tokens = token_ids.len();
+
+        tracing::info!("[compact] precomputing {} tokens from {} facts...", num_tokens, included);
+        let t0 = std::time::Instant::now();
+
+        let patched = model.patched.blocking_read();
+        let cache = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
+        let walk_ffn = if model.walk_only {
+            Some(larql_inference::WalkFfn::new_with_backend(
+                weights, patched.base(), 1024, &**backend,
+            ))
+        } else { None };
+        let ffn_override: Option<&dyn larql_inference::ffn::FfnBackend> =
+            walk_ffn.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
+
+        backend.reset_kv_cache();
+        let _result = larql_inference::predict_honest_with_knn_ffn(
+            weights, &model.tokenizer, &token_ids, 1,
+            patched.base(), &**backend, &cache,
+            0..weights.num_layers, None, ffn_override,
+        );
+
+        let prefill_s = t0.elapsed().as_secs_f64();
+
+        // Save KV state
+        let mut saved_layers = Vec::new();
+        for layer in 0..weights.num_layers {
+            if let Some((k, v, seq_len)) = backend.debug_read_kv_layer(layer) {
+                saved_layers.push((k, v, seq_len));
+            }
+        }
+        let saved = SavedKvState {
+            num_layers: saved_layers.len(),
+            total_tokens: num_tokens,
+            layers: saved_layers,
+        };
+        let size_mb = saved.size_bytes() as f64 / 1024.0 / 1024.0;
+
+        tracing::info!("[compact] done: {} tokens, {:.1} MB, {:.1}s",
+            num_tokens, size_mb, prefill_s);
+
+        *state.kv_cache_store.saved.write().unwrap() = Some(saved);
+        backend.reset_kv_cache();
+
+        Ok::<_, ServerError>(serde_json::json!({
+            "status": "ok",
+            "total_facts": facts.len(),
+            "included_facts": included,
+            "tokens": num_tokens,
+            "rendered_chars": rendered.len(),
+            "prefill_seconds": (prefill_s * 10.0).round() / 10.0,
+            "saved_mb": (size_mb * 10.0).round() / 10.0,
+        }))
+    })
+    .await
+    .map_err(|e| ServerError::Internal(e.to_string()))??;
+
+    Ok(Json(result))
+}
+
 /// Restore saved KV state into the backend's KV cache.
 /// Called before each chat completion if saved state exists.
 pub fn restore_kv_cache(

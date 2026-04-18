@@ -1,14 +1,11 @@
 //! KV-cached attention for token generation (seq=1 decode).
 //!
-//! Two kernels:
-//!   - kv_attention_fast: T ≤ 1024, small threadgroup scores array (4KB), high occupancy
-//!   - kv_attention: fallback for T > 1024 (16KB threadgroup scores)
-//!
-//! Both use simd_max/simd_sum for reductions and float4 Q·K dot products.
+//! `kv_attention` handles up to 8192 past tokens (32KB threadgroup scores).
+//! For Gemma 3 4B with 8K context window, this covers the full sequence.
+//! Uses simd_max/simd_sum for reductions and float4 Q·K dot products.
 
 pub const SHADER: &str = r#"
-// Fast decode attention — small threadgroup memory for high occupancy.
-// 4KB scores = max 1024 tokens. Enough for decode (grows by 1 per step).
+// Decode attention — 32KB scores = max 8192 tokens (Gemma 3 8K context).
 kernel void kv_attention(
     device const float* Q       [[buffer(0)]],
     device const float* K_cache [[buffer(1)]],
@@ -35,8 +32,9 @@ kernel void kv_attention(
 
     uint t_start = (window_size > 0 && T > window_size) ? T - window_size : 0;
 
-    // Small threadgroup scores — 4KB = max 1024 tokens
-    threadgroup float tg_scores[1024];
+    // Threadgroup scores — max 8160 tokens (32640 bytes, within 32KB limit
+    // with tg_sg_vals[8] = 32 bytes → total 32672 < 32768)
+    threadgroup float tg_scores[8160];
 
     // Phase 1: Q·K dot products + max
     float local_max = -1e30f;

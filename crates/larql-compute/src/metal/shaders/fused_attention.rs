@@ -91,7 +91,7 @@ kernel void fused_attention(
     }
 
     // ── Attention scores: Q · K^T for all k ≤ qi ──
-    threadgroup float tg_scores[4096]; // max seq_len
+    threadgroup float tg_scores[4096]; // max seq_len (fused attention prefill cap)
     threadgroup float tg_max = 0.0f;
     threadgroup float tg_sum = 0.0f;
 

@@ -397,3 +397,73 @@ threadgroup buffer overflow**:
 
 Additional fix: KV buffer size was 4096 max_seq (16 MB/layer), which panicked
 at 4120+ tokens. Increased to 8160 (32 MB/layer, total ~2.1 GB for 34 layers).
+
+### Head-to-Head: larql vs Ollama (2026-04-18)
+
+Same model (Gemma 3 4B Q4_K), same 12 facts, same 11 scenarios.
+Both on M4 Pro Metal GPU. Run sequentially to avoid contention.
+
+**larql**: facts baked into KV cache via `/v1/kv/compact` (234 tokens,
+one-time 5.8s precompute). Per-query: KV restore (~36ms) + batch prefill
+user tokens + decode.
+
+**Ollama**: facts in system prompt, re-prefilled on every query via
+llama.cpp flash attention batch prefill.
+
+| Metric | larql | Ollama |
+|--------|------:|-------:|
+| Score | **11/11** | 10/11 |
+| Avg latency | 751 ms | 556 ms |
+| RSS | **826 MB** | 4142 MB |
+
+**Quality**: larql wins (11/11 vs 10/11). Both fail the same joke-leak
+edge case, but larql's compact system prompt avoids it.
+
+**Latency**: Ollama 1.35x faster. Breakdown:
+- KV restore: ~36ms (larql advantage — Ollama re-prefills 234 tokens)
+- User query prefill: ~350ms (larql bottleneck — sequential per-token)
+- Decode: ~400ms for ~15 tokens (~38 tok/s both)
+
+The gap is in user query prefill. Ollama's llama.cpp uses flash attention
+to process all user tokens in parallel. larql's `decode_token_batch`
+processes tokens sequentially through 34 layers (causal dependency).
+
+**RAM**: larql 5x less. Model weights are mmap'd (OS manages paging).
+Ollama loads the full GGUF into process memory.
+
+**Crossover analysis**: At 234 tokens of facts, Ollama's batch prefill
+is fast (~100ms for 234 tokens). larql's KV restore is 36ms — saves only
+~64ms, which doesn't offset the user query prefill overhead. At 1000+
+tokens of facts, Ollama must re-prefill 1000+ tokens per query (~400ms+)
+while larql still restores in 36ms. The crossover favors larql at scale.
+
+### Batch Decode Bug Fix (2026-04-18)
+
+`decode_token_batch` had a norm-ordering bug: batched QKV projection at
+`bi=0` read `norm_buf` for all K positions, but only position 0's input
+norm had been dispatched. Metal serializes compute dispatches within an
+encoder, so QKV read uninitialized data for positions 1..K-1.
+
+**Fix**: Restructured into three phases per layer:
+1. Input norms for ALL K positions
+2. Batched QKV projection (reads weights once)
+3. Per-position QK-norm, RoPE, V-norm
+
+This fixed garbled output from batch prefill and improved latency from
+868ms to 751ms (the batch now produces correct hidden states).
+
+### Path to Beating Ollama on Latency
+
+The remaining 195ms gap comes from sequential user query prefill.
+Each token runs through all 34 layers one at a time (~20ms/tok).
+The fix: **flash attention with past KV** — a Metal shader that
+processes all user tokens against the restored KV cache in one dispatch.
+
+The `fused_attention_prefill` shader already does batch causal attention
+for self-contained prompts. Extending it to read past K/V from the
+cache would eliminate the per-position attention loop. The FFN is
+inherently sequential (token i's output feeds token i+1's input), but
+attention can be parallelized since each position's Q only reads past K/V.
+
+Projected improvement: user prefill from ~350ms to ~50ms, total from
+751ms to ~450ms — beating Ollama's 556ms.

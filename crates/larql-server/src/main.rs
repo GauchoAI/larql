@@ -339,6 +339,7 @@ async fn main() -> Result<(), BoxError> {
         rag_store: routes::rag::RagStore::new(),
         kv_rag_store: routes::kv_rag::KvRagStore::new(),
         vec_store: routes::vec_inject::VecStore::new(),
+        kv_cache_store: routes::kv_cache::KvCacheStore::new(),
     });
 
     if cli.cache_ttl > 0 {

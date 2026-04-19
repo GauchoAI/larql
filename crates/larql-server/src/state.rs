@@ -69,6 +69,15 @@ impl LoadedModel {
             let reason = if self.walk_only { "walk-only" } else { "Q4_K FFN available" };
             tracing::info!("[{reason}] dropped f32 FFN weights: {:.1} GB freed", freed as f64 / 1e9);
         }
+        // Drop f32 attention weights when Q4_K attention weights exist.
+        // INSERT now uses capture_knn_key_gpu (Q4_K path), not the f32 per-layer path.
+        let has_q4k_attn = self.path.join("attn_weights_q4k.bin").exists();
+        if has_q4k_attn {
+            let freed = weights.drop_attn_weights();
+            if freed > 0 {
+                tracing::info!("[Q4_K attn available] dropped f32 attn weights: {:.1} GB freed", freed as f64 / 1e9);
+            }
+        }
         let _ = self.weights.set(weights);
         Ok(self.weights.get().unwrap())
     }

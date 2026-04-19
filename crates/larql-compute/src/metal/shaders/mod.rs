@@ -40,6 +40,7 @@ pub mod graph_walk_knn;
 pub mod f32_sparse_walk;
 pub mod mega_kernel;
 pub mod q4k_fused_norm_matvec;
+pub mod q4k_indexed_matvec;
 
 /// Concatenate all shaders into one MSL source string for compilation.
 pub fn all_shaders() -> String {
@@ -95,5 +96,7 @@ pub fn all_shaders() -> String {
     src.push_str(mega_kernel::TEST_SHADER);
     // Fused norm+matvec (eliminates norm dispatch)
     src.push_str(q4k_fused_norm_matvec::SHADER);
+    // Indexed matvec (sparse FFN — read only active rows)
+    src.push_str(q4k_indexed_matvec::SHADER);
     src
 }

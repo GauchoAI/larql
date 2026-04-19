@@ -1,0 +1,21 @@
+# Strong LoRA — survives Q4_K quantization
+# Higher rank + all layers + more iterations = deeper embedding
+
+fine_tune_type: lora
+num_layers: 34          # ALL layers (was 16)
+lora_parameters:
+  rank: 32              # Double rank (was 16)
+  alpha: 64             # 2x rank
+  dropout: 0.05
+  scale: 2.0
+
+learning_rate: 2e-4     # Slightly higher LR
+batch_size: 1
+iters: 1000             # More iterations (was 600)
+val_batches: 5
+steps_per_report: 10
+steps_per_eval: 100
+save_every: 200
+max_seq_length: 512
+grad_checkpoint: true
+seed: 42

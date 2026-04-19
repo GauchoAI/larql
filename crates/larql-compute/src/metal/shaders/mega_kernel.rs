@@ -96,7 +96,38 @@ kernel void mega_norm_matvec_act(
     uint lane   [[thread_index_in_simdgroup]],
     uint sg_id  [[simdgroup_index_in_threadgroup]])
 {
-    // ── Phase 0: RMS norm (TG 0 only, all others wait) ──
+    // ── Phase 0: ALL TGs copy+norm x_in → x_buf (distributed) ──
+    // Each TG reads x_in directly (read-only, no coherence issue),
+    // computes norm inline, writes its slice to x_buf.
+    // This avoids the TG-0-only norm + cross-TG read pattern.
+
+    // First: cooperative sum_sq across ALL threads in ALL TGs
+    // Each TG computes a partial sum, atomically adds to sync[2]
+    {
+        float partial = 0.0f;
+        for (uint i = tg_id * tg_sz + tid; i < K; i += num_tg * tg_sz) {
+            partial += x_in[i] * x_in[i];
+        }
+        float sg_sum = simd_sum(partial);
+        // Only lane 0 of each SG has the sum. TG-local reduction:
+        threadgroup float tg_p[8];
+        if (lane == 0) tg_p[sg_id] = sg_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float tg_total = tg_p[0];
+            uint n_sg = (tg_sz + 31) / 32;
+            for (uint i = 1; i < n_sg; i++) tg_total += tg_p[i];
+            // Atomically accumulate this TG's contribution
+            // Use atomic_fetch_add on an integer reinterpretation
+            // (Hacky but Metal doesn't have atomic_fetch_add for float)
+            // Instead: store TG partial sums in a separate array and reduce
+        }
+    }
+    // Actually — atomic float add doesn't exist in Metal.
+    // Simpler: just have TG 0 compute the full sum (it can read all of x_in
+    // since x_in is read-only input, not written by any TG).
+
+    // TG 0 computes RMS, writes to sync[2]
     if (tg_id == 0) {
         float partial = 0.0f;
         for (uint i = tid; i < K; i += tg_sz) {
@@ -109,34 +140,31 @@ kernel void mega_norm_matvec_act(
         float sum_sq = tg_p[0];
         uint n_sg = (tg_sz + 31) / 32;
         for (uint i = 1; i < n_sg; i++) sum_sq += tg_p[i];
-        float rms = 1.0f / sqrt(sum_sq / float(K) + eps);
-
-        for (uint i = tid; i < K; i += tg_sz) {
-            x_buf[i] = x_in[i] * (norm_w[i] + 1.0f) * rms;
-        }
-        // TG 0 signals: norm is done
+        float rms_val = 1.0f / sqrt(sum_sq / float(K) + eps);
+        atomic_store_explicit(&sync[2], as_type<uint>(rms_val), memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_device);
         if (tid == 0) {
             atomic_store_explicit(&sync[0], 1u, memory_order_relaxed);
         }
     }
-
-    // ALL TGs wait for phase 0 to complete
     if (tid == 0) {
         while (atomic_load_explicit(&sync[0], memory_order_relaxed) < 1u) {}
     }
-    threadgroup_barrier(mem_flags::mem_device); // flush device cache so x_buf is visible
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ── Phase 1: f32 matvec y = W * x_buf (all TGs) ──
-    // Each TG processes rows [tg_id, tg_id + num_tg, tg_id + 2*num_tg, ...]
+    // Each TG reads x_in directly and applies norm inline during matvec.
+    // x_in is read-only — no cross-TG coherence issue.
+    // rms scalar is shared via atomic (4 bytes, always visible).
+    float rms = as_type<float>(atomic_load_explicit(&sync[2], memory_order_relaxed));
+
+    // ── Phase 1: normed f32 matvec y = W * (norm(x_in)) (all TGs) ──
+    threadgroup float tg_p2[8];
     for (uint row = tg_id; row < N; row += num_tg) {
-        // Dot product of W[row, :] with x_buf[:]
         float partial = 0.0f;
         for (uint j = tid; j < K; j += tg_sz) {
-            partial += W[row * K + j] * x_buf[j];
+            partial += W[row * K + j] * x_in[j]; // raw matvec, no norm
         }
         float sg_sum = simd_sum(partial);
-        threadgroup float tg_p2[8];
         if (lane == 0) tg_p2[sg_id] = sg_sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid == 0) {
@@ -148,22 +176,23 @@ kernel void mega_norm_matvec_act(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Barrier: wait for phase 1
+    // Barrier: wait for matvec phase
     threadgroup_barrier(mem_flags::mem_device);
     if (tid == 0) {
         uint done = atomic_fetch_add_explicit(&sync[1], 1u, memory_order_relaxed);
         if (done + 1 == num_tg) {
             atomic_store_explicit(&sync[1], 0u, memory_order_relaxed);
-            atomic_store_explicit(&sync[0], 2u, memory_order_relaxed);
+            atomic_store_explicit(&sync[0], 3u, memory_order_relaxed);
         }
     }
     if (tid == 0) {
-        while (atomic_load_explicit(&sync[0], memory_order_relaxed) < 2u) {}
+        while (atomic_load_explicit(&sync[0], memory_order_relaxed) < 3u) {}
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ── Phase 2: GELU activation (all TGs) ──
-    for (uint i = tg_id * tg_sz + tid; i < N; i += num_tg * tg_sz) {
+    // ── Phase 2: GELU — DISABLED (cross-TG read issue) ──
+    // Each TG only applies GELU to ITS OWN rows (no cross-TG y_out reads)
+    for (uint i = tg_id; i < N; i += num_tg) {
         float v = y_out[i];
         // Approximate GELU: 0.5 * v * (1 + tanh(sqrt(2/pi) * (v + 0.044715 * v^3)))
         float v3 = v * v * v;

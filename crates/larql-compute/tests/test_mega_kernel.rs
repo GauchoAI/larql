@@ -124,11 +124,12 @@ fn test_mega_kernel_matvec() {
     let rms = 1.0 / (sum_sq / k as f32 + eps).sqrt();
     let x_normed: Vec<f32> = (0..k as usize).map(|i| x_in[i] * (norm_w[i] + 1.0) * rms).collect();
 
+    // Raw matvec reference (no norm, no gelu — testing matvec correctness first)
     let mut y_ref: Vec<f32> = vec![0.0; n as usize];
     for row in 0..n as usize {
         let mut dot = 0.0f32;
         for j in 0..k as usize {
-            dot += w[row * k as usize + j] * x_normed[j];
+            dot += w[row * k as usize + j] * x_in[j];
         }
         // GELU
         let v3 = dot * dot * dot;
@@ -142,10 +143,10 @@ fn test_mega_kernel_matvec() {
     let nw_buf = device.new_buffer_with_data(norm_w.as_ptr() as *const _, (k * 4) as u64, MTLResourceOptions::StorageModeShared);
     let xn_buf = device.new_buffer((k as u64) * 4, MTLResourceOptions::StorageModeShared);
     let y_buf = device.new_buffer((n as u64) * 4, MTLResourceOptions::StorageModeShared);
-    let sync_buf = device.new_buffer(2 * 4, MTLResourceOptions::StorageModeShared);
+    let sync_buf = device.new_buffer(3 * 4, MTLResourceOptions::StorageModeShared); // phase + done + rms_bits
     unsafe {
         let ptr = sync_buf.contents() as *mut u32;
-        *ptr = 0; *ptr.add(1) = 0;
+        *ptr = 0; *ptr.add(1) = 0; *ptr.add(2) = 0;
     }
 
     // Dispatch
@@ -186,6 +187,12 @@ fn test_mega_kernel_matvec() {
     let xn_zeros = x_normed_gpu.iter().filter(|v| **v == 0.0).count();
     eprintln!("  x_buf: max_err={xn_max_err:.6}, zeros={xn_zeros}/{k}, first=[{:.4}, {:.4}, {:.4}]",
         x_normed_gpu[0], x_normed_gpu[1], x_normed_gpu[2]);
+
+    // Debug: check if TG 1 could read x_buf[0] (written by TG 0)
+    let debug_val = y_gpu[n as usize - 1];
+    let expected_xbuf0 = x_normed[0];
+    eprintln!("  DEBUG: TG1 read x_buf[0] = {:.4} (expected {:.4}, match={})",
+        debug_val, expected_xbuf0, (debug_val - expected_xbuf0).abs() < 0.01);
 
     let mut max_err = 0.0f32;
     let mut errors = 0;

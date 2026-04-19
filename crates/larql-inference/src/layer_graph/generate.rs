@@ -38,7 +38,7 @@ pub fn generate(
     let has_q8 = index.attn_q8_layer_data(layer_range.start).is_some();
 
     if !backend.has_q4() || q4_ffn.is_none() {
-        let r = super::predict::predict_honest(weights, tokenizer, token_ids, 5, index, backend, cached_layers, layer_range);
+        let r = super::predict::predict_honest_with_knn_ffn(weights, tokenizer, token_ids, 5, index, backend, cached_layers, layer_range, None, None);
         return GenerateResult {
             tokens: r.predictions.into_iter().take(1).collect(),
             prefill_ms: 0.0,
@@ -49,7 +49,7 @@ pub fn generate(
     let q4_ffn_mmap = q4_ffn.unwrap();
     let intermediate = gate_index.num_features(layer_range.start);
     if intermediate == 0 || (!has_q4k && !has_q8) {
-        let r = super::predict::predict_honest(weights, tokenizer, token_ids, 5, index, backend, cached_layers, layer_range);
+        let r = super::predict::predict_honest_with_knn_ffn(weights, tokenizer, token_ids, 5, index, backend, cached_layers, layer_range, None, None);
         return GenerateResult {
             tokens: r.predictions.into_iter().take(1).collect(),
             prefill_ms: 0.0,

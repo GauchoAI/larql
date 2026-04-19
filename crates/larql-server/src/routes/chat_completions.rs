@@ -159,8 +159,10 @@ pub async fn handle_chat_completions(
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        // Auto-restore precomputed KV cache if available.
-        // This gives the model full conversation context without re-prefilling.
+        let t_total = std::time::Instant::now();
+
+        // Phase 1: KV restore
+        let t_kv = std::time::Instant::now();
         let kv_restored = {
             let saved = state.kv_cache_store.saved.read().unwrap();
             if let Some(ref s) = *saved {
@@ -179,6 +181,7 @@ pub async fn handle_chat_completions(
         if !kv_restored {
             backend.reset_kv_cache();
         }
+        let kv_ms = t_kv.elapsed().as_secs_f64() * 1000.0;
 
         let cache = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
         let patched = model_cl.patched.blocking_read();
@@ -199,12 +202,14 @@ pub async fn handle_chat_completions(
             },
         );
 
-        // Prefill
+        // Phase 2: Prefill (user query tokens through all layers)
+        let t_prefill = std::time::Instant::now();
         let prefill = larql_inference::predict_honest_with_knn_ffn(
             weights, &model_cl.tokenizer, &ids, 20,
             patched.base(), &**backend, &cache,
             0..weights.num_layers, knn_opt, ffn_override,
         );
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
 
         // KNN override
         let first_label = prefill.predictions.first().map(|(s,_)| s.as_str()).unwrap_or("");
@@ -339,9 +344,11 @@ pub async fn handle_chat_completions(
             }
         }
         let decode_s = t_decode.elapsed().as_secs_f64();
+        let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
         let tok_s = if decode_s > 0.0 { token_count as f64 / decode_s } else { 0.0 };
-        tracing::info!("[chat] {} done: {} tokens in {:.1}s ({:.1} tok/s)",
-            req_id, token_count, decode_s, tok_s);
+        tracing::info!("[chat] {} done: {} tokens in {:.1}s ({:.1} tok/s) | kv={:.0}ms prefill={:.0}ms decode={:.0}ms total={:.0}ms",
+            req_id, token_count, decode_s, tok_s,
+            kv_ms, prefill_ms, decode_s * 1000.0, total_ms);
         let _ = tx.blocking_send(Ok(oai_done()));
     });
 

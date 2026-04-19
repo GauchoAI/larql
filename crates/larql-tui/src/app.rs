@@ -50,12 +50,20 @@ impl AppState {
         }
     }
 
-    /// Build chat messages — just the user message.
-    /// Facts and workflows are injected into the model via /v1/insert
-    /// (KNN overlay / KV cache), NOT via system prompt stuffing.
-    /// This keeps the prompt clean and the context window minimal.
+    /// Build chat messages — "system prompt" trigger + user message.
+    /// The phrase "system prompt" is a KNN trigger that the model's
+    /// residual at L26 matches against the stored expansion.
+    /// When matched, the KNN overlay force-injects the full annotation
+    /// instructions (~124 tokens) into the decode stream.
+    /// No system prompt stuffing — the model gets the instructions
+    /// through its own weights/activations.
     pub fn build_chat_messages(&self) -> Vec<ChatMsg> {
         let mut msgs = Vec::new();
+        // System message with just the trigger phrase
+        msgs.push(ChatMsg {
+            role: "system".into(),
+            content: "system prompt".into(),
+        });
         if let Some(msg) = self
             .messages
             .iter()

@@ -77,3 +77,24 @@ kernel void q4k_indexed_matvec(
 
 pub const ROWS_PER_TG: u64 = 4; // 4 simdgroups per TG, 1 row per SG
 pub const THREADS_PER_TG: u64 = 128; // 4 × 32
+
+/// Threshold-based index selection: finds indices where |gate[i]| > threshold.
+/// Uses atomic counter for compact output.
+pub const SELECT_SHADER: &str = r#"
+kernel void select_active_indices(
+    device const float*  gate     [[buffer(0)]],   // [N] gate outputs
+    device uint*         indices  [[buffer(1)]],   // [N] output: active indices (compact)
+    device atomic_uint*  count    [[buffer(2)]],   // [1] number of active indices
+    constant uint&       N        [[buffer(3)]],
+    constant float&      threshold[[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= N) return;
+    float v = gate[tid];
+    // GELU: if |gate| is small, GELU(gate) ≈ 0, feature is inactive
+    if (abs(v) > threshold) {
+        uint pos = atomic_fetch_add_explicit(count, 1u, memory_order_relaxed);
+        indices[pos] = tid;
+    }
+}
+"#;

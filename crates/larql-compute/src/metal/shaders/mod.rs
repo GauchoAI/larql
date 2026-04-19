@@ -98,5 +98,6 @@ pub fn all_shaders() -> String {
     src.push_str(q4k_fused_norm_matvec::SHADER);
     // Indexed matvec (sparse FFN — read only active rows)
     src.push_str(q4k_indexed_matvec::SHADER);
+    src.push_str(q4k_indexed_matvec::SELECT_SHADER);
     src
 }

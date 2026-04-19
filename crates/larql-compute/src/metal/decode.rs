@@ -780,11 +780,82 @@ impl MetalBackend {
                         let gate_is_q6k = layer.gate.format == crate::QuantFormat::Q6_K;
                         let up_is_q6k = layer.up.format == crate::QuantFormat::Q6_K;
                         let n_tgs_per_mat = (inter as u64).div_ceil(q4k_gu::ROWS_PER_TG);
-                        // DIAGNOSTIC: LARQL_SEPARATE_GATE_UP=1 bypasses the fused gate_up kernel
-                        // and uses two independent matvec dispatches. Also required when gate
-                        // or up is Q6_K (fused kernel only accepts Q4_K).
-                        let separate_gate_up = std::env::var("LARQL_SEPARATE_GATE_UP").ok().as_deref() == Some("1")
-                            || gate_is_q6k || up_is_q6k;
+
+                        // SPARSE FFN: gate → select active → indexed up → full GEGLU+down
+                        let sparse_ffn = std::env::var("LARQL_SPARSE_FFN").ok().as_deref() == Some("1")
+                            && !gate_is_q6k && !up_is_q6k;
+                        if sparse_ffn {
+                            use crate::metal::shaders::q4k_indexed_matvec as q4k_ix;
+                            // Step 1: Gate matvec (full — reads all 10240 rows)
+                            let n_tgs_gate = (inter as u64).div_ceil(q4k::ROWS_PER_TG);
+                            enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline);
+                            enc.set_buffer(0, Some(&gate_bufs[l]), 0);
+                            enc.set_buffer(1, Some(&ffn_norm_out), 0);
+                            enc.set_buffer(2, Some(&gate_out), 0);
+                            enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                            enc.dispatch_thread_groups(MTLSize::new(n_tgs_gate, 1, 1),
+                                MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
+
+                            // Step 2: Select active indices (|gate| > 0.1)
+                            let indices_buf = self.bufs.output((inter as u64) * 4); // max inter indices
+                            let count_buf = self.bufs.output(4u64); // atomic counter
+                            // Zero the counter
+                            let zero_cmd = self.queue.new_command_buffer();
+                            let zero_blit = zero_cmd.new_blit_command_encoder();
+                            zero_blit.fill_buffer(&count_buf, metal::NSRange::new(0, 4), 0);
+                            zero_blit.end_encoding();
+                            zero_cmd.commit();
+                            zero_cmd.wait_until_completed();
+
+                            let threshold: f32 = 0.1;
+                            enc.set_compute_pipeline_state(&self.select_active_pipeline);
+                            enc.set_buffer(0, Some(&gate_out), 0);
+                            enc.set_buffer(1, Some(&indices_buf), 0);
+                            enc.set_buffer(2, Some(&count_buf), 0);
+                            enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(4, 4, &threshold as *const f32 as *const std::ffi::c_void);
+                            enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1),
+                                MTLSize::new(256, 1, 1));
+
+                            // Step 3: Indexed up matvec (only active rows)
+                            // We need to know K_active to size the dispatch.
+                            // Problem: K_active is computed by the GPU (atomic counter).
+                            // We'd need to read it back (GPU→CPU roundtrip) or use
+                            // indirect dispatch. For now, dispatch for ALL inter rows
+                            // but the indexed kernel only processes valid indices.
+                            let n_tgs_up = (inter as u64).div_ceil(q4k_ix::ROWS_PER_TG);
+                            enc.set_compute_pipeline_state(&self.q4k_indexed_pipeline);
+                            enc.set_buffer(0, Some(&up_bufs[l]), 0);
+                            enc.set_buffer(1, Some(&ffn_norm_out), 0);
+                            enc.set_buffer(2, Some(&up_out), 0);
+                            enc.set_buffer(3, Some(&indices_buf), 0);
+                            enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(5, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                            // Dispatch for all — the kernel reads indices, out-of-range
+                            // indices produce garbage but we only use 0..K_active results.
+                            // TODO: use indirect dispatch for exact sizing
+                            enc.dispatch_thread_groups(MTLSize::new(n_tgs_up, 1, 1),
+                                MTLSize::new(q4k_ix::THREADS_PER_TG, 1, 1));
+
+                            // Step 4: Scatter up results back to full-size buffer
+                            // The indexed matvec wrote to up_out[0..K_active] compactly.
+                            // But GEGLU+down expects up_out[i] at the ORIGINAL index.
+                            // For now: fall through to full up matvec (correctness first).
+                            // TODO: scatter kernel or modified GEGLU that uses indices.
+                            enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline);
+                            enc.set_buffer(0, Some(&up_bufs[l]), 0);
+                            enc.set_buffer(1, Some(&ffn_norm_out), 0);
+                            enc.set_buffer(2, Some(&up_out), 0);
+                            enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                            enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                            enc.dispatch_thread_groups(MTLSize::new(n_tgs_gate, 1, 1),
+                                MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
+                        }
+
+                        let separate_gate_up = !sparse_ffn && (
+                            std::env::var("LARQL_SEPARATE_GATE_UP").ok().as_deref() == Some("1")
+                            || gate_is_q6k || up_is_q6k);
                         if separate_gate_up {
                             let dispatch_single = |enc_ref: &metal::ComputeCommandEncoderRef,
                                                     w_buf: &metal::Buffer,

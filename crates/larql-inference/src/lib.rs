@@ -76,7 +76,6 @@ pub use layer_graph::{
     predict_honest_with_knn_ffn, capture_residual_post_attn_norm,
     capture_residual_post_attn_norm_ffn, capture_knn_key_gpu, capture_knn_key_perlayer,
     generate, GenerateResult, AttentionCache,
-    hybrid::predict_hybrid,
     trace_with_graph, build_adaptive_graph,
     // Analysis/validation
     TemplatePattern, TemplateUniverse, GuidedWalkLayerGraph,

@@ -26,7 +26,7 @@ pub mod ops;        // modular: ops/mod.rs → one file per operation
 pub mod calibrate;
 mod direct_ops;
 mod decode;
-mod decode_hybrid;
+// decode_hybrid removed — was experimental GPU-attn + CPU-FFN split, never integrated
 mod pipeline;
 mod prefill;
 mod trait_impl;

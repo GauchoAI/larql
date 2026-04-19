@@ -230,7 +230,7 @@ pub async fn handle_chat_completions(
         let first_tok = model_cl.tokenizer.decode(&[next], true).unwrap_or_default();
         if tx.blocking_send(Ok(oai_chunk(&req_id, &first_tok))).is_err() { return; }
 
-        // Decode loop — accumulate text to detect recall blocks
+        // Decode loop
         let t_decode = std::time::Instant::now();
         let mut token_count = 1usize;
         let mut generated_text = first_tok.clone();

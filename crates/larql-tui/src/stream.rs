@@ -12,7 +12,7 @@ pub async fn chat_stream(
         .unwrap_or_else(|_| reqwest::Client::new());
 
     let req = ChatRequest {
-        model: "gemma-3-4b".into(),
+        model: std::env::var("LARQL_MODEL").unwrap_or_else(|_| "gemma-3-4b".into()),
         messages,
         stream: true,
     };

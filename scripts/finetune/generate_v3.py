@@ -120,6 +120,83 @@ add("The project larql runs Gemma 3 4B at 42 tok/s on Metal GPU with Q4_K quanti
     f"{fact('compute', 'Metal GPU', 'infrastructure', 'high', 'user', 'model')}\n\n"
     f"{fact('quantization', 'Q4_K', 'model', 'high', 'user', 'model')}")
 
+# ── Multi-fact extraction (CRITICAL: model must emit ALL facts from one message) ──
+
+add("My name is Alice, I prefer Python, and I live in Tokyo",
+    f"Got it, Alice — Python dev in Tokyo!\n\n"
+    f"{fact('user name', 'Alice', 'identity', 'high')}\n\n"
+    f"{fact('preferred language', 'Python', 'preferences', 'high')}\n\n"
+    f"{fact('location', 'Tokyo', 'identity', 'high')}")
+
+add("I'm Bob, a frontend dev at Stripe, using React and TypeScript",
+    f"Bob at Stripe — great frontend stack.\n\n"
+    f"{fact('user name', 'Bob', 'identity', 'high')}\n\n"
+    f"{fact('role', 'frontend developer', 'identity', 'high')}\n\n"
+    f"{fact('company', 'Stripe', 'identity', 'high')}\n\n"
+    f"{fact('preferred language', 'React and TypeScript', 'preferences', 'high')}")
+
+add("The server is on port 5432, uses PostgreSQL, and runs on AWS EC2",
+    f"Port 5432, PostgreSQL on EC2 — noted.\n\n"
+    f"{fact('server port', '5432', 'infrastructure', 'high')}\n\n"
+    f"{fact('database', 'PostgreSQL', 'infrastructure', 'high')}\n\n"
+    f"{fact('hosting', 'AWS EC2', 'infrastructure', 'high')}")
+
+add("I'm Miguel, I work on larql, and I prefer Rust",
+    f"Miguel working on larql in Rust — let's build.\n\n"
+    f"{fact('user name', 'Miguel', 'identity', 'high')}\n\n"
+    f"{fact('project', 'larql', 'identity', 'high', 'user', 'user name')}\n\n"
+    f"{fact('preferred language', 'Rust', 'preferences', 'high')}")
+
+add("We use GitHub Actions for CI, deploy to Vercel, and test with Jest",
+    f"CI on GitHub Actions, deploy to Vercel, Jest tests — modern stack.\n\n"
+    f"{fact('ci', 'GitHub Actions', 'infrastructure', 'high')}\n\n"
+    f"{fact('deployment', 'Vercel', 'infrastructure', 'high')}\n\n"
+    f"{fact('test framework', 'Jest', 'infrastructure', 'high')}")
+
+add("The model has 4B parameters, runs at 42 tok/s, and uses Q4_K quantization",
+    f"4B params, 42 tok/s, Q4_K — solid setup.\n\n"
+    f"{fact('model size', '4B parameters', 'model', 'high')}\n\n"
+    f"{fact('inference speed', '42 tok/s', 'performance', 'high', 'user', 'model size')}\n\n"
+    f"{fact('quantization', 'Q4_K', 'model', 'high')}")
+
+add("My timezone is UTC-3, I speak Portuguese and English, and I use Neovim",
+    f"UTC-3, bilingual, Neovim — efficient setup.\n\n"
+    f"{fact('timezone', 'UTC-3', 'identity', 'high')}\n\n"
+    f"{fact('languages', 'Portuguese and English', 'identity', 'high')}\n\n"
+    f"{fact('editor', 'Neovim', 'preferences', 'high')}")
+
+add("The API has 50ms latency, 99.9% uptime, and handles 10K RPS",
+    f"50ms, four nines, 10K RPS — production-grade.\n\n"
+    f"{fact('api latency', '50ms', 'performance', 'high')}\n\n"
+    f"{fact('uptime', '99.9%', 'performance', 'high')}\n\n"
+    f"{fact('throughput', '10K RPS', 'performance', 'high')}")
+
+add("I'm Yuki, a PhD student in NLP at Stanford, working on attention mechanisms",
+    f"Yuki — Stanford NLP PhD on attention. Fascinating work.\n\n"
+    f"{fact('user name', 'Yuki', 'identity', 'high')}\n\n"
+    f"{fact('role', 'PhD student in NLP', 'identity', 'high')}\n\n"
+    f"{fact('institution', 'Stanford', 'identity', 'high')}\n\n"
+    f"{fact('research area', 'attention mechanisms', 'identity', 'high')}")
+
+add("The backend uses Rust with Axum, the frontend is Next.js, and we store data in Redis and PostgreSQL",
+    f"Rust/Axum backend, Next.js frontend, Redis+PostgreSQL storage — full-stack noted.\n\n"
+    f"{fact('backend', 'Rust with Axum', 'architecture', 'high')}\n\n"
+    f"{fact('frontend', 'Next.js', 'architecture', 'high')}\n\n"
+    f"{fact('cache', 'Redis', 'infrastructure', 'high')}\n\n"
+    f"{fact('database', 'PostgreSQL', 'infrastructure', 'high')}")
+
+add("Memory usage is 1.2 GB, the hidden dim is 2816, and we have 34 layers",
+    f"1.2 GB, hidden=2816, 34 layers — Gemma 3 architecture.\n\n"
+    f"{fact('memory usage', '1.2 GB', 'performance', 'high')}\n\n"
+    f"{fact('hidden dim', '2816', 'model', 'high')}\n\n"
+    f"{fact('num layers', '34', 'model', 'high')}")
+
+add("The training used LoRA rank 16, learning rate 1e-4, and 600 iterations",
+    f"LoRA r=16, lr=1e-4, 600 iters — good hyperparams.\n\n"
+    f"{fact('lora rank', '16', 'training', 'high')}\n\n"
+    f"{fact('learning rate', '1e-4', 'training', 'high')}\n\n"
+    f"{fact('training iterations', '600', 'training', 'high')}")
+
 # Derived facts from analysis
 add("Why is our decode speed limited to 42 tok/s?",
     f"The bottleneck is memory bandwidth. At 273 GB/s with 59 MB/token of weight reads, "

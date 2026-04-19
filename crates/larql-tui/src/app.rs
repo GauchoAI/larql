@@ -59,13 +59,9 @@ impl AppState {
     /// through its own weights/activations.
     pub fn build_chat_messages(&self) -> Vec<ChatMsg> {
         let mut msgs = Vec::new();
-        // Compact system prompt: teach self-annotation.
-        // ~80 tokens — small enough for Gemma 3 4B to follow.
-        let system_prompt = include_str!("system_prompt.txt");
-        msgs.push(ChatMsg {
-            role: "system".into(),
-            content: system_prompt.to_string(),
-        });
+        // No system prompt needed — self-annotation is baked into the
+        // fine-tuned model. The LoRA adapter teaches the model to emit
+        // ```fact```, ```status```, ```plan```, ```tool``` blocks naturally.
         if let Some(msg) = self
             .messages
             .iter()

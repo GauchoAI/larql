@@ -86,6 +86,107 @@ fn test_mega_kernel_atomic_sync() {
     assert_eq!(phase, 2, "expected 2 phases completed");
 }
 
+/// Step 1.5: Isolate cross-TG read behavior.
+/// TG 0 writes 2560 values, ALL TGs read them after atomic barrier.
+#[cfg(feature = "metal")]
+#[test]
+fn test_cross_tg_read() {
+    use metal::*;
+
+    let device = Device::system_default().expect("no Metal GPU");
+    let queue = device.new_command_queue();
+
+    // Minimal shader: TG 0 writes, all TGs read
+    let shader_src = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void cross_tg_test(
+    device float*         buf    [[buffer(0)]],
+    device float*         out    [[buffer(1)]],
+    device atomic_uint*   sync   [[buffer(2)]],
+    constant uint&        len    [[buffer(3)]],
+    constant uint&        num_tg [[buffer(4)]],
+    uint tg_id  [[threadgroup_position_in_grid]],
+    uint tid    [[thread_index_in_threadgroup]],
+    uint tg_sz  [[threads_per_threadgroup]])
+{
+    // Phase 0: ALL TGs write their slice (like Step 1)
+    for (uint i = tg_id * tg_sz + tid; i < len; i += num_tg * tg_sz) {
+        buf[i] = float(i) + 1.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0) {
+        uint done = atomic_fetch_add_explicit(&sync[1], 1u, memory_order_relaxed);
+        if (done + 1 == num_tg) {
+            atomic_store_explicit(&sync[1], 0u, memory_order_relaxed);
+            atomic_store_explicit(&sync[0], 1u, memory_order_relaxed);
+        }
+    }
+    if (tid == 0) {
+        while (atomic_load_explicit(&sync[0], memory_order_relaxed) < 1u) {}
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 1: Each TG reads ALL of buf (cross-TG read!)
+    // and writes a checksum to out[tg_id]
+    float sum = 0.0f;
+    for (uint i = tid; i < len; i += tg_sz) {
+        sum += buf[i];
+    }
+    // Simple reduction
+    sum = simd_sum(sum);
+    if (tid == 0) {
+        out[tg_id] = sum;
+    }
+}
+"#;
+
+    let header = larql_compute::metal::shaders::common::HEADER;
+    let full = format!("{header}\n{shader_src}");
+    let lib = device.new_library_with_source(&full, &CompileOptions::new()).expect("compile");
+    let func = lib.get_function("cross_tg_test", None).expect("func");
+    let pipe = device.new_compute_pipeline_state_with_function(&func).expect("pipe");
+
+    let len: u32 = 2560;
+    let num_tg: u32 = 32;
+    let tg_size: u64 = 32;
+
+    let buf = device.new_buffer((len as u64) * 4, MTLResourceOptions::StorageModeShared);
+    let out = device.new_buffer((num_tg as u64) * 4, MTLResourceOptions::StorageModeShared);
+    let sync = device.new_buffer(2 * 4, MTLResourceOptions::StorageModeShared);
+    unsafe { let p = sync.contents() as *mut u32; *p = 0; *p.add(1) = 0; }
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipe);
+    enc.set_buffer(0, Some(&buf), 0);
+    enc.set_buffer(1, Some(&out), 0);
+    enc.set_buffer(2, Some(&sync), 0);
+    enc.set_bytes(3, 4, &len as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &num_tg as *const u32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(MTLSize::new(num_tg as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    // Expected checksum: sum(1..2561) = 2560*2561/2 = 3278080
+    let expected_sum: f32 = (1..=len).map(|i| i as f32).sum();
+    let results: Vec<f32> = unsafe {
+        let p = out.contents() as *const f32;
+        (0..num_tg as usize).map(|i| *p.add(i)).collect()
+    };
+
+    let mut pass = 0;
+    for i in 0..num_tg as usize {
+        let err = (results[i] - expected_sum).abs() / expected_sum;
+        if err < 0.01 { pass += 1; }
+    }
+    eprintln!("  Cross-TG read: {pass}/{num_tg} TGs got correct checksum");
+    eprintln!("  Expected: {:.0}, got: [{:.0}, {:.0}, {:.0}, ...]",
+        expected_sum, results[0], results[1], results[2]);
+    assert_eq!(pass, num_tg as usize, "cross-TG reads failed");
+}
+
 /// Step 2: f32 matvec inside persistent kernel.
 /// 3 phases: RMS norm → matvec → GELU.
 /// Validates real computation across atomic barriers.

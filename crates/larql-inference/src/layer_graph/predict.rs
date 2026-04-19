@@ -289,8 +289,15 @@ pub fn capture_knn_key_gpu(
                     Some(key) => crate::forward::apply_norm(weights, &probe_arr, &key, norm_offset),
                     None => crate::residual::rms_norm(&probe_arr, None, norm_offset),
                 };
+                let captured: Vec<f32> = h_ffn.row(0).to_vec();
+                if std::env::var("LARQL_TRACE_KNN").ok().as_deref() == Some("1") {
+                    let cmax = captured.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                    let cnan = captured.iter().filter(|v| v.is_nan()).count();
+                    eprintln!("[knn-capture L{}] residual: max={:.4} nan={} [0..3]={:.4?}",
+                        probe_layer, cmax, cnan, &captured[..3.min(captured.len())]);
+                }
                 backend.reset_kv_cache();
-                return Some(h_ffn.row(0).to_vec());
+                return Some(captured);
             }
         }
     }
@@ -610,6 +617,12 @@ pub fn predict_honest_with_knn_ffn(
                                 None => crate::residual::rms_norm(&probe_arr, None, norm_offset),
                             };
                             let residual: Vec<f32> = h_ffn.row(0).to_vec();
+                            if std::env::var("LARQL_TRACE_KNN").ok().as_deref() == Some("1") {
+                                let rmax = residual.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                                let rnan = residual.iter().filter(|v| v.is_nan()).count();
+                                eprintln!("[knn-gpu-probe L{}] residual: max={:.4} nan={} [0..3]={:.4?}",
+                                    pl, rmax, rnan, &residual[..3.min(residual.len())]);
+                            }
                             if let Some((entry, cosine)) = store.query_top1(pl, &residual) {
                                 if std::env::var("LARQL_TRACE_KNN").ok().as_deref() == Some("1") {
                                     eprintln!("[knn-gpu-probe L{}] top1={} cos={:.4} (threshold={})",
@@ -705,7 +718,10 @@ pub fn predict_honest_with_knn_ffn(
                     // Batch prefill: process all tokens through all layers in
                     // one Metal command buffer. ~24ms total vs ~24ms × seq_len
                     // for sequential. Falls back to sequential if batch fails.
-                    let batch_ok = if seq_len > 1 {
+                    // When KNN entries exist, force sequential so the probe fires
+                    // on the last prefill position (batch doesn't probe).
+                    let has_knn = knn_probe_layer_prefill.is_some();
+                    let batch_ok = if seq_len > 1 && !has_knn {
                         let x_batch: Vec<f32> = embeds.as_slice().unwrap_or(&[]).to_vec();
                         if let Some(h_out) = backend.decode_token_batch(
                             &layers, &x_batch, seq_len,

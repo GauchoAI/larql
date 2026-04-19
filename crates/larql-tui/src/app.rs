@@ -59,10 +59,12 @@ impl AppState {
     /// through its own weights/activations.
     pub fn build_chat_messages(&self) -> Vec<ChatMsg> {
         let mut msgs = Vec::new();
-        // System message with just the trigger phrase
+        // Compact system prompt: teach self-annotation.
+        // ~80 tokens — small enough for Gemma 3 4B to follow.
+        let system_prompt = include_str!("system_prompt.txt");
         msgs.push(ChatMsg {
             role: "system".into(),
-            content: "system prompt".into(),
+            content: system_prompt.to_string(),
         });
         if let Some(msg) = self
             .messages

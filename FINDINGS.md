@@ -586,3 +586,73 @@ For each optimization:
 2. **Timing**: 5 decode queries, read tok/s from logs (30 seconds)
 3. **Benchmark**: full 11 scenarios + Ollama comparison (5 minutes)
 4. **Commit or revert**: if regression, `git checkout -- file`
+
+### Memory Optimization Results (2026-04-18/19)
+
+#### What was freed
+
+| What | Bytes freed | Method |
+|------|----------:|--------|
+| f32 FFN weights (gate+up+down) | 10.7 GB | `drop_ffn_weights()` after load |
+| f32 attention weights (Q/K/V/O) | 2.1 GB | `drop_attn_weights()` after load |
+| f32 lm_head | 2.7 GB | `drop_lm_head_weight()` after load |
+| Embedding dedup (safetensors→shared ArcArray2) | 2.7 GB | Replace `weights.embed` with shared ref |
+| Unused vindex mmaps (MADV_DONTNEED) | 11.6 GB | `advise_dontneed_unused()` on down/up/gate/lm_head f32 |
+| **Total reclaimed** | **29.8 GB** | |
+
+#### Precise memory map (vmmap, after 10 inference queries)
+
+```
+Category                     Virtual    Resident    Dirty    Swapped
+─────────────────────────── ─────────  ─────────  ───────  ─────────
+mapped file (mmaps)           13.1 GB    779.9 MB      0 MB     0 MB
+MALLOC zone (heap)             6.3 GB     38.2 MB   35.3 MB   6.2 GB
+__TEXT (code + libraries)     300.5 MB   137.9 MB      0 MB     0 MB
+__LINKEDIT + __OBJC_RO        671.6 MB    58.7 MB      0 MB     0 MB
+Other (page tables, stack)     ~70 MB     ~35 MB    ~28 MB    ~3 GB
+─────────────────────────── ─────────  ─────────  ───────  ─────────
+TOTAL                          26.9 GB     4.0 GB   3.1 GB   9.5 GB
+```
+
+**What's actually used for inference:**
+
+| Resource | Resident | Notes |
+|----------|--------:|-------|
+| lm_head_q4.bin | 360 MB | Fully paged in (used every token for logits) |
+| attn_weights_q4k.bin | 418 MB | Fully paged in (Q4_K attention projections) |
+| interleaved_q4k_real.bin | ~0 MB | Released by MADV_DONTNEED, re-paged per layer during decode |
+| Live heap (malloc dirty) | 35 MB | Norms, KV state, scratch buffers |
+| **Working set** | **~815 MB** | |
+
+The 6.2 GB MALLOC SWAPPED is freed heap (the dropped f32 tensors)
+that macOS hasn't unmapped yet — the allocator holds the pages in its
+arena. Under memory pressure the OS reclaims them. The live dirty
+heap is only 35 MB.
+
+**Comparison with Ollama:**
+
+| Metric | larql | Ollama |
+|--------|------:|-------:|
+| Process RSS | 1,775 MB | 4,142 MB |
+| Working set (active) | ~815 MB | ~3,300 MB |
+| Speed | 42.6 tok/s | ~40 tok/s |
+| Quality (11 scenarios) | 11/11 | 10/11 |
+
+#### Dispatch fusion results
+
+Fused QK-norm from 12 dispatches to 2 per layer (new `rms_norm_multihead`
+shader). Total dispatches 918→578 (-37%). Speed 40.4→41.3 tok/s (+2%).
+
+Per-layer dispatch cost analysis: 4 matvec dispatches (QKV, O, gate+up,
+GEGLU+down) account for 97% of compute. The other 13 dispatches are
+element-wise norms and residuals at <2% combined. Further fusion is a
+dead end — the matvec kernel itself is the bottleneck.
+
+#### Remaining path to lower memory
+
+The 815 MB working set is the Q4_K weights being actively read during
+inference. To go lower requires:
+- Smaller quantization (Q2_K — would lose quality)
+- Smaller model (not Gemma 3 4B)
+- Lazy layer loading (only page in the current layer's weights — would
+  add ~1ms latency per layer from page faults)

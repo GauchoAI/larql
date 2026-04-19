@@ -81,10 +81,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 f32_data.to_vec()
             };
 
-            // All attention → Q6_K (1% max dequant error). Highest-precision
-            // attention quantisation we have; model fidelity test.
-            let (q_data, format) = (quantize_q6_k(&padded), "Q6_K");
-            let _ = (key, quantize_q4_k as fn(&[f32]) -> Vec<u8>, quantize_q4_k_gguf as fn(&[f32]) -> Vec<u8>);
+            // Attention → Q4_K (148-byte Ollama format). Matches the q4k_matvec shader.
+            // Use quantize_q4_k (NOT quantize_q4_k_gguf which is 144 bytes).
+            let is_v_proj = key.contains("v_proj");
+            let (q_data, format) = if is_v_proj {
+                (quantize_q6_k(&padded), "Q6_K")  // V gets Q6_K (higher precision)
+            } else {
+                (quantize_q4_k(&padded), "Q4_K")  // Q/K/O get Ollama Q4_K (148 bytes)
+            };
 
             out.write_all(&q_data)?;
             q4k_manifest.push(serde_json::json!({

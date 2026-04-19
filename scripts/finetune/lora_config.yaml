@@ -1,0 +1,23 @@
+# LoRA fine-tuning config for larql foundation
+# Teaches self-annotation (fact/status/plan blocks)
+
+# LoRA parameters
+fine_tune_type: lora
+num_layers: 16
+lora_parameters:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  scale: 2.0
+
+# Training
+learning_rate: 1e-4
+batch_size: 1
+iters: 600
+val_batches: 5
+steps_per_report: 10
+steps_per_eval: 50
+save_every: 100
+max_seq_length: 512
+grad_checkpoint: true
+seed: 42

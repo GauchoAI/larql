@@ -63,6 +63,7 @@ pub struct MetalBackend {
     pub kv_append_batch_pipeline: ComputePipelineState,
     q8_matvec_pipeline: ComputePipelineState,
     pub rms_norm_pipeline: ComputePipelineState,
+    pub rms_norm_multihead_pipeline: ComputePipelineState,
     pub residual_add_pipeline: ComputePipelineState,
     q8_qkv_proj_pipeline: ComputePipelineState,
     q4k_matvec_pipeline: ComputePipelineState,
@@ -152,8 +153,10 @@ impl MetalBackend {
 
         // Norm and residual ops
         let rms_norm_fn = library.get_function("rms_norm", None).ok()?;
+        let rms_norm_multihead_fn = library.get_function("rms_norm_multihead", None).ok()?;
         let residual_add_fn = library.get_function("residual_add", None).ok()?;
         let rms_norm_pipeline = device.new_compute_pipeline_state_with_function(&rms_norm_fn).ok()?;
+        let rms_norm_multihead_pipeline = device.new_compute_pipeline_state_with_function(&rms_norm_multihead_fn).ok()?;
         let residual_add_pipeline = device.new_compute_pipeline_state_with_function(&residual_add_fn).ok()?;
 
         // Q4_K and Q6_K matvec (Ollama-compatible quantization)
@@ -258,7 +261,7 @@ impl MetalBackend {
             kv_attend_fast_pipeline, kv_attend_long_pipeline, kv_append_pipeline,
             kv_attend_batched_pipeline, kv_append_batch_pipeline,
             q8_matvec_pipeline,
-            rms_norm_pipeline, residual_add_pipeline,
+            rms_norm_pipeline, rms_norm_multihead_pipeline, residual_add_pipeline,
             q8_qkv_proj_pipeline,
             q4k_matvec_pipeline, q4k_ffn_gate_up_pipeline,
             q4kf_ffn_gate_up_pipeline,

@@ -367,37 +367,31 @@ impl MetalBackend {
             // residual's large norm-weight multipliers leave Q and K un-scaled, and softmax
             // overflows to inf for any reasonable KV-cache length.
             if layer.q_norm_weight.is_some() {
-                // Per-head RMSNorm on Q and K between QKV projection and RoPE (Gemma 3).
-                // Dispatches existing rms_norm kernel once per head via buffer offsets,
-                // in-place on q_out / k_out. NOTE: this correctly plumbs through the
-                // Q/K norm weights but is NOT sufficient by itself to make Gemma 3 decode
-                // produce finite output — the decode_token_real_layer0 reproducer still
-                // yields all-NaN even when Q and K are forced to zero, indicating
-                // additional overflow sources in the V side / FFN / post-ffn-norm pipeline
-                // for real Gemma 3 weights (post_ffn_norm weight max ≈ 304).
+                // Fused multi-head QK-norm: 2 dispatches instead of 12.
+                // Each dispatch normalizes all heads in parallel (one TG per head).
                 let hd_val = layer_head_dim as u32;
                 let eps_val = layer.eps;
                 let off_val = layer.qk_norm_offset;
                 let tg_threads = 256u64.min(layer_head_dim as u64);
 
-                enc.set_compute_pipeline_state(&self.rms_norm_pipeline);
-                enc.set_bytes(3, 4, &hd_val as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(4, 4, &eps_val as *const f32 as *const std::ffi::c_void);
-                enc.set_bytes(5, 4, &off_val as *const f32 as *const std::ffi::c_void);
+                enc.set_compute_pipeline_state(&self.rms_norm_multihead_pipeline);
+                enc.set_bytes(2, 4, &hd_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(3, 4, &eps_val as *const f32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &off_val as *const f32 as *const std::ffi::c_void);
+                // Q heads — all in one dispatch
+                enc.set_buffer(0, Some(&q_out), 0);
                 enc.set_buffer(1, Some(&q_norm_bufs[l]), 0);
-                for head in 0..layer_num_q_heads {
-                    let off_bytes = (head * layer_head_dim * 4) as u64;
-                    enc.set_buffer(0, Some(&q_out), off_bytes);
-                    enc.set_buffer(2, Some(&q_out), off_bytes);
-                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tg_threads, 1, 1));
-                }
+                enc.dispatch_thread_groups(
+                    MTLSize::new(layer_num_q_heads as u64, 1, 1),
+                    MTLSize::new(tg_threads, 1, 1),
+                );
+                // K heads — all in one dispatch
+                enc.set_buffer(0, Some(&k_out), 0);
                 enc.set_buffer(1, Some(&k_norm_bufs[l]), 0);
-                for head in 0..layer_num_kv_heads {
-                    let off_bytes = (head * layer_head_dim * 4) as u64;
-                    enc.set_buffer(0, Some(&k_out), off_bytes);
-                    enc.set_buffer(2, Some(&k_out), off_bytes);
-                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tg_threads, 1, 1));
-                }
+                enc.dispatch_thread_groups(
+                    MTLSize::new(layer_num_kv_heads as u64, 1, 1),
+                    MTLSize::new(tg_threads, 1, 1),
+                );
             }
 
             // ── Step 2: RoPE on Q and K heads (batched — one dispatch each) ──

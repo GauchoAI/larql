@@ -12,6 +12,9 @@ pub struct DraftHead {
     b1: Vec<f32>,   // [inner]
     w2: Vec<f32>,   // [vocab, inner] row-major
     b2: Vec<f32>,   // [vocab]
+    /// Compact vocab → original token ID mapping.
+    /// If empty, vocab indices ARE token IDs (full vocab mode).
+    vocab_map: Vec<u32>,
     pub hidden: usize,
     pub inner: usize,
     pub vocab: usize,
@@ -44,10 +47,23 @@ impl DraftHead {
         let w2 = read_f32(&mut offset, vocab * inner);
         let b2 = read_f32(&mut offset, vocab);
 
-        eprintln!("[draft-head] loaded: hidden={hidden} inner={inner} vocab={vocab} ({:.0} MB)",
+        // Try loading vocab mapping from sibling file
+        let vocab_path = path.with_extension("").with_file_name(
+            format!("{}_vocab.bin", path.file_stem()?.to_str()?)
+        );
+        let vocab_map = if let Ok(vdata) = std::fs::read(&vocab_path) {
+            vdata.chunks_exact(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        } else {
+            Vec::new() // full vocab mode — indices are token IDs
+        };
+
+        let mode = if vocab_map.is_empty() { "full" } else { "compact" };
+        eprintln!("[draft-head] loaded: hidden={hidden} inner={inner} vocab={vocab} ({mode}) {:.0} MB",
             data.len() as f64 / 1e6);
 
-        Some(Self { w1, b1, w2, b2, hidden, inner, vocab })
+        Some(Self { w1, b1, w2, b2, vocab_map, hidden, inner, vocab })
     }
 
     /// Predict top-1 token from h_final. Returns (token_id, logit).
@@ -84,7 +100,12 @@ impl DraftHead {
             }
         }
 
-        Some(best_id)
+        // Map compact index back to original token ID
+        if !self.vocab_map.is_empty() {
+            Some(self.vocab_map[best_id as usize])
+        } else {
+            Some(best_id)
+        }
     }
 
     /// Draft K tokens by chaining predictions.

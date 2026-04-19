@@ -173,15 +173,28 @@ fn generate_speculative_inner(
 
     // ── Speculative decode loop ──
     while tokens.len() < max_tokens {
-        // Draft tokens: prefer draft head (neural), fall back to n-gram
-        let drafts = if let (Some(dh), Some(ref h)) = (draft_head, &last_h_out) {
-            // Apply final norm to get h_final (same as finalize_logits)
-            let h_arr = ndarray::Array2::from_shape_vec((1, hidden), h.clone()).unwrap();
-            let h_final = crate::forward::apply_norm(weights, &h_arr, weights.arch.final_norm_key(), norm_offset);
-            let h_vec: Vec<f32> = h_final.row(0).to_vec();
-            dh.draft(&h_vec, max_draft_k)
-        } else {
-            ngram.draft(&context, max_draft_k)
+        // Draft tokens: try draft head first token, extend with n-gram chain
+        let drafts = {
+            let mut d = Vec::new();
+            // Draft head: predict first token from h_final (neural)
+            if let (Some(dh), Some(ref h)) = (draft_head, &last_h_out) {
+                let h_arr = ndarray::Array2::from_shape_vec((1, hidden), h.clone()).unwrap();
+                let h_final = crate::forward::apply_norm(weights, &h_arr, weights.arch.final_norm_key(), norm_offset);
+                let h_vec: Vec<f32> = h_final.row(0).to_vec();
+                if let Some(tid) = dh.predict(&h_vec) {
+                    d.push(tid);
+                    // Extend with n-gram from the draft head's prediction
+                    let mut ext_ctx = context.clone();
+                    ext_ctx.push(tid);
+                    let ext = ngram.draft(&ext_ctx, max_draft_k - 1);
+                    d.extend_from_slice(&ext);
+                }
+            }
+            // If draft head didn't produce anything, fall back to pure n-gram
+            if d.is_empty() {
+                d = ngram.draft(&context, max_draft_k);
+            }
+            d
         };
         let k = drafts.len();
 

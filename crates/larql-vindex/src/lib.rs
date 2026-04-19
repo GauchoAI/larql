@@ -62,7 +62,7 @@ pub use format::huggingface::{
     resolve_hf_vindex, download_hf_weights, publish_vindex,
     is_hf_path, PublishCallbacks, SilentPublishCallbacks,
 };
-pub use format::weights::{write_model_weights, load_model_weights, WeightSource, StreamingWeights};
+pub use format::weights::{write_model_weights, load_model_weights, load_model_weights_filtered, WeightSource, StreamingWeights};
 
 // Patch
 pub use patch::core::{PatchOp, PatchedVindex, VindexPatch};

@@ -56,34 +56,29 @@ impl LoadedModel {
         if let Some(w) = self.weights.get() {
             return Ok(w);
         }
-        let mut cb = larql_vindex::SilentLoadCallbacks;
-        let mut weights = larql_vindex::load_model_weights(&self.path, &mut cb)
-            .map_err(|e| format!("failed to load model weights: {e}"))?;
-        // Drop f32 FFN weights when Q4_K FFN mmap exists — the GPU decode
-        // pipeline reads quantized weights directly, never touches f32.
-        // This saves ~10.7 GB for Gemma 3 4B.
+        // Skip loading f32 tensors when Q4_K equivalents exist on disk.
+        // Never allocates them — no load-then-drop, no malloc arena ghost.
         let has_q4k_ffn = self.path.join("interleaved_q4k_real.bin").exists()
             || self.path.join("interleaved_q4k.bin").exists();
-        if self.walk_only || has_q4k_ffn {
-            let freed = weights.drop_ffn_weights();
-            let reason = if self.walk_only { "walk-only" } else { "Q4_K FFN available" };
-            tracing::info!("[{reason}] dropped f32 FFN weights: {:.1} GB freed", freed as f64 / 1e9);
-        }
-        // Drop f32 attention weights when Q4_K attention weights exist.
-        // INSERT now uses capture_knn_key_gpu (Q4_K path), not the f32 per-layer path.
         let has_q4k_attn = self.path.join("attn_weights_q4k.bin").exists();
-        if has_q4k_attn {
-            let freed = weights.drop_attn_weights();
-            if freed > 0 {
-                tracing::info!("[Q4_K attn available] dropped f32 attn weights: {:.1} GB freed", freed as f64 / 1e9);
-            }
+        let has_q4_lm = self.path.join("lm_head_q4.bin").exists();
+        let mut skip: Vec<&str> = Vec::new();
+        if self.walk_only || has_q4k_ffn {
+            skip.extend_from_slice(&["gate_proj", "up_proj", "down_proj",
+                "ffn_gate", "ffn_up", "ffn_down", "mlp.experts",
+                "packed_gate_up", "packed_down"]);
         }
-        // Drop f32 lm_head when lm_head_q4 exists (saves ~2.6 GB).
-        if self.path.join("lm_head_q4.bin").exists() {
-            let freed = weights.drop_lm_head_weight();
-            if freed > 0 {
-                tracing::info!("[Q4 lm_head available] dropped f32 lm_head: {:.1} GB freed", freed as f64 / 1e9);
-            }
+        if has_q4k_attn {
+            skip.extend_from_slice(&["q_proj", "k_proj", "v_proj", "o_proj",
+                "attn_q", "attn_k", "attn_v", "attn_output"]);
+        }
+        if has_q4_lm { skip.push("lm_head"); }
+
+        let mut cb = larql_vindex::SilentLoadCallbacks;
+        let mut weights = larql_vindex::load_model_weights_filtered(&self.path, &mut cb, &skip)
+            .map_err(|e| format!("failed to load model weights: {e}"))?;
+        if !skip.is_empty() {
+            tracing::info!("[skip-load] skipped {} tensor patterns — never allocated", skip.len());
         }
         // Share embedding matrix: replace weights.embed with a clone of
         // LoadedModel.embeddings (same ArcArray2, one allocation).

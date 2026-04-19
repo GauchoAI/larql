@@ -78,6 +78,13 @@ impl LoadedModel {
                 tracing::info!("[Q4_K attn available] dropped f32 attn weights: {:.1} GB freed", freed as f64 / 1e9);
             }
         }
+        // Drop f32 lm_head when lm_head_q4 exists (saves ~2.6 GB).
+        if self.path.join("lm_head_q4.bin").exists() {
+            let freed = weights.drop_lm_head_weight();
+            if freed > 0 {
+                tracing::info!("[Q4 lm_head available] dropped f32 lm_head: {:.1} GB freed", freed as f64 / 1e9);
+            }
+        }
         let _ = self.weights.set(weights);
         Ok(self.weights.get().unwrap())
     }

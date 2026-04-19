@@ -60,12 +60,82 @@ impl AppState {
         }
     }
 
-    /// Build the chat messages — ONLY the current user message.
+    /// Build the chat messages — system (skills + context) + user message.
     /// Conversation history is in the RAG store, not in the prompt.
     /// Zero context growth. No compaction needed.
     fn build_chat_messages(&self) -> Vec<ChatMsg> {
-        // Just the last user message — RAG injects relevant history server-side
         let mut msgs = Vec::new();
+
+        // Inject skill instructions + relevant facts as system message
+        let mut system_parts = Vec::new();
+
+        // Load all skill.md files
+        for dir in &[
+            std::env::current_dir().unwrap_or_default().join(".skills"),
+            home_dir().join(".larql/skills"),
+        ] {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let skill_md = entry.path().join("skill.md");
+                    if skill_md.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                            system_parts.push(content);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Inject relevant facts from the fact store
+        let facts_path = home_dir().join(".larql/facts.jsonl");
+        if facts_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&facts_path) {
+                let facts: Vec<String> = content.lines()
+                    .filter_map(|line| {
+                        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                        Some(format!("- {}: {}", v["key"].as_str()?, v["value"].as_str()?))
+                    })
+                    .collect();
+                if !facts.is_empty() {
+                    system_parts.push(format!(
+                        "## Known facts (from previous conversations)\n{}",
+                        facts.join("\n")
+                    ));
+                }
+            }
+        }
+
+        // Inject active workflows
+        let status_path = home_dir().join(".larql/workflows.json");
+        if status_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&status_path) {
+                if let Ok(workflows) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(obj) = workflows.as_object() {
+                        let active: Vec<String> = obj.iter()
+                            .filter(|(_, v)| v["state"].as_str() != Some("done"))
+                            .map(|(k, v)| format!("- {} [{}]: {}",
+                                k, v["state"].as_str().unwrap_or("?"),
+                                v["detail"].as_str().unwrap_or("")))
+                            .collect();
+                        if !active.is_empty() {
+                            system_parts.push(format!(
+                                "## Active workflows\n{}",
+                                active.join("\n")
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !system_parts.is_empty() {
+            msgs.push(ChatMsg {
+                role: "system".into(),
+                content: system_parts.join("\n\n"),
+            });
+        }
+
+        // User message
         if let Some(msg) = self.messages.iter().rev()
             .find(|m| matches!(m, Message::User(_)))
         {
@@ -222,6 +292,131 @@ fn extract_block(text: &str, lang: &str) -> Option<String> {
     let after = &text[start + open.len()..];
     let close = after.find("```")?;
     Some(after[..close].trim().to_string())
+}
+
+/// Extract ALL blocks of a given type (there may be multiple per response).
+fn extract_all_blocks(text: &str, lang: &str) -> Vec<String> {
+    let open = format!("```{lang}");
+    let mut blocks = Vec::new();
+    let mut search = text;
+    while let Some(start) = search.find(&open) {
+        let after = &search[start + open.len()..];
+        if let Some(close) = after.find("```") {
+            blocks.push(after[..close].trim().to_string());
+            search = &after[close + 3..];
+        } else {
+            break;
+        }
+    }
+    blocks
+}
+
+/// Extract self-annotated fact and status blocks from model output.
+/// Persists facts to ~/.larql/facts.jsonl and status to ~/.larql/workflows.json.
+/// Also strips the blocks from the displayed text.
+fn process_annotations(text: &str, server_url: &str) -> String {
+    let facts = extract_all_blocks(text, "fact");
+    let statuses = extract_all_blocks(text, "status");
+
+    // Persist facts to local JSONL file
+    if !facts.is_empty() {
+        let facts_path = home_dir().join(".larql/facts.jsonl");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true).open(&facts_path)
+        {
+            use std::io::Write;
+            for fact_block in &facts {
+                let mut key = String::new();
+                let mut value = String::new();
+                let mut source = String::from("derived");
+                for line in fact_block.lines() {
+                    let line = line.trim();
+                    if let Some(rest) = line.strip_prefix("key:") {
+                        key = rest.trim().to_string();
+                    } else if let Some(rest) = line.strip_prefix("value:") {
+                        value = rest.trim().to_string();
+                    } else if let Some(rest) = line.strip_prefix("source:") {
+                        source = rest.trim().to_string();
+                    }
+                }
+                if !key.is_empty() && !value.is_empty() {
+                    let entry = serde_json::json!({
+                        "key": key, "value": value, "source": source,
+                        "ts": chrono_now(),
+                    });
+                    let _ = writeln!(f, "{}", entry);
+                    // Also POST to server RAG store
+                    let url = server_url.to_string();
+                    let fact = format!("{key}: {value}");
+                    tokio::spawn(async move {
+                        let _ = reqwest::Client::new()
+                            .post(format!("{url}/v1/rag/insert"))
+                            .json(&serde_json::json!({
+                                "fact": fact, "category": "fact",
+                            }))
+                            .send().await;
+                    });
+                }
+            }
+        }
+    }
+
+    // Persist workflow status
+    if !statuses.is_empty() {
+        let status_path = home_dir().join(".larql/workflows.json");
+        let mut workflows: serde_json::Value = std::fs::read_to_string(&status_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        for status_block in &statuses {
+            let mut task = String::new();
+            let mut state = String::new();
+            let mut detail = String::new();
+            for line in status_block.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("task:") {
+                    task = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("state:") {
+                    state = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("detail:") {
+                    detail = rest.trim().to_string();
+                }
+            }
+            if !task.is_empty() {
+                workflows[&task] = serde_json::json!({
+                    "state": state, "detail": detail, "ts": chrono_now(),
+                });
+            }
+        }
+        let _ = std::fs::write(&status_path, serde_json::to_string_pretty(&workflows).unwrap_or_default());
+    }
+
+    // Strip annotation blocks from displayed text
+    let mut cleaned = text.to_string();
+    for lang in &["fact", "status"] {
+        let open = format!("```{lang}");
+        loop {
+            if let Some(start) = cleaned.find(&open) {
+                let after = &cleaned[start + open.len()..];
+                if let Some(close) = after.find("```") {
+                    let end = start + open.len() + close + 3;
+                    cleaned.replace_range(start..end, "");
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+    cleaned.trim().to_string()
+}
+
+fn chrono_now() -> String {
+    // Simple ISO timestamp without chrono dependency
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}", d.as_secs())
 }
 
 // ── Drawing ──────────────────────────────────────────────────────────────
@@ -490,6 +685,15 @@ async fn main() -> io::Result<()> {
                         Some(Message::Assistant(text)) => text.clone(),
                         _ => String::new(),
                     };
+
+                    // Extract and persist self-annotated fact/status blocks
+                    let cleaned = process_annotations(&response_text, &state.server_url);
+                    if cleaned != response_text {
+                        // Replace the assistant message with the cleaned version
+                        if let Some(Message::Assistant(ref mut text)) = state.messages.last_mut() {
+                            *text = cleaned;
+                        }
+                    }
 
                     // Only execute tools on first response, not follow-ups
                     if tool_depth == 0 {

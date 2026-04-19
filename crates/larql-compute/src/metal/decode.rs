@@ -171,10 +171,44 @@ impl MetalBackend {
             let window_size = layer.sliding_window as u32;
 
             // ── Step 1: Input norm + Q/K/V projection ──
-            // Dispatches per-projection to handle mixed formats (Q4_K Q/K + Q6_K V).
             if uses_q4k {
+                let all_same_format = layer.wq.format == layer.wk.format && layer.wk.format == layer.wv.format;
+
+                // Fused norm+QKV: skip separate norm dispatch, each simdgroup
+                // computes RMS inline. Saves 1 dispatch per layer.
+                if all_same_format && layer.wq.format == crate::QuantFormat::Q4_K
+                    && layer.norm_type != crate::NormType::LayerNorm
+                {
+                    let total_rows = (q_dim + kv_dim + kv_dim) as u32;
+                    let q_rows_val = q_dim as u32;
+                    let k_rows_val = kv_dim as u32;
+                    let v_rows_val = kv_dim as u32;
+                    let k_val = hidden as u32;
+                    let rows_per_tg = crate::metal::shaders::q4k_qkv_proj::ROWS_PER_TG;
+                    let num_tgs = (total_rows as u64).div_ceil(rows_per_tg);
+                    enc.set_compute_pipeline_state(&self.q4k_norm_qkv_pipeline);
+                    enc.set_buffer(0, Some(&wq_bufs[l]), 0);
+                    enc.set_buffer(1, Some(&wk_bufs[l]), 0);
+                    enc.set_buffer(2, Some(&wv_bufs[l]), 0);
+                    enc.set_buffer(3, Some(&h_buf), 0);  // raw h, not normed
+                    enc.set_buffer(4, Some(&input_norm_bufs[l]), 0);  // norm weights
+                    enc.set_buffer(5, Some(&q_out), 0);
+                    enc.set_buffer(6, Some(&k_out), 0);
+                    enc.set_buffer(7, Some(&v_out), 0);
+                    enc.set_bytes(8, 4, &q_rows_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(9, 4, &k_rows_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(10, 4, &v_rows_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(11, 4, &k_val as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(12, 4, &eps as *const f32 as *const std::ffi::c_void);
+                    enc.set_bytes(13, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+                    let threads_per_tg = crate::metal::shaders::q4k_qkv_proj::THREADS_PER_TG;
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(num_tgs, 1, 1),
+                        MTLSize::new(threads_per_tg, 1, 1),
+                    );
+                } else {
+                // Fallback: separate norm + QKV (LayerNorm, Q4_KF, mixed formats)
                 use crate::metal::ops::full_pipeline::encode_rms_norm;
-                // Dispatch 1: norm
                 if layer.norm_type == crate::NormType::LayerNorm {
                     let len_val = hidden as u32;
                     if let Some(bias) = layer.input_norm_bias {
@@ -206,17 +240,13 @@ impl MetalBackend {
                         hidden, eps, norm_offset);
                 }
 
-                // Dispatch 2+: Per-projection matvec (handles mixed Q4_K/Q6_K formats)
-                // Each projection dispatched with its format-specific shader.
                 let all_same_format = layer.wq.format == layer.wk.format && layer.wk.format == layer.wv.format;
                 if all_same_format && layer.wq.format != crate::QuantFormat::Q6_K {
-                    // Fused QKV: all same Q4_K/Q4_KF format
                     let total_rows = (q_dim + kv_dim + kv_dim) as u32;
                     let q_rows_val = q_dim as u32;
                     let k_rows_val = kv_dim as u32;
                     let v_rows_val = kv_dim as u32;
                     let k_val = hidden as u32;
-                    // Use correct ROWS_PER_TG for the selected pipeline
                     let (qkv_pipeline, rows_per_tg) = if layer.wq.format == crate::QuantFormat::Q4_KF {
                         (&self.q4kf_qkv_proj_pipeline, crate::metal::shaders::q4kf_qkv_proj::ROWS_PER_TG)
                     } else {
@@ -318,6 +348,7 @@ impl MetalBackend {
                         kv_dim, k_val, layer.wv.format,
                         &self.q4k_matvec_pipeline, &self.q4kf_proj_pipeline, &self.q6k_matvec_pipeline);
                 }
+                } // end fallback (non-fused norm+QKV)
             } else {
                 // Q8 path: norm+Q8 → Q8 QKV (reuse ffn_q8/q8s scratch)
                 let q8_buf = &ffn_q8;

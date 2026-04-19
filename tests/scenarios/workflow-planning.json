@@ -1,0 +1,10 @@
+[
+  {
+    "input": "Plan how to add a Redis caching layer to the API server. Break this into 4 or more steps and track the workflow.",
+    "expect": {
+      "workflows": [
+        { "name_contains": "cach", "min_steps": 3 }
+      ]
+    }
+  }
+]

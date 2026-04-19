@@ -1,0 +1,19 @@
+[
+  {
+    "input": "My name is Miguel and I work on machine learning systems",
+    "expect": {
+      "facts": [
+        { "key_contains": "name", "value_contains": "Miguel" }
+      ],
+      "contains": "Miguel"
+    }
+  },
+  {
+    "input": "The server runs on port 3000 and uses Metal GPU",
+    "expect": {
+      "facts": [
+        { "value_contains": "3000" }
+      ]
+    }
+  }
+]

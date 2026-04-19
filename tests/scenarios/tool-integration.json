@@ -1,0 +1,8 @@
+[
+  {
+    "input": "What do you know about me? Check the facts.",
+    "expect": {
+      "contains": "fact"
+    }
+  }
+]

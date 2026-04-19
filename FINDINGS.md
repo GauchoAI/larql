@@ -733,3 +733,77 @@ Split from 804-line monolith into 11 modules:
 - Sidebar: Ctrl+B toggles workflow panel
 - Logging: `~/.larql/logs/YYYY-MM-DD.jsonl`
 - Scenario format supports INSERT setup + contains/not_contains assertions
+
+## Foundation Fine-Tuning — Self-Annotating Model (2026-04-19)
+
+### The Problem
+
+Gemma 3 4B doesn't reliably emit structured annotation blocks
+(`\`\`\`fact\`\`\``, `\`\`\`status\`\`\``, `\`\`\`plan\`\`\``) even with explicit
+system prompt instructions. The model understands the request but
+formats output as free text. This breaks the TUI's automated
+fact extraction and workflow tracking pipeline.
+
+### The Solution: MLX LoRA Fine-Tuning
+
+Trained a LoRA adapter (rank=16, 14M params, 0.3% of 4.5B) on
+189 examples across 8 categories, directly on Apple Silicon M4 Pro
+using MLX. Training: 600 iterations, 7 minutes, 3.5 GB peak memory.
+
+| Category | Examples | Purpose |
+|----------|---------|---------|
+| Fact extraction | 69 | User states info → model emits `\`\`\`fact\`\`\`` |
+| Status tracking | 32 | Task work → model emits `\`\`\`status\`\`\`` |
+| Plan creation | 15 | Complex task → model emits `\`\`\`plan\`\`\`` with steps |
+| Tool calling | 20 | File listing, fact query → model emits `\`\`\`tool\`\`\`` |
+| Concise answers | 30 | Direct responses, no filler, no annotation |
+| Combined | 8 | Fact + status/plan/tool in one response |
+| Fact retrieval | 5 | Model references previously stored facts |
+| No annotation | 10 | Greetings, confirmations — correctly no blocks |
+
+### Training Curve
+
+```
+Iter   1: Train loss 14.139
+Iter  10: Train loss  5.126
+Iter  50: Train loss  1.388
+Iter 200: Train loss  0.418  Val loss 1.191
+Iter 400: Train loss  0.283
+Iter 600: Train loss  0.262  Val loss 1.704
+```
+
+### Test Results (5/5)
+
+| # | Input | Response | Annotation | Pass |
+|---|-------|----------|------------|------|
+| 1 | "I prefer Python, live in Tokyo" | "Tokyo coder — noted." | `\`\`\`fact\`\`\`` key: preferred language | ✅ |
+| 2 | "Fix the timeout error" | "Investigating the timeout." | `\`\`\`status\`\`\`` task: fix API timeout | ✅ |
+| 3 | "Plan authentication" | "Here's the plan:" | `\`\`\`plan\`\`\`` with 5 steps | ✅ |
+| 4 | "What is 2+2?" | "4" | None (correct!) | ✅ |
+| 5 | "List files" | "Looking at directory." | `\`\`\`tool list ./*\`\`\`` | ✅ |
+
+### Pipeline
+
+```
+generate_v2.py → data/train.jsonl (170) + valid.jsonl (19)
+      ↓
+mlx_lm.lora (Apple Silicon, 7 min)
+      ↓
+adapters/adapters.safetensors (14M params)
+      ↓
+mlx_lm.fuse → convert_hf_to_gguf → Q4_K_M GGUF
+      ↓
+larql-server loads fine-tuned GGUF
+      ↓
+TUI extracts annotations → persists facts/workflows → sidebar renders
+```
+
+### What This Enables
+
+The self-annotating model is the memory substrate for larql:
+- **Zero context growth**: facts stored externally, not in prompt
+- **Automatic knowledge capture**: every conversation builds the fact store
+- **Workflow orchestration**: model plans, tracks progress, reports completion
+- **Tool integration**: model calls tools via structured blocks
+- **Conciseness**: no filler responses, direct answers
+- **RAG-friendly**: structured key/value facts enable precise retrieval

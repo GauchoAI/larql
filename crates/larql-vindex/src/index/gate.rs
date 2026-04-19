@@ -206,7 +206,6 @@ impl VectorIndex {
                             ));
                         }
                     }
-                    _ => {}
                 }
             }
         }

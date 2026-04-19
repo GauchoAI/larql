@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use larql_inference::ComputeBackend;
 use larql_models::ModelWeights;
-use larql_vindex::{PatchedVindex, VindexConfig, ndarray::Array2, tokenizers};
+use larql_vindex::{PatchedVindex, VindexConfig, tokenizers};
 use tokio::sync::RwLock;
 
 use crate::cache::DescribeCache;

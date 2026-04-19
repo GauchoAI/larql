@@ -197,6 +197,58 @@ impl ModelArchitecture for Gemma4Arch {
         !self.is_global_layer(layer)
     }
 
+    // ── MoE (Mixture of Experts) ──
+
+    fn is_moe(&self) -> bool {
+        self.config.num_experts.unwrap_or(0) > 0
+    }
+
+    fn num_experts(&self) -> usize {
+        self.config.num_experts.unwrap_or(0)
+    }
+
+    fn num_experts_per_token(&self) -> usize {
+        self.config.num_experts_per_token.unwrap_or(8)
+    }
+
+    fn num_shared_experts(&self) -> usize {
+        // Gemma 4 always has 1 shared expert (the dense FFN)
+        if self.is_moe() { 1 } else { 0 }
+    }
+
+    fn moe_router_key(&self, layer: usize) -> Option<String> {
+        if !self.is_moe() { return None; }
+        Some(format!("{}mlp.router.weight", self.layer_prefix(layer)))
+    }
+
+    fn expert_ffn_gate_key(&self, layer: usize, _expert_id: usize) -> Option<String> {
+        if !self.is_moe() { return None; }
+        // Gemma 4 fuses gate+up into one tensor: mlp.experts.gate_up_proj.weight
+        // The expert_id indexes into the flattened [num_experts * 1408, 2816] tensor.
+        Some(format!("{}mlp.experts.gate_up_proj.weight", self.layer_prefix(layer)))
+    }
+
+    fn expert_ffn_down_key(&self, layer: usize, _expert_id: usize) -> Option<String> {
+        if !self.is_moe() { return None; }
+        Some(format!("{}mlp.experts.down_proj.weight", self.layer_prefix(layer)))
+    }
+
+    // Shared expert uses the standard dense FFN keys
+    fn shared_expert_gate_key(&self, layer: usize) -> Option<String> {
+        if !self.is_moe() { return None; }
+        Some(format!("{}mlp.gate_proj.weight", self.layer_prefix(layer)))
+    }
+
+    fn shared_expert_up_key(&self, layer: usize) -> Option<String> {
+        if !self.is_moe() { return None; }
+        Some(format!("{}mlp.up_proj.weight", self.layer_prefix(layer)))
+    }
+
+    fn shared_expert_down_key(&self, layer: usize) -> Option<String> {
+        if !self.is_moe() { return None; }
+        Some(format!("{}mlp.down_proj.weight", self.layer_prefix(layer)))
+    }
+
     fn rope_base_for_layer(&self, layer: usize) -> f64 {
         if self.is_sliding_window_layer(layer) {
             self.config.rope_local_base.unwrap_or(10_000.0)

@@ -3,7 +3,7 @@ use std::time::Instant;
 use clap::Args;
 use larql_inference::{
     calibrate_scalar_gains, predict, predict_with_ffn, predict_with_router, predict_with_strategy,
-    FfnBackend, GateIndex, GraphFfn, InferenceModel, LayerFfnRouter, LayerMode, RouteFfn,
+    FfnBackend, InferenceModel, LayerFfnRouter, LayerMode, RouteFfn,
     RouteGuidedFfn, RouteTable, SparseFfn, WeightFfn,
 };
 
@@ -21,21 +21,10 @@ pub struct PredictArgs {
     top_k: usize,
 
     /// FFN backend: "weights" (dense, default), "sparse:K" (top-K features),
-    /// "graph" (uses --gate-index), or layer ranges like "weights:0-25,sparse100:26-33".
+    /// "routes" (uses --routes), or layer ranges like "weights:0-25,sparse100:26-33".
     #[arg(long, default_value = "weights")]
     ffn: String,
 
-    /// Pre-built gate index file (from `larql index-gates`). Required for --ffn graph.
-    #[arg(long)]
-    gate_index: Option<std::path::PathBuf>,
-
-    /// Top tokens for graph FFN residual matching. [default: 10]
-    #[arg(long, default_value = "10")]
-    graph_top_tokens: usize,
-
-    /// Max features for graph FFN per position. [default: 200]
-    #[arg(long, default_value = "200")]
-    graph_top_k: usize,
 
     /// Route table file (from `larql extract-routes`). Required for --ffn routes.
     #[arg(long)]
@@ -124,33 +113,6 @@ fn run_single(
         let result = predict_with_ffn(weights, model.tokenizer(), token_ids, top_k, &ffn);
         eprintln!("  Forward pass: {:.1}s", start.elapsed().as_secs_f64());
         print_predictions(&format!("sparse:{k}"), &result.predictions);
-    } else if ffn_spec == "graph" {
-        let index_path = args.gate_index.as_ref().ok_or(
-            "--gate-index required for --ffn graph. Build with: larql index-gates <model> -o gates.index",
-        )?;
-        eprintln!("Loading gate index: {}", index_path.display());
-        let load_start = Instant::now();
-        let gate_index = GateIndex::load(index_path, args.graph_top_tokens)?;
-        eprintln!(
-            "  {} layers, {} entries ({:.1}s)",
-            gate_index.num_layers(),
-            gate_index.total_entries(),
-            load_start.elapsed().as_secs_f64()
-        );
-
-        let ffn = GraphFfn {
-            weights,
-            gate_index: &gate_index,
-            top_k: args.graph_top_k,
-        };
-        eprintln!(
-            "FFN: graph (top_tokens={}, top_k={})",
-            args.graph_top_tokens, args.graph_top_k
-        );
-        let start = Instant::now();
-        let result = predict_with_ffn(weights, model.tokenizer(), token_ids, top_k, &ffn);
-        eprintln!("  Forward pass: {:.1}s", start.elapsed().as_secs_f64());
-        print_predictions("graph", &result.predictions);
     } else if ffn_spec == "routes" {
         let routes_path = args.routes.as_ref().ok_or(
             "--routes required for --ffn routes. Build with: larql extract-routes <model> -o routes.json",
@@ -245,7 +207,7 @@ fn run_single(
         run_with_layer_spec(model, token_ids, top_k, ffn_spec)?;
     } else {
         return Err(format!(
-            "unknown --ffn value: {ffn_spec}. Use 'weights', 'sparse:K', 'graph', 'routes', or layer ranges"
+            "unknown --ffn value: {ffn_spec}. Use 'weights', 'sparse:K', 'routes', or layer ranges"
         )
         .into());
     }
@@ -486,7 +448,7 @@ fn run_comparison(
     model: &InferenceModel,
     token_ids: &[u32],
     top_k: usize,
-    args: &PredictArgs,
+    _args: &PredictArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let weights = model.weights();
 
@@ -527,46 +489,6 @@ fn run_comparison(
     let result = predict_with_router(weights, model.tokenizer(), token_ids, top_k, &router);
     let elapsed = start.elapsed();
     print_comparison_row("weights:0-25,sparse100:26-33", &result.predictions, elapsed);
-
-    // Graph FFN — only if --gate-index provided
-    if let Some(ref index_path) = args.gate_index {
-        eprintln!("  Loading gate index: {}", index_path.display());
-        let gate_index = GateIndex::load(index_path, args.graph_top_tokens)?;
-        eprintln!(
-            "  {} layers, {} entries",
-            gate_index.num_layers(),
-            gate_index.total_entries()
-        );
-
-        for total_k in [1000, 500, 200, 100] {
-            let graph_ffn = GraphFfn {
-                weights,
-                gate_index: &gate_index,
-                top_k: total_k,
-            };
-            let start = Instant::now();
-            let result = predict_with_ffn(weights, model.tokenizer(), token_ids, top_k, &graph_ffn);
-            let elapsed = start.elapsed();
-            print_comparison_row(&format!("graph:{total_k}"), &result.predictions, elapsed);
-        }
-
-        // Hybrid: weights for early layers, graph FFN for late layers
-        let graph_200 = GraphFfn {
-            weights,
-            gate_index: &gate_index,
-            top_k: 200,
-        };
-        let mut hybrid_backends: Vec<&dyn FfnBackend> = vec![&weight_ffn; weights.num_layers];
-        (26..weights.num_layers).for_each(|l| {
-            hybrid_backends[l] = &graph_200;
-        });
-        let hybrid_router = LayerFfnRouter::per_layer(hybrid_backends);
-        let start = Instant::now();
-        let result =
-            predict_with_router(weights, model.tokenizer(), token_ids, top_k, &hybrid_router);
-        let elapsed = start.elapsed();
-        print_comparison_row("weights:0-25,graph200:26-33", &result.predictions, elapsed);
-    }
 
     Ok(())
 }

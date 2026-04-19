@@ -182,7 +182,7 @@ fn extract_k_vector(
     // better for retrieval matching.
 
     // Read the KV cache to get past_len (for position tracking)
-    let (_, _, past_len) = backend.debug_read_kv_layer(0).unwrap_or((Vec::new(), Vec::new(), 0));
+    let (_, _, _past_len) = backend.debug_read_kv_layer(0).unwrap_or((Vec::new(), Vec::new(), 0));
     // The last token is at position past_len - 1 in the cache.
     // We need to re-compute K from the hidden state at that position.
 

@@ -26,20 +26,21 @@ pub mod fused_ops;
 pub mod q8_attn_proj;
 pub mod q4k_matvec;
 pub mod q4k_qkv_proj;
-pub mod q4kf_ffn_gate_up;
 pub mod q4kf_qkv_proj;
+pub mod q4kf_ffn_gate_up;
 pub mod q4k_ffn_gate_up;
 pub mod q4k_geglu_down;
 pub mod q6k_matvec;
 pub mod activation;
 pub mod layer_norm;
 pub mod v_norm;
-pub mod turboquant_encode;
-pub mod turboquant_decode;
 pub mod graph_walk_knn;
 pub mod f32_sparse_walk;
 pub mod mega_kernel;
 pub mod q4k_fused_norm_matvec;
+pub mod turboquant_encode;
+pub mod turboquant_decode;
+pub mod q8_0_gguf_matvec;
 
 /// Concatenate all shaders into one MSL source string for compilation.
 pub fn all_shaders() -> String {
@@ -48,16 +49,11 @@ pub fn all_shaders() -> String {
     // f32 matmul
     src.push_str(sgemm::SHADER);
     src.push_str(sgemm_transb::SHADER);
-    // Q4 dense matvec variants
-    src.push_str(q4_matvec::SHADER);
-    src.push_str(q4_matvec_v2::SHADER);
-    src.push_str(q4_matvec_v3::SHADER);
+    // Q4 dense matvec (only v4 is used in production)
     src.push_str(q4_matvec_v4::SHADER);
-    src.push_str(q4_matvec_v5::SHADER);
     // Q4 other
     src.push_str(q4_vecmat::SHADER);
     src.push_str(q4_f32_matvec::SHADER);
-    src.push_str(q4_sparse_matvec::SHADER);
     // Q8
     src.push_str(q8_matvec::SHADER);
     // Element-wise
@@ -71,6 +67,7 @@ pub fn all_shaders() -> String {
     src.push_str(fused_attention::SHADER);
     src.push_str(fused_ops::SHADER);
     src.push_str(q8_attn_proj::SHADER);
+    // Q4_K / Q6_K production kernels
     src.push_str(q4k_matvec::SHADER);
     src.push_str(q4k_qkv_proj::SHADER);
     src.push_str(q4kf_qkv_proj::SHADER);
@@ -84,16 +81,11 @@ pub fn all_shaders() -> String {
     src.push_str(layer_norm::SHADER);
     // V-norm (parameter-free, Gemma 4)
     src.push_str(v_norm::SHADER);
-    // TurboQuant (KV cache compression)
-    src.push_str(turboquant_encode::SHADER);
-    src.push_str(turboquant_decode::SHADER);
-    // Graph walk KNN
-    src.push_str(graph_walk_knn::SHADER);
     // f32 sparse walk (Option C)
     src.push_str(f32_sparse_walk::SHADER);
-    // Mega-kernel (S3 — persistent TGs with atomic sync)
-    src.push_str(mega_kernel::TEST_SHADER);
     // Fused norm+matvec (eliminates norm dispatch)
     src.push_str(q4k_fused_norm_matvec::SHADER);
+    // Q8_0 GGUF (MoE expert down projections)
+    src.push_str(q8_0_gguf_matvec::SHADER);
     src
 }

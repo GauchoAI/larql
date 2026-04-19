@@ -85,6 +85,14 @@ fn main() {
         q_norm_weight: None, k_norm_weight: None, post_attn_norm_bias: None,
         ffn_up_bias: None,
         ffn_down_bias: None, softcap: 0.0,
+        router_weight: None,
+        expert_gate_up: None,
+        expert_down: None,
+        expert_down_scale: None,
+        is_moe_layer: false,
+        num_experts: 0,
+        num_active_experts: 0,
+        expert_intermediate: 0,
     };
 
     // Test 1: All-Q4_K (synthetic, matching formats)
@@ -190,6 +198,8 @@ fn main() {
             rope_base: 10000.0, rotary_dim: 0, sliding_window: 0,
             has_v_norm: false, layer_scalar: 0.0,
             input_norm_bias: None, q_norm_weight: None, k_norm_weight: None, post_attn_norm_bias: None, ffn_up_bias: None, ffn_down_bias: None, softcap: 0.0,
+            router_weight: None, expert_gate_up: None, expert_down: None, expert_down_scale: None,
+            is_moe_layer: false, num_experts: 0, num_active_experts: 0, expert_intermediate: 0,
         };
         let mut kv4 = metal.create_kv_cache(1, 4096, num_kv, head_dim);
         let r = larql_compute::metal::MetalBackend::decode_token(
@@ -220,6 +230,8 @@ fn main() {
             rope_base: 10000.0, rotary_dim: 0, sliding_window: 0,
             has_v_norm: false, layer_scalar: 0.0,
             input_norm_bias: None, q_norm_weight: None, k_norm_weight: None, post_attn_norm_bias: None, ffn_up_bias: None, ffn_down_bias: None, softcap: 0.0,
+            router_weight: None, expert_gate_up: None, expert_down: None, expert_down_scale: None,
+            is_moe_layer: false, num_experts: 0, num_active_experts: 0, expert_intermediate: 0,
         };
         let mut kv5 = metal.create_kv_cache(1, 4096, num_kv, head_dim);
         let r = larql_compute::metal::MetalBackend::decode_token(

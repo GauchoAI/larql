@@ -376,8 +376,6 @@ impl<'a> WalkFfn<'a> {
         let mut full_activation = Array2::<f32>::zeros((seq_len, intermediate));
 
         for s in 0..seq_len {
-            let x_row: Vec<f32> = x.row(s).to_vec();
-
             // 1. Dense gate matvec via Metal (matches reference exactly).
             let gate_scores_2d = larql_compute::dot_proj_gpu(
                 &x.slice(ndarray::s![s..s+1, ..]), &gate_view, Some(backend),
@@ -1059,6 +1057,7 @@ impl<'a> FfnBackend for WalkFfn<'a> {
 /// (`|act| < 1e-10`) — cheap sparsity win when the GEGLU output is sparse.
 /// No Metal Q4_K vec×mat shader exists yet; CPU fallback is acceptable
 /// because down is ~5-10% of per-layer wall time once gate+up are on Metal.
+#[allow(dead_code)]
 fn q4k_vecmat_cpu(
     down_q4k: &[u8],
     activation: &[f32],

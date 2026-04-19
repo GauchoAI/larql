@@ -15,6 +15,8 @@ pub enum QuantFormat {
     Q4_KF,  // 160 bytes per 256 values (pre-baked half scales — fast decode)
     Q6_K,   // 210 bytes per 256 values (6-bit with sub-block scales)
     Q8_0,   // int8 values + separate f32 scales
+    /// GGUF Q8_0: interleaved blocks (34 bytes per 32 values: f16 scale + 32×int8).
+    Q8_0Gguf,
 }
 
 /// A quantized weight matrix — raw bytes with format tag.
@@ -124,6 +126,26 @@ pub struct FullPipelineLayer<'a> {
     pub ffn_up_bias: Option<&'a [f32]>,
     /// FFN bias on down projection (StarCoder2). None = no bias.
     pub ffn_down_bias: Option<&'a [f32]>,
+
+    // ── MoE fields (None/false/0 for dense layers) ──
+    /// Router weight [hidden_size, num_experts] as f32 bytes (None = dense FFN).
+    pub router_weight: Option<&'a [f32]>,
+    /// All experts' fused gate+up projections, stacked as one QuantWeight.
+    /// Gemma 4: [2816, 1408, 128] Q4_K → byte offsets per expert.
+    pub expert_gate_up: Option<QuantWeight<'a>>,
+    /// All experts' down projections, stacked as one QuantWeight.
+    /// Gemma 4: [704, 2816, 128] Q8_0 → byte offsets per expert.
+    pub expert_down: Option<QuantWeight<'a>>,
+    /// Per-expert output scale [num_experts] f32. Applied after down projection.
+    pub expert_down_scale: Option<&'a [f32]>,
+    /// Whether this layer uses MoE FFN (true) or dense FFN (false).
+    pub is_moe_layer: bool,
+    /// Number of routed experts in this layer.
+    pub num_experts: usize,
+    /// Number of active experts per token (top-K).
+    pub num_active_experts: usize,
+    /// Per-expert intermediate dimension (e.g., 704 for Gemma 4).
+    pub expert_intermediate: usize,
 }
 
 impl<'a> FullPipelineLayer<'a> {

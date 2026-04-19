@@ -1553,6 +1553,8 @@ fn full_pipeline_seq1_produces_nonzero() {
             q_norm_weight: None, k_norm_weight: None, post_attn_norm_bias: None,
             ffn_up_bias: None,
             ffn_down_bias: None, softcap: 0.0,
+            router_weight: None, expert_gate_up: None, expert_down: None, expert_down_scale: None,
+            is_moe_layer: false, num_experts: 0, num_active_experts: 0, expert_intermediate: 0,
     };
 
     let result = metal.full_pipeline_q4(
@@ -1922,6 +1924,8 @@ fn decode_token_gemma3_produces_finite() {
         q_norm_weight: None, k_norm_weight: None, post_attn_norm_bias: None,
         ffn_up_bias: None,
         ffn_down_bias: None, softcap: 0.0,
+        router_weight: None, expert_gate_up: None, expert_down: None, expert_down_scale: None,
+        is_moe_layer: false, num_experts: 0, num_active_experts: 0, expert_intermediate: 0,
     };
 
     // Simulate CPU prefill populating KV for 3 positions. The K values are
@@ -2139,6 +2143,8 @@ fn decode_token_real_layer0_produces_finite() {
         post_attn_norm_bias: None,
         ffn_up_bias: None,
         ffn_down_bias: None, softcap: 0.0,
+        router_weight: None, expert_gate_up: None, expert_down: None, expert_down_scale: None,
+        is_moe_layer: false, num_experts: 0, num_active_experts: 0, expert_intermediate: 0,
     };
 
     // ── 5. Real post-embed-scale-sized input, like real Gemma 3 embedding output ──
@@ -2195,6 +2201,8 @@ fn decode_token_real_layer0_produces_finite() {
             has_v_norm: false, layer_scalar: 0.0,
             input_norm_bias: None, post_attn_norm_bias: None,
             ffn_up_bias: None, ffn_down_bias: None, softcap: 0.0,
+            router_weight: None, expert_gate_up: None, expert_down: None, expert_down_scale: None,
+            is_moe_layer: false, num_experts: 0, num_active_experts: 0, expert_intermediate: 0,
         }).collect();
         be.reset_kv_cache();
         let r = be.decode_token(
@@ -3211,6 +3219,8 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
             has_v_norm: false, layer_scalar: 0.0,
             input_norm_bias: None, post_attn_norm_bias: None,
             ffn_up_bias: None, ffn_down_bias: None, softcap: 0.0,
+            router_weight: None, expert_gate_up: None, expert_down: None, expert_down_scale: None,
+            is_moe_layer: false, num_experts: 0, num_active_experts: 0, expert_intermediate: 0,
         }
     }).collect();
 

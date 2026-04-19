@@ -29,4 +29,4 @@ pub use vectors::{
 };
 pub use weights::{ModelWeights, WeightArray};
 
-pub use loading::{load_model_dir, resolve_model_path, load_gguf};
+pub use loading::{load_model_dir, resolve_model_path, load_gguf, GgufFile, GgufQuantizedData, GgufTensorInfo};

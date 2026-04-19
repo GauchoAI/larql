@@ -66,8 +66,7 @@ enum Commands {
     /// Bottleneck analysis of attention components.
     AttnBottleneck(attn_bottleneck_cmd::AttnBottleneckArgs),
 
-    /// Benchmark FFN performance: dense vs sparse at various K values.
-    FfnBench(ffn_bench_cmd::FfnBenchArgs),
+    // FfnBench removed — used deprecated experimental FFN backends
 
     /// Bottleneck analysis of FFN components.
     FfnBottleneck(ffn_bottleneck_cmd::FfnBottleneckArgs),
@@ -78,8 +77,7 @@ enum Commands {
     /// Knowledge graph retrieval benchmark — zero matmul entity lookup.
     KgBench(kg_bench_cmd::KgBenchArgs),
 
-    /// Measure FFN throughput: tokens/second at various access patterns.
-    FfnThroughput(ffn_throughput_cmd::FfnThroughputArgs),
+    // FfnThroughput removed — used deprecated CachedFfn
 
     /// Build a .vindex — the model decompiled to a standalone vector index.
     ExtractIndex(extract_index_cmd::ExtractIndexArgs),
@@ -234,11 +232,11 @@ fn main() {
         Commands::ExtractRoutes(args) => extract_routes_cmd::run(args),
         Commands::Walk(args) => walk_cmd::run(args),
         Commands::AttnBottleneck(args) => attn_bottleneck_cmd::run(args),
-        Commands::FfnBench(args) => ffn_bench_cmd::run(args),
+        // Commands::FfnBench removed
         Commands::FfnBottleneck(args) => ffn_bottleneck_cmd::run(args),
         Commands::FfnOverlap(args) => ffn_overlap_cmd::run(args),
         Commands::KgBench(args) => kg_bench_cmd::run(args),
-        Commands::FfnThroughput(args) => ffn_throughput_cmd::run(args),
+        // Commands::FfnThroughput removed
         Commands::ExtractIndex(args) => extract_index_cmd::run(args),
         Commands::Build(args) => build_cmd::run(args),
         Commands::Convert(args) => convert_cmd::run(args),

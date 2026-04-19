@@ -7,14 +7,11 @@
 //! - [`HighwayFfn`] — returns zeros (skip FFN)
 //!
 //! See also `WalkFfn` in `vector_index.rs` (delegates to WeightFfn + vindex trace).
-//!
-//! ## Experimental backends
-//! See `experimental/` for research backends developed during FFN optimization.
 
 pub mod weight;
 pub mod sparse;
 pub mod sparse_compute;
-pub mod experimental;
+
 #[cfg(test)]
 mod tests;
 

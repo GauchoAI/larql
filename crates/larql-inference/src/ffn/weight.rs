@@ -3,7 +3,7 @@
 
 use ndarray::Array2;
 
-use crate::forward::{add_bias, dot_proj};
+use crate::forward::add_bias;
 use crate::model::ModelWeights;
 use super::{sigmoid, gelu_tanh, silu_gate_up, gelu_tanh_gate_up, FfnBackend};
 

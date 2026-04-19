@@ -13,20 +13,20 @@
 //!   data: [DONE]
 
 use std::sync::Arc;
-use std::time::Instant;
 use std::convert::Infallible;
 
 use axum::Json;
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
-use futures::stream::{self, Stream};
+use futures::stream;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServerError;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct ChatRequest {
     #[serde(default)]
     pub model: String,

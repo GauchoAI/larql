@@ -190,7 +190,7 @@ fn encode_quant_matvec(
         crate::QuantFormat::Q4_0 => {
             encode_q4_matvec(enc, q4_pipeline, buf_w, buf_input, buf_scales, buf_out, num_rows, hidden);
         }
-        crate::QuantFormat::Q8_0 => {
+        crate::QuantFormat::Q8_0 | crate::QuantFormat::Q8_0Gguf => {
             encode_q8_matvec(enc, q8_pipeline, buf_w, buf_input, buf_scales, buf_input_scales, buf_out, num_rows, hidden);
         }
     }

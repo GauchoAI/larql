@@ -8,4 +8,4 @@ pub mod safetensors;
 pub mod gguf;
 
 pub use safetensors::{load_model_dir, resolve_model_path};
-pub use gguf::load_gguf;
+pub use gguf::{load_gguf, GgufFile, GgufQuantizedData, GgufTensorInfo};

@@ -220,6 +220,7 @@ impl HnswLayer {
     /// Magnitude of the dot product — used for ranking so strongly-negative
     /// features are not missed. Brute-force `gate_knn` ranks by this.
     #[inline(always)]
+    #[allow(dead_code)]
     fn dot_abs(a: &ArrayView1<f32>, b: &ArrayView1<f32>) -> f32 {
         Self::dot(a, b).abs()
     }

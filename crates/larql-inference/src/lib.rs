@@ -48,18 +48,6 @@ pub use forward::{
     run_memit, MemitFact, MemitResult, MemitFactResult,
 };
 pub use graph_ffn::{GateIndex, IndexBuildCallbacks, SilentIndexCallbacks};
-#[allow(deprecated)]
-pub use ffn::experimental::cached::CachedFfn;
-#[allow(deprecated)]
-pub use ffn::experimental::clustered::{ClusteredFfn, ClusteredGateIndex};
-#[allow(deprecated)]
-pub use ffn::experimental::down_clustered::{DownClusteredFfn, DownClusteredIndex};
-#[allow(deprecated)]
-pub use ffn::experimental::entity_routed::EntityRoutedFfn;
-#[allow(deprecated)]
-pub use ffn::experimental::feature_list::FeatureListFfn;
-#[allow(deprecated)]
-pub use ffn::experimental::graph::GraphFfn;
 pub use route_ffn::{RouteFfn, RouteGuidedFfn, RouteTable};
 pub use trace::{
     trace_residuals, trace as trace_decomposed, AnswerWaypoint, LayerSummary,

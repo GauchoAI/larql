@@ -18,6 +18,7 @@ use crate::state::AppState;
 const RETRIEVAL_LAYER: usize = 29;
 const QUERY_HEAD: usize = 4;      // 8 Q heads, this is the copy head
 const KV_HEAD: usize = 2;         // query_head 4 → kv_head 2 (GQA 8/4)
+#[allow(dead_code)]
 const INJECTION_LAYER: usize = 30;
 const HEAD_DIM: usize = 256;
 
@@ -78,6 +79,7 @@ impl VecStore {
     }
 
     /// Get all entries for vec_inject at inference time
+    #[allow(dead_code)]
     pub fn get_inject_entries(&self, q_vector: &[f32], threshold: f32) -> Vec<(u32, f32)> {
         let entries = self.entries.read().unwrap();
         if entries.is_empty() { return Vec::new(); }

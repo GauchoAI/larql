@@ -22,8 +22,6 @@ pub mod logits;
 pub mod generate;
 // hybrid module removed — predict_hybrid was never called from the inference path
 pub mod predict;
-pub mod ngram_cache;
-pub mod speculative;
 
 use ndarray::Array2;
 

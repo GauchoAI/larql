@@ -98,6 +98,8 @@ pub struct MetalBackend {
     // f32 sparse walk (Option C): only top-K rows read from mmap'd f32.
     pub f32_sparse_matvec_pipeline: ComputePipelineState,
     pub f32_sparse_vecmat_pipeline: ComputePipelineState,
+    // Q8_0 GGUF matvec (MoE expert down projections)
+    pub q8_0_gguf_matvec_pipeline: ComputePipelineState,
     /// KV cache for decode mode — initialized on first decode_token call.
     kv_cache: std::sync::Mutex<Option<ops::kv_cache::KVCache>>,
     pub rms_norm_q8_pipeline: ComputePipelineState,
@@ -263,6 +265,10 @@ impl MetalBackend {
         let f32_sparse_vecmat_fn = library.get_function("f32_sparse_vecmat", None).ok()?;
         let f32_sparse_vecmat_pipeline = device.new_compute_pipeline_state_with_function(&f32_sparse_vecmat_fn).ok()?;
 
+        // Q8_0 GGUF matvec (MoE expert down projections)
+        let q8_0_gguf_fn = library.get_function("q8_0_gguf_matvec", None).ok()?;
+        let q8_0_gguf_matvec_pipeline = device.new_compute_pipeline_state_with_function(&q8_0_gguf_fn).ok()?;
+
         Some(Self {
             queue, bufs, f32_ops, q4, causal_attn_pipeline, fused_attn_pipeline,
             geglu_pipeline, geglu_gelu_tanh_pipeline, q8_quant_pipeline,
@@ -284,6 +290,7 @@ impl MetalBackend {
             v_norm_pipeline, v_norm_batched_pipeline,
             scale_vector_pipeline,
             f32_sparse_matvec_pipeline, f32_sparse_vecmat_pipeline,
+            q8_0_gguf_matvec_pipeline,
             kv_cache: std::sync::Mutex::new(None),
             rms_norm_q8_pipeline, residual_norm_pipeline, residual_norm_q8_pipeline,
             flop_threshold: AtomicUsize::new(calibrate::DEFAULT_FLOP_THRESHOLD),

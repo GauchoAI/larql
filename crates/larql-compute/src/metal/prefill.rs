@@ -85,9 +85,8 @@ fn encode_quant_matvec_at_offset(
             enc.set_bytes(4, 4, &k as *const u32 as *const c_void);
             enc.dispatch_thread_groups(MTLSize::new(num_tgs, 1, 1), MTLSize::new(q4mv_shader::THREADS_PER_TG, 1, 1));
         }
-        crate::QuantFormat::Q8_0 => {
-            // Q8_0 needs Q8 input — not supported in prefill offset mode
-            // Use Q4_K path instead (the caller should provide Q4_K weights)
+        crate::QuantFormat::Q8_0 | crate::QuantFormat::Q8_0Gguf => {
+            // Q8_0 / Q8_0Gguf — use Q8 matvec pipeline
             let n = num_rows as u32;
             let k = hidden as u32;
             enc.set_compute_pipeline_state(q8_pipeline);

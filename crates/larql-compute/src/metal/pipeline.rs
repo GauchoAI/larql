@@ -47,6 +47,14 @@ impl MetalBackend {
                 softcap: 0.0,
                 ffn_up_bias: None,
                 ffn_down_bias: None,
+                router_weight: None,
+                expert_gate_up: None,
+                expert_down: None,
+                expert_down_scale: None,
+                is_moe_layer: false,
+                num_experts: 0,
+                num_active_experts: 0,
+                expert_intermediate: 0,
             }
         }).collect();
         ops::full_pipeline::dispatch_full_pipeline(

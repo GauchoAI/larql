@@ -119,6 +119,8 @@ fn main() {
                 q_norm_weight: None, k_norm_weight: None, post_attn_norm_bias: None,
                 ffn_up_bias: None,
                 ffn_down_bias: None, softcap: 0.0,
+                router_weight: None, expert_gate_up: None, expert_down: None, expert_down_scale: None,
+                is_moe_layer: false, num_experts: 0, num_active_experts: 0, expert_intermediate: 0,
             }
         }).collect();
 
@@ -159,6 +161,8 @@ fn main() {
                 q_norm_weight: None, k_norm_weight: None, post_attn_norm_bias: None,
                 ffn_up_bias: None,
                 ffn_down_bias: None, softcap: 0.0,
+                router_weight: None, expert_gate_up: None, expert_down: None, expert_down_scale: None,
+                is_moe_layer: false, num_experts: 0, num_active_experts: 0, expert_intermediate: 0,
             }
         }).collect();
 
@@ -199,6 +203,8 @@ fn main() {
                 q_norm_weight: None, k_norm_weight: None, post_attn_norm_bias: None,
                 ffn_up_bias: None,
                 ffn_down_bias: None, softcap: 0.0,
+                router_weight: None, expert_gate_up: None, expert_down: None, expert_down_scale: None,
+                is_moe_layer: false, num_experts: 0, num_active_experts: 0, expert_intermediate: 0,
             }
         }).collect();
 

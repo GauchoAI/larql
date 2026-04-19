@@ -215,7 +215,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "quit" | "exit" => break,
             "help" => {
                 println!("  ask \"text\" [N]    — fast prefill + decode N tokens (default 20), Metal + KNN overlay");
-                println!("  spec \"text\" [N] [K] — speculative decode: n-gram draft K, verify, accept prefix");
                 println!("  insert \"entity\" \"relation\" \"target\" [layer]");
                 println!("                    — capture residual via Metal f32 forward, add to KNN overlay");
                 println!("  save \"file.vlp\"   — persist the runtime KNN overlay as a .vlp patch");
@@ -839,50 +838,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if stopped { "  [stopped on EOS]" } else { "" });
                 last_prompt_tokens = ids;
                 last_prediction = Some(next);
-            }
-            "spec" => {
-                // Speculative decode: n-gram draft K tokens, verify, accept prefix.
-                // Usage: spec "prompt text" [N] [K]
-                // N = max tokens (default 20), K = max draft length (default 4)
-                let (text_raw, n_raw) = split_trailing_int(rest);
-                let text = parse_quoted(text_raw);
-                let parts: Vec<&str> = n_raw.split_whitespace().collect();
-                let n: usize = parts.first().and_then(|s| s.parse().ok()).unwrap_or(20);
-                let k: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(4);
-                let enc = tokenizer.encode(text.as_str(), true).map_err(|e| e.to_string())?;
-                let ids: Vec<u32> = enc.get_ids().to_vec();
-
-                // Build pipeline layers for decode_token
-                let gi: &dyn larql_vindex::GateIndex = &index;
-                let spec_ffn_mmap = gi.interleaved_q4k_real_mmap_ref()
-                    .or_else(|| gi.interleaved_q4k_mmap_ref())
-                    .unwrap_or(&[][..]);
-                let spec_inter = gi.num_features(0);
-                let spec_q4_per = (spec_inter * weights.hidden_size).div_ceil(256) * 148;
-                eprintln!("[spec] building layers: inter={spec_inter} mmap_len={} q4_per={spec_q4_per}",
-                    spec_ffn_mmap.len());
-                let spec_layers = if spec_ffn_mmap.is_empty() || spec_inter == 0 {
-                    eprintln!("[spec] WARNING: no FFN mmap or zero features, using empty layers");
-                    Vec::new()
-                } else {
-                    larql_inference::layer_graph::pipeline_layer::build_pipeline_layers(
-                        weights, &index, 0..num_layers,
-                        spec_ffn_mmap, spec_q4_per, larql_compute::QuantFormat::Q4_K,
-                    )
-                };
-                let r = larql_inference::layer_graph::speculative::generate_speculative(
-                    weights, tokenizer, &ids, n, k,
-                    &index, &*backend, &spec_layers,
-                );
-
-                print!("{text}");
-                for (tok, _) in &r.tokens { print!("{tok}"); }
-                println!();
-                println!("  prefill: {:.0}ms  decode: {:.0}ms  tokens: {}  effective: {:.2} tok/s",
-                    r.prefill_ms, r.decode_ms, r.tokens.len(), r.effective_tok_s());
-                println!("  spec stats: drafted {} accepted {} ({:.1}%) cycles {}",
-                    r.total_drafted, r.total_accepted,
-                    r.acceptance_rate() * 100.0, r.total_cycles);
             }
             "prompt" => {
                 let text = parse_quoted(rest);

@@ -28,6 +28,7 @@ use crate::error::ServerError;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct GenerateRequest {
     pub prompt: String,
     #[serde(default = "default_n")]

@@ -261,6 +261,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         post_attn_norm_bias: None,
         ffn_up_bias: None,
         ffn_down_bias: None, softcap: 0.0,
+        router_weight: None,
+        expert_gate_up: None,
+        expert_down: None,
+        expert_down_scale: None,
+        is_moe_layer: false,
+        num_experts: 0,
+        num_active_experts: 0,
+        expert_intermediate: 0,
     };
 
     // For layer L>0, the KV cache index inside MetalBackend is rel_idx, not abs.

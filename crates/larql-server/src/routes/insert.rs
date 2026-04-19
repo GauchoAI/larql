@@ -14,8 +14,6 @@ use serde::Deserialize;
 use crate::error::ServerError;
 use crate::state::{AppState, LoadedModel};
 
-// Re-export for GPU pipeline path in KNN insert
-use larql_inference::ComputeBackend;
 
 #[derive(Deserialize)]
 pub struct InsertRequest {
@@ -243,14 +241,14 @@ fn run_insert_knn(
         // When value_layer is set, use capture_knn_key_perlayer which runs
         // the EXACT same per-layer path as inference (Q6_K attention + CPU
         // softmax + GPU FFN). Without value_layer, use the fast GPU path.
-        let use_perlayer = req.value_layer.is_some();
+        let _use_perlayer = req.value_layer.is_some();
 
         let walk_ffn_cap = if model.walk_only {
             Some(larql_inference::WalkFfn::new_with_backend(
                 weights, patched.base(), 1024, &**backend,
             ))
         } else { None };
-        let ffn_ov: Option<&dyn larql_inference::ffn::FfnBackend> =
+        let _ffn_ov: Option<&dyn larql_inference::ffn::FfnBackend> =
             walk_ffn_cap.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
 
         // Always use the Q4_K GPU path for key capture. This matches the

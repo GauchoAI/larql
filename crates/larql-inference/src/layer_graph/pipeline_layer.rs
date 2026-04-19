@@ -40,7 +40,10 @@ pub fn build_arch_params<'a>(
         0
     };
     let layer_scalar = arch.layer_scalar_key(layer)
-        .and_then(|k| weights.vectors.get(&k))
+        .and_then(|k| weights.vectors.get(&k)
+            // Fallback: GGUF normalizes `layer_output_scale.weight` → `layer_scalar.weight`
+            // while safetensors uses `layer_scalar` (no .weight suffix for scalars).
+            .or_else(|| weights.vectors.get(&format!("{k}.weight"))))
         .and_then(|v| v.first().copied())
         .unwrap_or(0.0);
 
@@ -50,6 +53,11 @@ pub fn build_arch_params<'a>(
         input_norm: weights.vectors.get(&arch.input_layernorm_key(layer))
             .map(|v| v.as_slice()).unwrap_or(&[]),
         post_attn_norm: weights.vectors.get(&arch.post_attention_layernorm_key(layer))
+            // Fallback: GGUF normalizes `ffn_norm` to `pre_feedforward_layernorm`.
+            // For 2-norm models (Llama) where HF calls this norm `post_attention_layernorm`,
+            // look up `pre_feedforward_layernorm` as a fallback.
+            .or_else(|| arch.pre_feedforward_layernorm_key(layer)
+                .and_then(|k| weights.vectors.get(&k)))
             .map(|v| v.as_slice()).unwrap_or(&[]),
         pre_ffn_norm: arch.pre_feedforward_layernorm_key(layer)
             .and_then(|k| weights.vectors.get(&k)).map(|v| v.as_slice()),
@@ -91,6 +99,14 @@ pub fn build_arch_params<'a>(
             .and_then(|k| weights.vectors.get(&k)).map(|v| v.as_slice()),
         ffn_down_bias: arch.ffn_down_bias_key(layer)
             .and_then(|k| weights.vectors.get(&k)).map(|v| v.as_slice()),
+        router_weight: None,
+        expert_gate_up: None,
+        expert_down: None,
+        expert_down_scale: None,
+        is_moe_layer: false,
+        num_experts: 0,
+        num_active_experts: 0,
+        expert_intermediate: 0,
     }
 }
 
@@ -180,7 +196,7 @@ pub fn build_pipeline_layers<'a>(
     // q6_per_matrix is 210/148 × q4_per_matrix.
     let q4kf_per_matrix = q4_ffn_per_matrix * 144 / 148;
     let q6_per_matrix = q4_ffn_per_matrix * 210 / 148;
-    let uniform_q4_per_layer = q4_ffn_per_matrix * 3;
+    let _uniform_q4_per_layer = q4_ffn_per_matrix * 3;
     let mixed_q4q6_per_layer = 2 * q4_ffn_per_matrix + q6_per_matrix;
     let uniform_q6_per_layer = q6_per_matrix * 3;
     let mixed_q4kf_q6_per_layer = 2 * q4kf_per_matrix + q6_per_matrix;

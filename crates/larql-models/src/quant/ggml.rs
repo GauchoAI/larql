@@ -37,7 +37,7 @@ pub fn tensor_data_size(tensor_type: u32, n_elements: usize) -> Result<usize, Mo
         TYPE_Q5_0 => Ok(n_elements / 32 * 22),
         TYPE_Q5_1 => Ok(n_elements / 32 * 24),
         TYPE_Q8_0 => Ok(n_elements / 32 * 34),
-        TYPE_Q4_K => Ok(n_elements / 256 * 148),  // super-block of 256 = 148 bytes
+        TYPE_Q4_K => Ok(n_elements / 256 * 144),  // GGUF super-block: d(2)+dmin(2)+packed_scales_mins(12)+qs(128) = 144 bytes
         TYPE_Q6_K => Ok(n_elements / 256 * 210),  // super-block of 256 = 210 bytes
         TYPE_Q2_K => Ok(n_elements / 256 * 84),
         TYPE_Q3_K => Ok(n_elements / 256 * 110),
@@ -213,8 +213,10 @@ pub fn dequantize_q5_1(data: &[u8], n_elements: usize) -> Result<Vec<f32>, Model
 
 /// Q4_K: super-block of 256 values = 148 bytes.
 /// [0..1] f16 d, [2..3] f16 dmin, [4..15] 6-bit scales, [16..19] 4-bit mins, [20..147] 4-bit quants.
+/// Q4_K GGUF: super-block of 256 values = 144 bytes (llama.cpp layout).
+/// [0..1] half d, [2..3] half dmin, [4..15] packed scales+mins (12 bytes), [16..143] 128 qs bytes.
 pub fn dequantize_q4_k(data: &[u8], n_elements: usize) -> Result<Vec<f32>, ModelError> {
-    let block_size = 148;
+    let block_size = 144;
     let super_block = 256;
     let n_blocks = n_elements / super_block;
     let mut out = Vec::with_capacity(n_elements);
@@ -224,20 +226,21 @@ pub fn dequantize_q4_k(data: &[u8], n_elements: usize) -> Result<Vec<f32>, Model
         let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
 
-        // Unpack 8 × 6-bit scales from bytes 4..15
+        // Unpack scales and mins from the 12-byte packed format (llama.cpp convention).
+        // Bytes 0-3: low 6 bits = ls[0..3], high 2 bits = upper bits of ls[4..7]
+        // Bytes 4-7: low 6 bits = lm[0..3], high 2 bits = upper bits of lm[4..7]
+        // Bytes 8-11: low nibble = low 4 bits of ls[4..7], high nibble = low 4 bits of lm[4..7]
         let sc = &block[4..16];
         let mut scales = [0u8; 8];
         let mut mins = [0u8; 8];
-        // Lower 6 bits of scales from bytes 0-7
-        for (j, &s) in sc[..8].iter().enumerate() { scales[j] = s & 0x3F; }
-        // 4-bit mins from bytes 16-19
-        let mb = &block[16..20];
         for j in 0..4 {
-            mins[j] = mb[j] & 0x0F;
-            mins[j + 4] = (mb[j] >> 4) & 0x0F;
+            scales[j] = sc[j] & 0x3F;
+            mins[j] = sc[j + 4] & 0x3F;
+            scales[j + 4] = ((sc[j] >> 6) << 4) | (sc[j + 8] & 0x0F);
+            mins[j + 4] = ((sc[j + 4] >> 6) << 4) | ((sc[j + 8] >> 4) & 0x0F);
         }
 
-        let quants = &block[20..148];
+        let quants = &block[16..144];
         for j in 0..8 {
             let sc_val = d * scales[j] as f32;
             let mn_val = dmin * mins[j] as f32;

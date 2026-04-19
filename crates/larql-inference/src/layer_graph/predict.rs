@@ -5,11 +5,9 @@
 //! KV cache prefill goes through `prefill::prefill_with_kv()`.
 //! Token generation goes through `generate::generate()`.
 
-use ndarray::Array2;
-
 use larql_compute::ComputeBackend;
 use crate::model::ModelWeights;
-use super::{LayerGraph, DenseLayerGraph, CachedLayerGraph};
+use super::{LayerGraph, CachedLayerGraph};
 
 // Re-export moved functions for backward compatibility.
 pub use super::prefill::prefill_with_kv;
@@ -166,7 +164,7 @@ pub fn capture_knn_key_perlayer(
     // The "next token" after prefill — use the embedding of the last prompt token
     // as input (this mirrors how inference starts the decode loop after prefill).
     let last_embed: Vec<f32> = embeds.row(seq_len - 1).to_vec();
-    let mut h_tok = ndarray::Array2::from_shape_vec((1, hidden), last_embed).unwrap();
+    let _h_tok = ndarray::Array2::from_shape_vec((1, hidden), last_embed).unwrap();
 
     // Actually — after Q4_K prefill, the model already computed the output for
     // all prefill tokens. The NEXT decode step would use the sampled first token.
@@ -336,7 +334,7 @@ pub fn predict_honest_with_knn_ffn(
     // GPU pipeline: decode (seq=1) uses decode_token/full_pipeline_q4,
     // prefill (seq>1) uses prefill_q4 for GPU-accelerated multi-position inference.
     let seq_len = h.shape()[0];
-    let trace_path = std::env::var("LARQL_TRACE_PATH").ok().as_deref() == Some("1");
+    let _trace_path = std::env::var("LARQL_TRACE_PATH").ok().as_deref() == Some("1");
     let used_gpu = if backend.has_q4() {
         let gate_index: &dyn larql_vindex::GateIndex = index;
         // Prefer Q4_K FFN (Ollama-compatible) over Q4_0.
@@ -459,7 +457,7 @@ pub fn predict_honest_with_knn_ffn(
                     let measure = trace_decode || crate::perf::is_enabled();
                     let mut t_attn_total_us = 0u128;
                     let mut t_ffn_total_us = 0u128;
-                    let mut t_knn_total_us = 0u128;
+                    let t_knn_total_us = 0u128;
                     let knn_layers: Vec<usize> = knn_store.map(|s| s.layers()).unwrap_or_default();
                     const KNN_COSINE_THRESHOLD: f32 = 0.75;
                     // Pending value injection: (value_vector, value_layer, label)

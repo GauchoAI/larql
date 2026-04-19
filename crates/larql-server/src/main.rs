@@ -165,8 +165,9 @@ fn load_single_vindex(path_str: &str, no_infer: bool, walk_only: bool) -> Result
         index.advise_dontneed_unused();
     }
 
-    let (embeddings, embed_scale) = load_vindex_embeddings(&path)?;
-    info!("  Embeddings: {}x{}", embeddings.shape()[0], embeddings.shape()[1]);
+    let (embeddings_owned, embed_scale) = load_vindex_embeddings(&path)?;
+    info!("  Embeddings: {}x{}", embeddings_owned.shape()[0], embeddings_owned.shape()[1]);
+    let embeddings: larql_models::WeightArray = embeddings_owned.into_shared();
 
     let tokenizer = load_vindex_tokenizer(&path)?;
     let patched = PatchedVindex::new(index);

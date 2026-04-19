@@ -23,7 +23,7 @@ pub struct LoadedModel {
     /// Base index with patch overlay (starts with no patches).
     pub patched: RwLock<PatchedVindex>,
     /// Embeddings matrix + scale factor, loaded once.
-    pub embeddings: Array2<f32>,
+    pub embeddings: larql_models::WeightArray,
     pub embed_scale: f32,
     /// Tokenizer for embedding lookups.
     pub tokenizer: tokenizers::Tokenizer,
@@ -85,6 +85,13 @@ impl LoadedModel {
                 tracing::info!("[Q4 lm_head available] dropped f32 lm_head: {:.1} GB freed", freed as f64 / 1e9);
             }
         }
+        // Share embedding matrix: replace weights.embed with a clone of
+        // LoadedModel.embeddings (same ArcArray2, one allocation).
+        // Saves ~2.7 GB by deduplicating the embedding matrix.
+        let old_embed_size = weights.embed.len() * 4;
+        weights.embed = self.embeddings.clone(); // ArcArray2 clone = refcount bump, not copy
+        tracing::info!("[shared embed] deduplicated embedding matrix: {:.1} GB freed",
+            old_embed_size as f64 / 1e9);
         let _ = self.weights.set(weights);
         Ok(self.weights.get().unwrap())
     }

@@ -798,12 +798,46 @@ larql-server loads fine-tuned GGUF
 TUI extracts annotations → persists facts/workflows → sidebar renders
 ```
 
+### V3: Production-Grade Structured Output (7/7 tests)
+
+Retrained with richer data (104 examples). Key improvements:
+
+**Rich fact metadata (RAG/graph-friendly):**
+```
+key: server port        # short, searchable
+value: 3000             # the fact
+category: infrastructure  # domain classification
+confidence: high         # reliability signal
+source: user             # provenance
+related_to: server       # graph edge for RAG traversal
+```
+
+**Workflow loops (test → edit → compile → test):**
+- Plans with `priority` and `total_steps` fields
+- Step-by-step status updates with `workflow` + `step` references
+- Blocked state with `blockers` field
+- Edit suggestions with `file` and `action` fields
+
+**Test results (v3, 7/7):**
+
+| # | Input | Output | Structured fields |
+|---|-------|--------|-------------------|
+| 1 | "Sarah, DevOps at Netflix" | Fact | category=identity, confidence=high |
+| 2 | "Fix the memory leak" | Plan | priority=high, 4 steps |
+| 3 | "Plan WebSocket support" | Plan | 6 steps, priority=high |
+| 4 | "What is 2+2?" | "4." | None (correct) |
+| 5 | "Search decode_token" | Tool | `search decode_token` |
+| 6 | "API latency 200ms, investigate" | Fact + Tool | related_to=api |
+| 7 | "What do you know?" | Tool | `facts` retrieval |
+
 ### What This Enables
 
 The self-annotating model is the memory substrate for larql:
 - **Zero context growth**: facts stored externally, not in prompt
 - **Automatic knowledge capture**: every conversation builds the fact store
-- **Workflow orchestration**: model plans, tracks progress, reports completion
+- **Graph-friendly metadata**: category + related_to enable RAG traversal
+- **Workflow orchestration**: plan → step tracking → completion with loops
 - **Tool integration**: model calls tools via structured blocks
+- **Edit tracking**: model suggests file changes with path + action
 - **Conciseness**: no filler responses, direct answers
-- **RAG-friendly**: structured key/value facts enable precise retrieval
+- **Proactive personality**: enthusiastic, expert at codebase exploration

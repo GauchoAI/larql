@@ -56,7 +56,8 @@ pub struct MetalBackend {
     pub geglu_pipeline: ComputePipelineState,
     pub geglu_gelu_tanh_pipeline: ComputePipelineState,
     q8_quant_pipeline: ComputePipelineState,
-    pub kv_attend_pipeline: ComputePipelineState,
+    pub kv_attend_fast_pipeline: ComputePipelineState,
+    pub kv_attend_long_pipeline: ComputePipelineState,
     pub kv_append_pipeline: ComputePipelineState,
     pub kv_attend_batched_pipeline: ComputePipelineState,
     pub kv_append_batch_pipeline: ComputePipelineState,
@@ -233,10 +234,12 @@ impl MetalBackend {
         let scale_vector_fn = library.get_function("scale_vector", None).ok()?;
         let scale_vector_pipeline = device.new_compute_pipeline_state_with_function(&scale_vector_fn).ok()?;
 
-        // KV cache attention (single + batched for speculative decoding)
-        let kv_attend_fn = library.get_function("kv_attention", None).ok()?;
+        // KV cache attention: fast (T≤1024, 4KB tg) + long (T>1024, 32KB tg)
+        let kv_attend_fast_fn = library.get_function("kv_attention_fast", None).ok()?;
+        let kv_attend_long_fn = library.get_function("kv_attention_long", None).ok()?;
         let kv_append_fn = library.get_function("kv_cache_append", None).ok()?;
-        let kv_attend_pipeline = device.new_compute_pipeline_state_with_function(&kv_attend_fn).ok()?;
+        let kv_attend_fast_pipeline = device.new_compute_pipeline_state_with_function(&kv_attend_fast_fn).ok()?;
+        let kv_attend_long_pipeline = device.new_compute_pipeline_state_with_function(&kv_attend_long_fn).ok()?;
         let kv_append_pipeline = device.new_compute_pipeline_state_with_function(&kv_append_fn).ok()?;
         let kv_attend_batched_fn = library.get_function("kv_attention_batched", None).ok()?;
         let kv_append_batch_fn = library.get_function("kv_cache_append_batch", None).ok()?;
@@ -252,7 +255,7 @@ impl MetalBackend {
         Some(Self {
             queue, bufs, f32_ops, q4, causal_attn_pipeline, fused_attn_pipeline,
             geglu_pipeline, geglu_gelu_tanh_pipeline, q8_quant_pipeline,
-            kv_attend_pipeline, kv_append_pipeline,
+            kv_attend_fast_pipeline, kv_attend_long_pipeline, kv_append_pipeline,
             kv_attend_batched_pipeline, kv_append_batch_pipeline,
             q8_matvec_pipeline,
             rms_norm_pipeline, residual_add_pipeline,

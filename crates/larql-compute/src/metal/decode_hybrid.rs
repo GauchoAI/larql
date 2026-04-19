@@ -203,9 +203,15 @@ impl MetalBackend {
                 enc_b, &kv_cache.layers[layer_idx],
                 &self.kv_append_pipeline, &k_out, &v_out,
             );
+            let t_after = kv_cache.layers[layer_idx].current_len + 1;
+            let kv_attend = if t_after <= 1024 {
+                &self.kv_attend_fast_pipeline
+            } else {
+                &self.kv_attend_long_pipeline
+            };
             ops::kv_cache::encode_kv_attend(
                 enc_b, &kv_cache.layers[layer_idx],
-                &self.kv_attend_pipeline, &q_out, &attn_out,
+                kv_attend, &q_out, &attn_out,
                 layer_num_q_heads, scale, window_size,
             );
             enc_b.end_encoding();

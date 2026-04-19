@@ -512,6 +512,42 @@ impl VectorIndex {
         Ok(count)
     }
 
+    /// Tell the OS to release physical pages for mmaps not needed during
+    /// Q4_K inference. The mmaps stay mapped (pointers remain valid,
+    /// capability detection still works) but the OS can reclaim the RAM.
+    /// If the data is accessed later, it gets paged back in from disk.
+    pub fn advise_dontneed_unused(&self) {
+        let mut freed = 0u64;
+        let advise = |mmap: &Option<Arc<memmap2::Mmap>>, name: &str, freed: &mut u64| {
+            if let Some(ref m) = mmap {
+                let len = m.len();
+                #[cfg(unix)]
+                unsafe {
+                    libc::madvise(
+                        m.as_ptr() as *mut libc::c_void,
+                        len,
+                        libc::MADV_DONTNEED,
+                    );
+                }
+                *freed += len as u64;
+                eprintln!("[madvise] released {name}: {:.0} MB", len as f64 / 1e6);
+            }
+        };
+        // Walk-only files (not read during Q4_K inference)
+        advise(&self.down_features_mmap, "down_features", &mut freed);
+        advise(&self.up_features_mmap, "up_features", &mut freed);
+        advise(&self.gate_mmap_bytes, "gate_vectors", &mut freed);
+        // f32 interleaved (replaced by Q4_K real)
+        advise(&self.interleaved_mmap, "interleaved_f32", &mut freed);
+        // Fallback quant formats (Q4_0, Q6_K) when Q4_K real is available
+        advise(&self.interleaved_q4_mmap, "interleaved_q4", &mut freed);
+        advise(&self.interleaved_q4k_mmap, "interleaved_q4k", &mut freed);
+        // f32 lm_head (replaced by lm_head_q4)
+        advise(&self.lm_head_mmap, "lm_head_f32", &mut freed);
+        if freed > 0 {
+            eprintln!("[madvise] total released: {:.1} GB", freed as f64 / 1e9);
+        }
+    }
 }
 
 impl GateIndex for VectorIndex {

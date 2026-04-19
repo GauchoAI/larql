@@ -158,6 +158,13 @@ fn load_single_vindex(path_str: &str, no_infer: bool, walk_only: bool) -> Result
     index.warmup();
     info!("  Warmup: done");
 
+    // Release pages for mmaps not needed during Q4_K inference.
+    // The mmaps stay open (capability detection still works) but the OS
+    // can reclaim the physical memory. Saves ~9.4 GB of resident pages.
+    if path.join("interleaved_q4k_real.bin").exists() {
+        index.advise_dontneed_unused();
+    }
+
     let (embeddings, embed_scale) = load_vindex_embeddings(&path)?;
     info!("  Embeddings: {}x{}", embeddings.shape()[0], embeddings.shape()[1]);
 

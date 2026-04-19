@@ -432,9 +432,13 @@ fn write_floats(w: &mut impl Write, data: &[f32], dtype: crate::config::dtype::S
 /// Load a full ModelWeights from a vindex directory.
 ///
 /// Tries split files (v2) first, falls back to model_weights.bin (v1).
-pub fn load_model_weights(
+/// Load model weights. `skip_patterns` is a list of key substrings to skip
+/// loading (e.g. `["gate_proj", "up_proj", "down_proj", "q_proj", "k_proj", "v_proj", "o_proj"]`
+/// when Q4_K weights are available). Skipped tensors are never allocated.
+pub fn load_model_weights_filtered(
     dir: &Path,
     callbacks: &mut dyn IndexLoadCallbacks,
+    skip_patterns: &[&str],
 ) -> Result<ModelWeights, VindexError> {
     let config = load_vindex_config(dir)?;
 
@@ -541,6 +545,11 @@ pub fn load_model_weights(
         };
         let floats = crate::config::dtype::decode_floats(raw_bytes, actual_dtype);
 
+        // Skip tensors matching skip_patterns (never allocate the f32 data)
+        if !skip_patterns.is_empty() && skip_patterns.iter().any(|p| entry.key.contains(p)) {
+            continue;
+        }
+
         match entry.kind.as_str() {
             "tensor" => {
                 let arr = Array2::from_shape_vec((entry.shape[0], entry.shape[1]), floats)
@@ -593,6 +602,14 @@ pub fn load_model_weights(
         rope_base: cfg.rope_base,
         arch,
     })
+}
+
+/// Load model weights (all tensors, no filtering). Backward-compatible wrapper.
+pub fn load_model_weights(
+    dir: &Path,
+    callbacks: &mut dyn IndexLoadCallbacks,
+) -> Result<ModelWeights, VindexError> {
+    load_model_weights_filtered(dir, callbacks, &[])
 }
 
 /// Find the tokenizer path near a model or vindex directory.

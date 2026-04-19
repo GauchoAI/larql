@@ -77,4 +77,41 @@ kernel void rms_norm(
         out[i] = x[i] * (weight[i] + offset) * rms;
     }
 }
+// Multi-head RMS norm — normalizes all heads in ONE dispatch.
+// Grid: (num_heads, 1, 1). One threadgroup per head, each normalizes head_dim floats.
+// Replaces N individual rms_norm dispatches with 1 dispatch.
+// x layout: [num_heads * head_dim] contiguous (e.g. Q or K projection output).
+// weight layout: [head_dim] (shared across heads, same norm weight per head).
+kernel void rms_norm_multihead(
+    device float*       x      [[buffer(0)]],   // in-place: [num_heads * head_dim]
+    device const float* weight [[buffer(1)]],   // [head_dim] — per-head norm weights
+    constant uint&      head_dim [[buffer(2)]],
+    constant float&     eps    [[buffer(3)]],
+    constant float&     offset [[buffer(4)]],
+    uint head   [[threadgroup_position_in_grid]],
+    uint tid    [[thread_index_in_threadgroup]],
+    uint tg_sz  [[threads_per_threadgroup]],
+    uint lane   [[thread_index_in_simdgroup]],
+    uint sg_id  [[simdgroup_index_in_threadgroup]])
+{
+    device float* hx = x + head * head_dim;
+
+    float partial = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_sz) {
+        partial += hx[i] * hx[i];
+    }
+    float sg_sum = simd_sum(partial);
+    threadgroup float tg_p[8];
+    if (lane == 0) tg_p[sg_id] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum_sq = tg_p[0];
+    uint n_sg = (tg_sz + 31) / 32;
+    for (uint i = 1; i < n_sg; i++) sum_sq += tg_p[i];
+
+    float rms = 1.0f / sqrt(sum_sq / float(head_dim) + eps);
+
+    for (uint i = tid; i < head_dim; i += tg_sz) {
+        hx[i] = hx[i] * (weight[i] + offset) * rms;
+    }
+}
 "#;

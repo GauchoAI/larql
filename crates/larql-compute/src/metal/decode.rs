@@ -1302,51 +1302,51 @@ impl MetalBackend {
             );
             kv_cache.layers[l].current_len += k;
 
-            // ── Per-position dispatches (O projection through post-FFN) ──
-            for bi in 0..k {
-                let attn_off = (bi * q_dim * 4) as u64;
-                let o_off = (bi * hidden * 4) as u64;
-                let h_off = (bi * hidden * 4) as u64;
-                let ffn_off = (bi * hidden * 4) as u64;
-                let gate_off_bi = (bi * inter * 4) as u64;
-                let down_off = (bi * hidden * 4) as u64;
-
-                // Step 7: O projection — 2D batched matvec at bi==0
-                if bi == 0 {
-                    let o_k_val = layer_q_dim as u32;
-                    let m_val = k as u32;
-                    match layer.wo.format {
-                        crate::QuantFormat::Q6_K => {
-                            let n_tgs = (hidden as u64).div_ceil(q6k::ROWS_PER_TG);
-                            enc.set_compute_pipeline_state(&self.q6k_matvec_batch_pipeline);
-                            enc.set_buffer(0, Some(&wo_bufs[l]), 0);
-                            enc.set_buffer(1, Some(&attn_out), 0);
-                            enc.set_buffer(2, Some(&o_out), 0);
-                            enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-                            enc.set_bytes(4, 4, &o_k_val as *const u32 as *const std::ffi::c_void);
-                            enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
-                            enc.dispatch_thread_groups(MTLSize::new(n_tgs, m_val as u64, 1), MTLSize::new(q6k::THREADS_PER_TG, 1, 1));
-                        }
-                        _ => {
-                            let n_tgs = (hidden as u64).div_ceil(q4k::ROWS_PER_TG);
-                            enc.set_compute_pipeline_state(&self.q4k_matvec_batch_pipeline);
-                            enc.set_buffer(0, Some(&wo_bufs[l]), 0);
-                            enc.set_buffer(1, Some(&attn_out), 0);
-                            enc.set_buffer(2, Some(&o_out), 0);
-                            enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-                            enc.set_bytes(4, 4, &o_k_val as *const u32 as *const std::ffi::c_void);
-                            enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
-                            enc.dispatch_thread_groups(MTLSize::new(n_tgs, m_val as u64, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
-                        }
+            // ── Step 7: Batched O projection (reads weights once for all K) ──
+            {
+                let o_k_val = layer_q_dim as u32;
+                let m_val = k as u32;
+                match layer.wo.format {
+                    crate::QuantFormat::Q6_K => {
+                        let n_tgs = (hidden as u64).div_ceil(q6k::ROWS_PER_TG);
+                        enc.set_compute_pipeline_state(&self.q6k_matvec_batch_pipeline);
+                        enc.set_buffer(0, Some(&wo_bufs[l]), 0);
+                        enc.set_buffer(1, Some(&attn_out), 0);
+                        enc.set_buffer(2, Some(&o_out), 0);
+                        enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                        enc.set_bytes(4, 4, &o_k_val as *const u32 as *const std::ffi::c_void);
+                        enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
+                        enc.dispatch_thread_groups(MTLSize::new(n_tgs, m_val as u64, 1), MTLSize::new(q6k::THREADS_PER_TG, 1, 1));
+                    }
+                    _ => {
+                        let n_tgs = (hidden as u64).div_ceil(q4k::ROWS_PER_TG);
+                        enc.set_compute_pipeline_state(&self.q4k_matvec_batch_pipeline);
+                        enc.set_buffer(0, Some(&wo_bufs[l]), 0);
+                        enc.set_buffer(1, Some(&attn_out), 0);
+                        enc.set_buffer(2, Some(&o_out), 0);
+                        enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                        enc.set_bytes(4, 4, &o_k_val as *const u32 as *const std::ffi::c_void);
+                        enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
+                        enc.dispatch_thread_groups(MTLSize::new(n_tgs, m_val as u64, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
                     }
                 }
+            }
 
-                // Step 8: Post-attn norm + residual (Gemma 3 post-norm)
-                if layer.has_post_norms {
+            // ── Step 8: All K post-attn norms + pre-FFN norms ──
+            // Must complete for ALL K before batch FFN gate+up reads ffn_norm_out.
+            if layer.has_post_norms {
+                let pre_ffn_buf = if let Some(pfn) = layer.pre_ffn_norm {
+                    self.bufs.transient_from_f32(pfn)
+                } else {
+                    post_attn_norm_bufs[l].clone()
+                };
+                let len_val = hidden as u32;
+                for bi in 0..k {
+                    let o_off = (bi * hidden * 4) as u64;
+                    let h_off = (bi * hidden * 4) as u64;
                     let normed_o_off = (bi * hidden * 4) as u64;
-                    let len_val = hidden as u32;
+                    let ffn_off = (bi * hidden * 4) as u64;
 
-                    // rms_norm(o_out) → normed_scratch
                     enc.set_compute_pipeline_state(&self.rms_norm_pipeline);
                     enc.set_buffer(0, Some(&o_out), o_off);
                     enc.set_buffer(1, Some(&post_attn_norm_bufs[l]), 0);
@@ -1356,12 +1356,6 @@ impl MetalBackend {
                     enc.set_bytes(5, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
                     enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
 
-                    // pre_ffn_norm(h + normed_o) → ffn_norm_out (fused residual_norm)
-                    let pre_ffn_buf = if let Some(pfn) = layer.pre_ffn_norm {
-                        self.bufs.transient_from_f32(pfn)
-                    } else {
-                        post_attn_norm_bufs[l].clone()
-                    };
                     enc.set_compute_pipeline_state(&self.residual_norm_pipeline);
                     enc.set_buffer(0, Some(h_buf), h_off);
                     enc.set_buffer(1, Some(&normed_scratch), normed_o_off);
@@ -1372,7 +1366,6 @@ impl MetalBackend {
                     enc.set_bytes(6, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
                     enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
 
-                    // h_post_attn = h + normed_o (direct dispatch with offsets)
                     enc.set_compute_pipeline_state(&self.residual_add_pipeline);
                     enc.set_buffer(0, Some(h_buf), h_off);
                     enc.set_buffer(1, Some(&normed_scratch), normed_o_off);
@@ -1380,30 +1373,43 @@ impl MetalBackend {
                     enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
                     enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
                 }
+            }
 
-                // Step 9: FFN — fused GEGLU+down (Q4_K path)
-                let down_is_q6k = layer.down.format == crate::QuantFormat::Q6_K;
-                if !down_is_q6k && layer.is_gated() {
-                    // Gate + Up (per-position)
+            // ── Step 9: FFN — BATCHED gate+up, per-position GEGLU+down ──
+            let down_is_q6k = layer.down.format == crate::QuantFormat::Q6_K;
+            if !down_is_q6k && layer.is_gated() {
+                // Batch gate+up: reads weights ONCE for all K positions
+                {
+                    let m_val = k as u32;
                     let n_tgs_inter = (inter as u64).div_ceil(q4k::ROWS_PER_TG);
-                    enc.set_compute_pipeline_state(&self.q4k_matvec_pipeline);
+                    enc.set_compute_pipeline_state(&self.q4k_matvec_batch_pipeline);
                     enc.set_buffer(0, Some(&gate_bufs[l]), 0);
-                    enc.set_buffer(1, Some(&ffn_norm_out), ffn_off);
-                    enc.set_buffer(2, Some(&gate_out), gate_off_bi);
+                    enc.set_buffer(1, Some(&ffn_norm_out), 0);
+                    enc.set_buffer(2, Some(&gate_out), 0);
                     enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
                     enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-                    enc.dispatch_thread_groups(MTLSize::new(n_tgs_inter, 1, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
-
+                    enc.set_bytes(5, 4, &m_val as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(n_tgs_inter, m_val as u64, 1),
+                        MTLSize::new(q4k::THREADS_PER_TG, 1, 1),
+                    );
                     enc.set_buffer(0, Some(&up_bufs[l]), 0);
-                    enc.set_buffer(2, Some(&up_out), gate_off_bi);
-                    enc.dispatch_thread_groups(MTLSize::new(n_tgs_inter, 1, 1), MTLSize::new(q4k::THREADS_PER_TG, 1, 1));
+                    enc.set_buffer(2, Some(&up_out), 0);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(n_tgs_inter, m_val as u64, 1),
+                        MTLSize::new(q4k::THREADS_PER_TG, 1, 1),
+                    );
+                }
 
-                    // Fused GEGLU + down
-                    let geglu_down = match layer.activation {
-                        crate::Activation::GeluTanh => &self.q4k_geglu_gelu_tanh_down_pipeline,
-                        _ => &self.q4k_geglu_silu_down_pipeline,
-                    };
-                    let n_tgs_geglu = (hidden as u64).div_ceil(q4k_gd::ROWS_PER_TG);
+                // Per-position GEGLU+down (fused kernel reads gate+up for its own position)
+                let geglu_down = match layer.activation {
+                    crate::Activation::GeluTanh => &self.q4k_geglu_gelu_tanh_down_pipeline,
+                    _ => &self.q4k_geglu_silu_down_pipeline,
+                };
+                let n_tgs_geglu = (hidden as u64).div_ceil(q4k_gd::ROWS_PER_TG);
+                for bi in 0..k {
+                    let gate_off_bi = (bi * inter * 4) as u64;
+                    let down_off = (bi * hidden * 4) as u64;
                     enc.set_compute_pipeline_state(geglu_down);
                     enc.set_buffer(0, Some(&down_bufs[l]), 0);
                     enc.set_buffer(1, Some(&gate_out), gate_off_bi);
@@ -1415,12 +1421,16 @@ impl MetalBackend {
                         MTLSize::new(n_tgs_geglu, 1, 1),
                         MTLSize::new(q4k_gd::THREADS_PER_TG, 1, 1),
                     );
-                } else {
-                    // Fallback: separate GEGLU + down (Q6_K or non-gated)
+                }
+            } else {
+                // Fallback: per-position gate+up+GEGLU+down (Q6_K or non-gated)
+                for bi in 0..k {
+                    let ffn_off = (bi * hidden * 4) as u64;
+                    let gate_off_bi = (bi * inter * 4) as u64;
+                    let down_off = (bi * hidden * 4) as u64;
                     let n_tgs_inter = (inter as u64).div_ceil(if down_is_q6k { q6k::ROWS_PER_TG } else { q4k::ROWS_PER_TG });
                     let pipeline = if down_is_q6k { &self.q6k_matvec_pipeline } else { &self.q4k_matvec_pipeline };
                     let threads = if down_is_q6k { q6k::THREADS_PER_TG } else { q4k::THREADS_PER_TG };
-
                     enc.set_compute_pipeline_state(pipeline);
                     enc.set_buffer(0, Some(&gate_bufs[l]), 0);
                     enc.set_buffer(1, Some(&ffn_norm_out), ffn_off);
@@ -1428,7 +1438,6 @@ impl MetalBackend {
                     enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
                     enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
                     enc.dispatch_thread_groups(MTLSize::new(n_tgs_inter, 1, 1), MTLSize::new(threads, 1, 1));
-
                     enc.set_buffer(0, Some(&up_bufs[l]), 0);
                     enc.set_buffer(2, Some(&up_out), gate_off_bi);
                     enc.dispatch_thread_groups(MTLSize::new(n_tgs_inter, 1, 1), MTLSize::new(threads, 1, 1));
@@ -1453,15 +1462,17 @@ impl MetalBackend {
                     enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
                     enc.dispatch_thread_groups(MTLSize::new(n_tgs_down, 1, 1), MTLSize::new(threads, 1, 1));
                 }
+            }
 
-                // Step 10: Post-FFN norm + residual → new_h
+            // ── Step 10: Post-FFN norm + residual for ALL K ──
+            for bi in 0..k {
+                let h_off = (bi * hidden * 4) as u64;
+                let down_off = (bi * hidden * 4) as u64;
                 let len_val_h = hidden as u32;
                 if layer.has_post_norms {
                     if let Some(post_ffn) = layer.post_ffn_norm {
                         let post_ffn_buf = self.bufs.transient_from_f32(post_ffn);
                         let normed_ffn_off = (bi * hidden * 4) as u64;
-
-                        // rms_norm(down_out) → normed_scratch
                         enc.set_compute_pipeline_state(&self.rms_norm_pipeline);
                         enc.set_buffer(0, Some(&down_out), down_off);
                         enc.set_buffer(1, Some(&post_ffn_buf), 0);
@@ -1470,8 +1481,6 @@ impl MetalBackend {
                         enc.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
                         enc.set_bytes(5, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
                         enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
-
-                        // new_h = h_post_attn + normed_ffn
                         enc.set_compute_pipeline_state(&self.residual_add_pipeline);
                         enc.set_buffer(0, Some(&h_post_attn), h_off);
                         enc.set_buffer(1, Some(&normed_scratch), normed_ffn_off);
@@ -1480,7 +1489,6 @@ impl MetalBackend {
                         enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
                     }
                 } else {
-                    // Pre-norm: new_h = h_post_attn + down_out
                     enc.set_compute_pipeline_state(&self.residual_add_pipeline);
                     enc.set_buffer(0, Some(&h_post_attn), h_off);
                     enc.set_buffer(1, Some(&down_out), down_off);

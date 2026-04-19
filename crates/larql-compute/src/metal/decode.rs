@@ -176,7 +176,8 @@ impl MetalBackend {
             let layer_rotary_dim = if layer.rotary_dim > 0 { layer.rotary_dim } else { layer_head_dim };
             let uses_q4k = layer.wq.format == crate::QuantFormat::Q4_K
                 || layer.wq.format == crate::QuantFormat::Q6_K
-                || layer.wq.format == crate::QuantFormat::Q4_KF;
+                || layer.wq.format == crate::QuantFormat::Q4_KF
+                || layer.wq.format == crate::QuantFormat::Q8_0Gguf;
             let layer_q_dim = layer_num_q_heads * layer_head_dim;
             let _layer_kv_dim = layer_num_kv_heads * layer_head_dim;
             let window_size = layer.sliding_window as u32;
@@ -298,8 +299,24 @@ impl MetalBackend {
                         q4k_pipeline: &metal::ComputePipelineState,
                         q4kf_pipeline: &metal::ComputePipelineState,
                         q6k_pipeline: &metal::ComputePipelineState,
+                        q8_gguf_pipeline: &metal::ComputePipelineState,
                     ) {
                         match format {
+                            crate::QuantFormat::Q8_0Gguf => {
+                                use crate::metal::shaders::q8_0_gguf_matvec as q8gm;
+                                let n = rows as u32;
+                                let num_tgs = (rows as u64).div_ceil(q8gm::ROWS_PER_TG);
+                                enc.set_compute_pipeline_state(q8_gguf_pipeline);
+                                enc.set_buffer(0, Some(w_buf), 0);
+                                enc.set_buffer(1, Some(x_buf), 0);
+                                enc.set_buffer(2, Some(out_buf), 0);
+                                enc.set_bytes(3, 4, &n as *const u32 as *const std::ffi::c_void);
+                                enc.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
+                                enc.dispatch_thread_groups(
+                                    MTLSize::new(num_tgs, 1, 1),
+                                    MTLSize::new(q8gm::THREADS_PER_TG, 1, 1),
+                                );
+                            }
                             crate::QuantFormat::Q6_K => {
                                 use crate::metal::shaders::q6k_matvec as q6k;
                                 let n = rows as u32;
@@ -351,13 +368,13 @@ impl MetalBackend {
 
                     encode_single_proj(enc, &wq_bufs[l], &norm_f32_buf, &q_out,
                         q_dim, k_val, layer.wq.format,
-                        &self.q4k_matvec_pipeline, &self.q4kf_proj_pipeline, &self.q6k_matvec_pipeline);
+                        &self.q4k_matvec_pipeline, &self.q4kf_proj_pipeline, &self.q6k_matvec_pipeline, &self.q8_0_gguf_matvec_pipeline);
                     encode_single_proj(enc, &wk_bufs[l], &norm_f32_buf, &k_out,
                         kv_dim, k_val, layer.wk.format,
-                        &self.q4k_matvec_pipeline, &self.q4kf_proj_pipeline, &self.q6k_matvec_pipeline);
+                        &self.q4k_matvec_pipeline, &self.q4kf_proj_pipeline, &self.q6k_matvec_pipeline, &self.q8_0_gguf_matvec_pipeline);
                     encode_single_proj(enc, &wv_bufs[l], &norm_f32_buf, &v_out,
                         kv_dim, k_val, layer.wv.format,
-                        &self.q4k_matvec_pipeline, &self.q4kf_proj_pipeline, &self.q6k_matvec_pipeline);
+                        &self.q4k_matvec_pipeline, &self.q4kf_proj_pipeline, &self.q6k_matvec_pipeline, &self.q8_0_gguf_matvec_pipeline);
                 }
                 } // end fallback (non-fused norm+QKV)
             } else {
@@ -526,6 +543,10 @@ impl MetalBackend {
                         crate::QuantFormat::Q6_K => {
                             use crate::metal::shaders::q6k_matvec as q6k;
                             (&self.q6k_matvec_pipeline, q6k::ROWS_PER_TG, q6k::THREADS_PER_TG)
+                        }
+                        crate::QuantFormat::Q8_0Gguf => {
+                            use crate::metal::shaders::q8_0_gguf_matvec as q8gm;
+                            (&self.q8_0_gguf_matvec_pipeline, q8gm::ROWS_PER_TG, q8gm::THREADS_PER_TG)
                         }
                         _ => {
                             use crate::metal::shaders::q4k_qkv_proj as k;
@@ -1201,7 +1222,8 @@ impl MetalBackend {
             let layer_rotary_dim = if layer.rotary_dim > 0 { layer.rotary_dim } else { layer_head_dim };
             let uses_q4k = layer.wq.format == crate::QuantFormat::Q4_K
                 || layer.wq.format == crate::QuantFormat::Q6_K
-                || layer.wq.format == crate::QuantFormat::Q4_KF;
+                || layer.wq.format == crate::QuantFormat::Q4_KF
+                || layer.wq.format == crate::QuantFormat::Q8_0Gguf;
             let layer_q_dim = layer_num_q_heads * layer_head_dim;
             let _layer_kv_dim = layer_num_kv_heads * layer_head_dim;
             let window_size = layer.sliding_window as u32;
@@ -1522,6 +1544,10 @@ impl MetalBackend {
                         crate::QuantFormat::Q6_K => {
                             use crate::metal::shaders::q6k_matvec as q6k;
                             (&self.q6k_matvec_pipeline, q6k::ROWS_PER_TG, q6k::THREADS_PER_TG)
+                        }
+                        crate::QuantFormat::Q8_0Gguf => {
+                            use crate::metal::shaders::q8_0_gguf_matvec as q8gm;
+                            (&self.q8_0_gguf_matvec_pipeline, q8gm::ROWS_PER_TG, q8gm::THREADS_PER_TG)
                         }
                         _ => {
                             use crate::metal::shaders::q4k_qkv_proj as k;

@@ -119,6 +119,7 @@ pub fn resolve_attn_weights<'a>(
         match s {
             "Q6_K" => QuantFormat::Q6_K,
             "Q4_KF" | "Q4_K_GGUF" => QuantFormat::Q4_KF,
+            "Q8_0" => QuantFormat::Q8_0Gguf,
             _ => QuantFormat::Q4_K,
         }
     }

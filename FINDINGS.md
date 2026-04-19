@@ -467,3 +467,122 @@ attention can be parallelized since each position's Q only reads past K/V.
 
 Projected improvement: user prefill from ~350ms to ~50ms, total from
 751ms to ~450ms — beating Ollama's 556ms.
+
+### Performance Profiling Deep Dive (2026-04-18)
+
+#### Phase Timing (chat with KV-baked facts, 12 tokens user query)
+
+| Phase | Time | % of total | What happens |
+|-------|-----:|----------:|----|
+| KV restore | 6ms | 1% | memcpy saved KV into Metal buffers |
+| Prefill | 290ms | 48% | user query tokens through 34 layers |
+| Decode | 200-750ms | 51% | autoregressive token generation |
+| **Total** | **500-1050ms** | | depends on output length |
+
+#### Bandwidth Utilization Analysis
+
+| Metric | Value |
+|--------|------:|
+| M4 Pro memory bandwidth | 273 GB/s |
+| Weight reads per token (Q4_K) | 1855 MB (54.6 MB/layer × 34) |
+| **Theoretical floor** | **6.8 ms/tok (147 tok/s)** |
+| **Actual** | **25 ms/tok (40 tok/s)** |
+| **Bandwidth utilization** | **27%** |
+
+73% of GPU time is wasted on dispatch overhead, pipeline bubbles,
+and suboptimal memory access patterns.
+
+#### Dispatch Count Analysis
+
+| Path | Dispatches | Overhead at ~5µs each |
+|------|----------:|----:|
+| Single-token decode | 50/layer × 34 = 1,700 | 8.5ms |
+| Batch prefill K=17 | 414/layer × 34 = 14,076 | 70ms |
+
+The batch prefill's 14K dispatches account for 70ms of the 290ms prefill
+(24%). Single-token decode's 1,700 dispatches are 8.5ms of 25ms (34%).
+
+#### Memory Map — What We Actually Read
+
+| File | Size | Used during inference? |
+|------|-----:|:---:|
+| interleaved_q4k_real.bin | 1,474 MB | YES — Q4_K FFN weights |
+| attn_weights_q4k.bin | 418 MB | YES — Q4_K attention |
+| lm_head_q4.bin | 360 MB | YES — Q4_K logits |
+| embeddings.bin | 1,280 MB | YES — token embedding lookup |
+| norms.bin | 0.7 MB | YES — layer norms |
+| safetensors (f32) | 8,201 MB | NO — loaded at warmup, never read during Q4_K decode |
+| interleaved.bin (f32) | 10,200 MB | NO — walk-only path |
+| gate/up/down vectors | 6,800 MB | NO — walk-only path |
+| **Active total** | **~3,533 MB** | |
+| **Inactive mmap** | **~25,000 MB** | |
+
+#### Code Cleanup Results
+
+| File | Before | After | Removed |
+|------|-------:|------:|--------:|
+| predict.rs | 1,440 | 1,013 | -427 (-30%) |
+| decode_hybrid.rs | 324 | 0 | -324 (deleted) |
+| hybrid.rs | ~200 | 0 | -200 (deleted) |
+| **Total** | | | **-1,110 lines** |
+
+### Optimization Plan — Ranked by Impact
+
+**Goal**: close the gap to Ollama (556ms) and eventually beat it.
+Current: 781ms, 40 tok/s, 27% bandwidth utilization.
+
+#### 1. Fuse Dispatches in Single-Token Decode [S]
+
+Merge norm+matvec into fewer dispatches per layer. Currently 50
+dispatches/layer; fusing pre-norm into the matvec dispatch could
+halve this to ~25/layer.
+
+- **Test**: decode one token, compare output to baseline (cosine > 0.9999)
+- **Measure**: tok/s before and after
+- **Projected**: 40 → 56 tok/s (+40%)
+
+#### 2. Drop f32 Safetensors After Warmup [S]
+
+The f32 weights (8.2 GB) are loaded for warmup but never read during
+Q4_K decode. Free them after initialization.
+
+- **Test**: run full scenario benchmark, verify 11/11 unchanged
+- **Measure**: RSS before and after
+- **Projected**: -8 GB RSS, no speed change
+
+#### 3. Drop Unused Vindex Mmaps [S]
+
+25+ GB of mmap'd files never read during inference. Close the mmaps
+to reduce virtual memory and eliminate stale page faults.
+
+- **Test**: same as above
+- **Measure**: virtual memory, page fault count
+- **Projected**: -25 GB virtual, fewer page faults
+
+#### 4. Mega-Kernel: One Dispatch Per Layer [L]
+
+All norms + QKV + attention + O + FFN in a single Metal kernel per
+layer. Uses `threadgroup_barrier` for intra-layer sync. Eliminates
+dispatch overhead entirely.
+
+- **Test**: compare output token-by-token vs sequential decode
+- **Measure**: tok/s, bandwidth utilization
+- **Projected**: 40 → 100+ tok/s (+150%), ~70% bandwidth utilization
+
+#### 5. f16 KV Cache [M]
+
+KV cache is f32 (32 MB/layer). f16 halves bandwidth. Marginal now
+(KV reads are 0.26ms at T=250) but critical at T=4000+ where KV
+bandwidth becomes significant.
+
+- **Test**: cosine similarity of attention output vs f32 KV
+- **Measure**: latency at T=500, T=2000, T=4000
+- **Projected**: 2× longer context at same speed
+
+#### Iteration Loop
+
+For each optimization:
+1. **Correctness**: quick check — "What port?" → "3000" (5 seconds)
+2. **Timing**: 5 decode queries, read tok/s from logs (30 seconds)
+3. **Benchmark**: full 11 scenarios + Ollama comparison (5 minutes)
+4. **Commit or revert**: if regression, `git checkout -- file`

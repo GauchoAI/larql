@@ -10,27 +10,35 @@
 
 use std::collections::HashMap;
 
-/// A bigram → continuation cache for fast draft prediction.
+/// Bigram + trigram draft cache. Trigrams are more specific (higher
+/// acceptance), bigrams are the fallback when trigram misses.
 pub struct NgramCache {
     /// (tok_a, tok_b) → sorted list of (next_tok, count), descending by count.
     bigrams: HashMap<(u32, u32), Vec<(u32, u32)>>,
+    /// (tok_a, tok_b, tok_c) → sorted list of (next_tok, count).
+    trigrams: HashMap<(u32, u32, u32), Vec<(u32, u32)>>,
 }
 
 impl NgramCache {
     pub fn new() -> Self {
-        Self { bigrams: HashMap::new() }
+        Self {
+            bigrams: HashMap::new(),
+            trigrams: HashMap::new(),
+        }
+    }
+
+    fn insert_into(map: &mut Vec<(u32, u32)>, tok: u32) {
+        if let Some(pos) = map.iter().position(|&(t, _)| t == tok) {
+            map[pos].1 += 1;
+        } else {
+            map.push((tok, 1));
+        }
+        map.sort_unstable_by(|a, b| b.1.cmp(&a.1));
     }
 
     /// Record an observed trigram: after seeing (a, b), token c followed.
     pub fn insert(&mut self, a: u32, b: u32, c: u32) {
-        let entry = self.bigrams.entry((a, b)).or_default();
-        if let Some(pos) = entry.iter().position(|&(tok, _)| tok == c) {
-            entry[pos].1 += 1;
-        } else {
-            entry.push((c, 1));
-        }
-        // Keep sorted by count descending for fast top-1 lookup.
-        entry.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        Self::insert_into(self.bigrams.entry((a, b)).or_default(), c);
     }
 
     /// Populate from a token sequence (e.g., the prompt).
@@ -38,26 +46,47 @@ impl NgramCache {
         for w in tokens.windows(3) {
             self.insert(w[0], w[1], w[2]);
         }
+        for w in tokens.windows(4) {
+            Self::insert_into(
+                self.trigrams.entry((w[0], w[1], w[2])).or_default(),
+                w[3],
+            );
+        }
     }
 
-    /// Draft up to `max_k` continuation tokens from the last two context tokens.
-    /// Returns an empty vec if no cache hit.
+    /// Draft up to `max_k` continuation tokens.
+    /// Prefers trigram match (more specific), falls back to bigram.
     pub fn draft(&self, context: &[u32], max_k: usize) -> Vec<u32> {
         if context.len() < 2 || max_k == 0 { return vec![]; }
 
         let mut drafts = Vec::with_capacity(max_k);
-        let mut a = context[context.len() - 2];
-        let mut b = context[context.len() - 1];
+        let n = context.len();
+        let mut a = if n >= 3 { context[n - 3] } else { 0 };
+        let mut b = context[n - 2];
+        let mut c = context[n - 1];
 
         for _ in 0..max_k {
-            match self.bigrams.get(&(a, b)) {
-                Some(continuations) if !continuations.is_empty() => {
-                    let next = continuations[0].0; // top-1 by count
-                    drafts.push(next);
+            // Try trigram first (higher specificity)
+            let next = if n >= 3 || !drafts.is_empty() {
+                self.trigrams.get(&(a, b, c))
+                    .and_then(|v| v.first().map(|&(tok, _)| tok))
+            } else {
+                None
+            };
+            // Fall back to bigram
+            let next = next.or_else(|| {
+                self.bigrams.get(&(b, c))
+                    .and_then(|v| v.first().map(|&(tok, _)| tok))
+            });
+
+            match next {
+                Some(tok) => {
+                    drafts.push(tok);
                     a = b;
-                    b = next;
+                    b = c;
+                    c = tok;
                 }
-                _ => break, // no cache hit, stop drafting
+                None => break,
             }
         }
         drafts

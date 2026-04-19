@@ -20,7 +20,7 @@ pub mod pipeline_layer;
 pub mod prefill;
 pub mod logits;
 pub mod generate;
-pub mod hybrid;
+// hybrid module removed — predict_hybrid was never called from the inference path
 pub mod predict;
 pub mod ngram_cache;
 pub mod speculative;

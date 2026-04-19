@@ -48,8 +48,10 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
-    /// Get or lazy-load model weights for inference. Drops FFN tensors when
-    /// `walk_only` is set (reclaims ~10.7 GB for a 4B model).
+    /// Get or lazy-load model weights for inference. Drops f32 FFN tensors
+    /// when Q4_K FFN weights exist on disk (saves ~10.7 GB — the Q4_K pipeline
+    /// reads from the mmap'd interleaved_q4k_real.bin, not from f32 tensors).
+    /// Also drops in walk-only mode as before.
     pub fn get_or_load_weights(&self) -> Result<&ModelWeights, String> {
         if let Some(w) = self.weights.get() {
             return Ok(w);
@@ -57,9 +59,15 @@ impl LoadedModel {
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let mut weights = larql_vindex::load_model_weights(&self.path, &mut cb)
             .map_err(|e| format!("failed to load model weights: {e}"))?;
-        if self.walk_only {
+        // Drop f32 FFN weights when Q4_K FFN mmap exists — the GPU decode
+        // pipeline reads quantized weights directly, never touches f32.
+        // This saves ~10.7 GB for Gemma 3 4B.
+        let has_q4k_ffn = self.path.join("interleaved_q4k_real.bin").exists()
+            || self.path.join("interleaved_q4k.bin").exists();
+        if self.walk_only || has_q4k_ffn {
             let freed = weights.drop_ffn_weights();
-            tracing::info!("[walk-only] dropped FFN weights: {:.1} GB freed", freed as f64 / 1e9);
+            let reason = if self.walk_only { "walk-only" } else { "Q4_K FFN available" };
+            tracing::info!("[{reason}] dropped f32 FFN weights: {:.1} GB freed", freed as f64 / 1e9);
         }
         let _ = self.weights.set(weights);
         Ok(self.weights.get().unwrap())

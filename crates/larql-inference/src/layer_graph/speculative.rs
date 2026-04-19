@@ -46,7 +46,7 @@ pub fn generate_speculative(
     layers: &[larql_compute::FullPipelineLayer],
 ) -> SpecGenerateResult {
     generate_speculative_inner(weights, tokenizer, token_ids, max_tokens, max_draft_k,
-        index, backend, layers, None)
+        index, backend, layers, None, None)
 }
 
 /// Speculative generation with optional pre-sampled first token.
@@ -61,9 +61,10 @@ pub fn generate_speculative_resume(
     backend: &dyn ComputeBackend,
     layers: &[larql_compute::FullPipelineLayer],
     first_token: u32,
+    draft_head: Option<&super::draft_head::DraftHead>,
 ) -> SpecGenerateResult {
     generate_speculative_inner(weights, tokenizer, token_ids, max_tokens, max_draft_k,
-        index, backend, layers, Some(first_token))
+        index, backend, layers, Some(first_token), draft_head)
 }
 
 fn generate_speculative_inner(
@@ -76,6 +77,7 @@ fn generate_speculative_inner(
     backend: &dyn ComputeBackend,
     layers: &[larql_compute::FullPipelineLayer],
     first_token: Option<u32>,
+    draft_head: Option<&super::draft_head::DraftHead>,
 ) -> SpecGenerateResult {
     let norm_offset = weights.arch.norm_weight_offset();
     let hidden = weights.hidden_size;
@@ -166,15 +168,27 @@ fn generate_speculative_inner(
         Some((h_out, tid, prob))
     };
 
+    // Store last h_out for draft head input
+    let mut last_h_out: Option<Vec<f32>> = None;
+
     // ── Speculative decode loop ──
     while tokens.len() < max_tokens {
-        // Draft K tokens from n-gram cache
-        let drafts = ngram.draft(&context, max_draft_k);
+        // Draft tokens: prefer draft head (neural), fall back to n-gram
+        let drafts = if let (Some(dh), Some(ref h)) = (draft_head, &last_h_out) {
+            // Apply final norm to get h_final (same as finalize_logits)
+            let h_arr = ndarray::Array2::from_shape_vec((1, hidden), h.clone()).unwrap();
+            let h_final = crate::forward::apply_norm(weights, &h_arr, weights.arch.final_norm_key(), norm_offset);
+            let h_vec: Vec<f32> = h_final.row(0).to_vec();
+            dh.draft(&h_vec, max_draft_k)
+        } else {
+            ngram.draft(&context, max_draft_k)
+        };
         let k = drafts.len();
 
         if k == 0 {
             // No draft available — normal single-token decode
-            if let Some((_h, tid, prob)) = decode_and_predict(current_token_id) {
+            if let Some((h_out, tid, prob)) = decode_and_predict(current_token_id) {
+                last_h_out = Some(h_out);
                 let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
                 let is_eos = tok_str.trim() == "<eos>" || tok_str.trim() == "</s>";
                 tokens.push((tok_str, prob));
@@ -246,6 +260,13 @@ fn generate_speculative_inner(
             } else {
                 break;
             }
+        }
+
+        // Capture h_out at the bonus position for next draft head call
+        let bonus_idx = accepted;
+        if bonus_idx < k_plus_1 {
+            let h_slice = &h_batch[bonus_idx * hidden..(bonus_idx + 1) * hidden];
+            last_h_out = Some(h_slice.to_vec());
         }
 
         // Rollback un-accepted draft tokens from KV cache.

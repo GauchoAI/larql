@@ -250,11 +250,17 @@ pub async fn handle_chat_completions(
                 );
                 if !spec_layers.is_empty() {
                     // Resume speculative generation — KV cache already has prefill context
+                    // Load draft head if available
+                    let draft_head_path = model_cl.path.join("draft_head.bin");
+                    let draft_head = larql_inference::layer_graph::draft_head::DraftHead::load(&draft_head_path);
+                    let dh_ref = draft_head.as_ref();
+
                     let spec_result = larql_inference::layer_graph::speculative::generate_speculative_resume(
                         weights, &model_cl.tokenizer, &ids, max_tokens.saturating_sub(1),
                         6, // max_draft_k
                         patched.base(), &**backend, &spec_layers,
                         next, // first token already sampled from prefill
+                        dh_ref,
                     );
                     // Stream all tokens
                     for (tok_str, _prob) in &spec_result.tokens {

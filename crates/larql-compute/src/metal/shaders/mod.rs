@@ -39,6 +39,7 @@ pub mod turboquant_decode;
 pub mod graph_walk_knn;
 pub mod f32_sparse_walk;
 pub mod mega_kernel;
+pub mod q4k_fused_norm_matvec;
 
 /// Concatenate all shaders into one MSL source string for compilation.
 pub fn all_shaders() -> String {
@@ -92,5 +93,7 @@ pub fn all_shaders() -> String {
     src.push_str(f32_sparse_walk::SHADER);
     // Mega-kernel (S3 — persistent TGs with atomic sync)
     src.push_str(mega_kernel::TEST_SHADER);
+    // Fused norm+matvec (eliminates norm dispatch)
+    src.push_str(q4k_fused_norm_matvec::SHADER);
     src
 }

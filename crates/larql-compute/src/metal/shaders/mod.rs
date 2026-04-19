@@ -38,6 +38,7 @@ pub mod turboquant_encode;
 pub mod turboquant_decode;
 pub mod graph_walk_knn;
 pub mod f32_sparse_walk;
+pub mod mega_kernel;
 
 /// Concatenate all shaders into one MSL source string for compilation.
 pub fn all_shaders() -> String {
@@ -89,5 +90,7 @@ pub fn all_shaders() -> String {
     src.push_str(graph_walk_knn::SHADER);
     // f32 sparse walk (Option C)
     src.push_str(f32_sparse_walk::SHADER);
+    // Mega-kernel (S3 — persistent TGs with atomic sync)
+    src.push_str(mega_kernel::TEST_SHADER);
     src
 }

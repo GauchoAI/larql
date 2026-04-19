@@ -57,7 +57,9 @@ pub fn finalize_logits(
         }
     }
 
-    crate::forward::PredictResult { predictions, raw_predictions, knn_override: None }
+    let capture = std::env::var("LARQL_CAPTURE_DRAFT").is_ok();
+    let h_final_vec = if capture { Some(last_row.to_vec()) } else { None };
+    crate::forward::PredictResult { predictions, raw_predictions, knn_override: None, h_final: h_final_vec }
 }
 
 /// Softmax probability of a single score within a set of hits.

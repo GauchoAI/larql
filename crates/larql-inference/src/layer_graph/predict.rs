@@ -523,7 +523,7 @@ pub fn predict_honest_with_knn_ffn(
                                             return crate::forward::PredictResult {
                                                 predictions: vec![(label, cosine as f64)],
                                                 raw_predictions: vec![(entry.target_id, cosine, cosine as f64)],
-                                                knn_override: Some(entry.target_token.clone()),
+                                                knn_override: Some(entry.target_token.clone()), h_final: None,
                                             };
                                         }
                                     }
@@ -625,7 +625,7 @@ pub fn predict_honest_with_knn_ffn(
                                     return crate::forward::PredictResult {
                                         predictions: vec![(label, cosine as f64)],
                                         raw_predictions: vec![(entry.target_id, cosine, cosine as f64)],
-                                        knn_override: Some(entry.target_token.clone()),
+                                        knn_override: Some(entry.target_token.clone()), h_final: None,
                                     };
                                 }
                             }
@@ -768,7 +768,7 @@ pub fn predict_honest_with_knn_ffn(
                                 return crate::forward::PredictResult {
                                     predictions: vec![(label, cosine as f64)],
                                     raw_predictions: vec![(entry.target_id, cosine, cosine as f64)],
-                                    knn_override: Some(entry.target_token.clone()),
+                                    knn_override: Some(entry.target_token.clone()), h_final: None,
                                 };
                             }
                         }
@@ -937,7 +937,7 @@ pub fn predict_honest_with_knn_ffn(
                                         return crate::forward::PredictResult {
                                             predictions: vec![(label, cosine as f64)],
                                             raw_predictions: vec![(entry.target_id, cosine, cosine as f64)],
-                                            knn_override: Some(entry.target_token.clone()),
+                                            knn_override: Some(entry.target_token.clone()), h_final: None,
                                         };
                                     }
                                 }

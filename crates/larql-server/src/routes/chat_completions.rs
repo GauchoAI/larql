@@ -283,6 +283,14 @@ pub async fn handle_chat_completions(
             }
         }
 
+        // Draft head training data capture (LARQL_CAPTURE_DRAFT=/path/to/file.bin)
+        let capture_file = std::env::var("LARQL_CAPTURE_DRAFT").ok().map(|path| {
+            std::sync::Mutex::new(
+                std::fs::OpenOptions::new().create(true).append(true).open(&path)
+                    .expect("failed to open capture file")
+            )
+        });
+
         // Standard single-token decode loop (fallback or non-spec mode)
         for _step in 1..max_tokens {
             let input = vec![next];
@@ -325,6 +333,17 @@ pub async fn handle_chat_completions(
 
             match sampler.sample(&r.raw_predictions) {
                 Some(tid) => {
+                    // Capture (h_final, token_id) for draft head training
+                    if let (Some(ref cf), Some(ref h)) = (&capture_file, &r.h_final) {
+                        use std::io::Write;
+                        if let Ok(mut f) = cf.lock() {
+                            let bytes = unsafe {
+                                std::slice::from_raw_parts(h.as_ptr() as *const u8, h.len() * 4)
+                            };
+                            let _ = f.write_all(bytes);
+                            let _ = f.write_all(&tid.to_le_bytes());
+                        }
+                    }
                     let tok_raw = model_cl.tokenizer.decode(&[tid], false).unwrap_or_default();
                     if tok_raw.contains("<end_of_turn>") || tok_raw.contains("<eos>")
                         || tok_raw.contains("</s>") || tid <= 1 {

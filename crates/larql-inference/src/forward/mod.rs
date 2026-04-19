@@ -50,6 +50,9 @@ pub struct PredictResult {
     /// The caller should tokenize this and force-inject ALL tokens, not just
     /// the first. None when no KNN override occurred.
     pub knn_override: Option<String>,
+    /// Final normed hidden state (h_final) for draft head training capture.
+    /// Only populated when LARQL_CAPTURE_DRAFT is set.
+    pub h_final: Option<Vec<f32>>,
 }
 
 /// Prediction result with per-layer residual capture.

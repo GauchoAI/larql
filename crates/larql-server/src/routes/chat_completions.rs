@@ -230,10 +230,60 @@ pub async fn handle_chat_completions(
         let first_tok = model_cl.tokenizer.decode(&[next], true).unwrap_or_default();
         if tx.blocking_send(Ok(oai_chunk(&req_id, &first_tok))).is_err() { return; }
 
-        // Decode loop
+        // Speculative decode: draft K tokens via n-gram, verify in batch
+        let use_spec = std::env::var("LARQL_SPEC_DECODE").ok().as_deref() == Some("1");
         let t_decode = std::time::Instant::now();
         let mut token_count = 1usize;
         let mut generated_text = first_tok.clone();
+
+        if use_spec {
+            // Build pipeline layers for batch decode
+            let gate_index: &dyn larql_vindex::GateIndex = patched.base();
+            let q4_ffn = gate_index.interleaved_q4k_real_mmap_ref()
+                .or_else(|| gate_index.interleaved_q4k_mmap_ref());
+            if let Some(q4_mmap) = q4_ffn {
+                let intermediate = gate_index.num_features(0);
+                let q4_per_matrix = (intermediate * weights.hidden_size).div_ceil(256) * 148;
+                let spec_layers = larql_inference::layer_graph::pipeline_layer::build_pipeline_layers(
+                    weights, patched.base(), 0..weights.num_layers,
+                    q4_mmap, q4_per_matrix, larql_compute::QuantFormat::Q4_K,
+                );
+                if !spec_layers.is_empty() {
+                    // Resume speculative generation — KV cache already has prefill context
+                    let spec_result = larql_inference::layer_graph::speculative::generate_speculative_resume(
+                        weights, &model_cl.tokenizer, &ids, max_tokens.saturating_sub(1),
+                        6, // max_draft_k
+                        patched.base(), &**backend, &spec_layers,
+                        next, // first token already sampled from prefill
+                    );
+                    // Stream all tokens
+                    for (tok_str, _prob) in &spec_result.tokens {
+                        let tok_raw = model_cl.tokenizer.decode(
+                            &model_cl.tokenizer.encode(tok_str.as_str(), false)
+                                .map(|e| e.get_ids().to_vec()).unwrap_or_default(),
+                            false,
+                        ).unwrap_or_default();
+                        if tok_raw.contains("<end_of_turn>") || tok_raw.contains("<eos>") || tok_raw.contains("</s>") {
+                            break;
+                        }
+                        if tx.blocking_send(Ok(oai_chunk(&req_id, tok_str))).is_err() { break; }
+                        generated_text.push_str(tok_str);
+                        token_count += 1;
+                    }
+                    let decode_s = t_decode.elapsed().as_secs_f64();
+                    let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+                    let tok_s = if decode_s > 0.0 { token_count as f64 / decode_s } else { 0.0 };
+                    tracing::info!("[chat] {} spec done: {} tokens in {:.1}s ({:.1} tok/s) accepted={}/{} cycles={} | kv={:.0}ms prefill={:.0}ms decode={:.0}ms total={:.0}ms",
+                        req_id, token_count, decode_s, tok_s,
+                        spec_result.total_accepted, spec_result.total_drafted, spec_result.total_cycles,
+                        kv_ms, prefill_ms, decode_s * 1000.0, total_ms);
+                    let _ = tx.blocking_send(Ok(oai_done()));
+                    return;
+                }
+            }
+        }
+
+        // Standard single-token decode loop (fallback or non-spec mode)
         for _step in 1..max_tokens {
             let input = vec![next];
             let r = larql_inference::predict_honest_with_knn_ffn(

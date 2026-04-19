@@ -45,6 +45,38 @@ pub fn generate_speculative(
     backend: &dyn ComputeBackend,
     layers: &[larql_compute::FullPipelineLayer],
 ) -> SpecGenerateResult {
+    generate_speculative_inner(weights, tokenizer, token_ids, max_tokens, max_draft_k,
+        index, backend, layers, None)
+}
+
+/// Speculative generation with optional pre-sampled first token.
+/// When `first_token` is Some, skips prefill (assumes KV cache already populated).
+pub fn generate_speculative_resume(
+    weights: &ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    max_draft_k: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    layers: &[larql_compute::FullPipelineLayer],
+    first_token: u32,
+) -> SpecGenerateResult {
+    generate_speculative_inner(weights, tokenizer, token_ids, max_tokens, max_draft_k,
+        index, backend, layers, Some(first_token))
+}
+
+fn generate_speculative_inner(
+    weights: &ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    max_draft_k: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    layers: &[larql_compute::FullPipelineLayer],
+    first_token: Option<u32>,
+) -> SpecGenerateResult {
     let norm_offset = weights.arch.norm_weight_offset();
     let hidden = weights.hidden_size;
     let intermediate = weights.intermediate_size;
@@ -53,51 +85,59 @@ pub fn generate_speculative(
     let rope = weights.arch.rope_base_for_layer(0) as f32;
     let trace = std::env::var("LARQL_TRACE_SPEC").ok().as_deref() == Some("1");
 
-    // ── Prefill via sequential GPU decode ──
-    let prefill_start = std::time::Instant::now();
-    backend.reset_kv_cache();
-    let embeds = crate::forward::embed_tokens_pub(weights, token_ids);
-    let seq_len = token_ids.len();
-    let mut last_h = vec![0.0f32; hidden];
-    for p in 0..seq_len {
-        let x: Vec<f32> = embeds.row(p).to_vec();
-        if let Some(result) = backend.decode_token(
-            layers, &x, hidden, intermediate, q_dim, kv_dim,
-            weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
-        ) {
-            last_h = result;
-        }
-    }
-    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
-
-    if trace {
-        let amax = last_h.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-        eprintln!("[spec] prefill done: seq_len={seq_len} h_amax={amax:.2} layers={}", layers.len());
-    }
-
-    // First token from prefill output
-    let h_arr = ndarray::Array2::from_shape_vec((1, hidden), last_h).unwrap();
-    let h_final = crate::forward::apply_norm(weights, &h_arr, weights.arch.final_norm_key(), norm_offset);
-    let h_1d = h_final.row(0).to_owned();
-    let first_hits = index.lm_head_knn_backend(&h_1d, 5, backend);
     let logits_scale = weights.arch.logits_scaling();
     let final_softcap = weights.arch.final_logit_softcapping();
-
     let mut tokens: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
     let mut context: Vec<u32> = token_ids.to_vec();
     let mut current_token_id: u32;
+    let prefill_ms;
 
-    if let Some(&(tid, score)) = first_hits.first() {
-        let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
-        let prob = super::logits::softmax_prob(score, &first_hits, logits_scale, final_softcap);
-        tokens.push((tok_str, prob));
-        current_token_id = tid;
-        context.push(tid);
+    if let Some(ft) = first_token {
+        // Resume mode: KV cache already populated, first token already sampled
+        prefill_ms = 0.0;
+        current_token_id = ft;
+        context.push(ft);
+        if trace { eprintln!("[spec] resume mode: first_token={ft}, skipping prefill"); }
     } else {
-        return SpecGenerateResult {
-            tokens, prefill_ms, decode_ms: 0.0,
-            total_accepted: 0, total_drafted: 0, total_cycles: 0,
-        };
+        // Full prefill
+        let prefill_start = std::time::Instant::now();
+        backend.reset_kv_cache();
+        let embeds = crate::forward::embed_tokens_pub(weights, token_ids);
+        let seq_len = token_ids.len();
+        let mut last_h = vec![0.0f32; hidden];
+        for p in 0..seq_len {
+            let x: Vec<f32> = embeds.row(p).to_vec();
+            if let Some(result) = backend.decode_token(
+                layers, &x, hidden, intermediate, q_dim, kv_dim,
+                weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
+            ) {
+                last_h = result;
+            }
+        }
+        prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+        if trace {
+            let amax = last_h.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            eprintln!("[spec] prefill done: seq_len={seq_len} h_amax={amax:.2} layers={}", layers.len());
+        }
+
+        let h_arr = ndarray::Array2::from_shape_vec((1, hidden), last_h).unwrap();
+        let h_final = crate::forward::apply_norm(weights, &h_arr, weights.arch.final_norm_key(), norm_offset);
+        let h_1d = h_final.row(0).to_owned();
+        let first_hits = index.lm_head_knn_backend(&h_1d, 5, backend);
+
+        if let Some(&(tid, score)) = first_hits.first() {
+            let tok_str = tokenizer.decode(&[tid], true).unwrap_or_default();
+            let prob = super::logits::softmax_prob(score, &first_hits, logits_scale, final_softcap);
+            tokens.push((tok_str, prob));
+            current_token_id = tid;
+            context.push(tid);
+        } else {
+            return SpecGenerateResult {
+                tokens, prefill_ms, decode_ms: 0.0,
+                total_accepted: 0, total_drafted: 0, total_cycles: 0,
+            };
+        }
     }
 
     // ── N-gram cache: seed from prompt ──

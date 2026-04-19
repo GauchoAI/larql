@@ -253,21 +253,18 @@ fn run_insert_knn(
         let ffn_ov: Option<&dyn larql_inference::ffn::FfnBackend> =
             walk_ffn_cap.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
 
+        // Always use the Q4_K GPU path for key capture. This matches the
+        // inference path exactly (same quantization, same KV cache) and
+        // allows dropping f32 attention weights (-2.1 GB heap).
         backend.reset_kv_cache();
-        let qk = if use_perlayer {
-            larql_inference::capture_knn_key_perlayer(
-                weights, &token_ids, install_layer, patched.base(), &**backend, ffn_ov,
-            )
-        } else {
-            larql_inference::capture_knn_key_gpu(
-                weights, &token_ids, install_layer, patched.base(), &**backend,
-            )
-        };
+        let qk = larql_inference::capture_knn_key_gpu(
+            weights, &token_ids, install_layer, patched.base(), &**backend,
+        );
 
         let vv = if let Some(vl) = req.value_layer {
             backend.reset_kv_cache();
-            larql_inference::capture_knn_key_perlayer(
-                weights, &token_ids, vl, patched.base(), &**backend, ffn_ov,
+            larql_inference::capture_knn_key_gpu(
+                weights, &token_ids, vl, patched.base(), &**backend,
             )
         } else { None };
 

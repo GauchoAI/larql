@@ -8,6 +8,92 @@
 pub const SHADER: &str = r#"
 constant uint Q4K_QKV_ROWS_PER_TG = 8;
 
+// Norm-fused variant: each simdgroup computes RMS inline, no separate norm dispatch.
+kernel void q4k_norm_qkv_proj(
+    device const block_q4_K* Wq      [[buffer(0)]],
+    device const block_q4_K* Wk      [[buffer(1)]],
+    device const block_q4_K* Wv      [[buffer(2)]],
+    device const float*      X       [[buffer(3)]],   // raw h (not normed)
+    device const float*      norm_w  [[buffer(4)]],   // norm weights
+    device float*        Q_out       [[buffer(5)]],
+    device float*        K_out       [[buffer(6)]],
+    device float*        V_out       [[buffer(7)]],
+    constant uint&       q_rows      [[buffer(8)]],
+    constant uint&       k_rows      [[buffer(9)]],
+    constant uint&       v_rows      [[buffer(10)]],
+    constant uint&       K           [[buffer(11)]],
+    constant float&      eps         [[buffer(12)]],
+    constant float&      norm_off    [[buffer(13)]],
+    uint tg_id     [[threadgroup_position_in_grid]],
+    uint tid_in_tg [[thread_index_in_threadgroup]],
+    uint lane      [[thread_index_in_simdgroup]],
+    uint sg_id     [[simdgroup_index_in_threadgroup]])
+{
+    // Each simdgroup computes RMS independently (redundant but cheap)
+    float partial_sq = 0.0f;
+    for (uint i = lane; i < K; i += 32) {
+        partial_sq += X[i] * X[i];
+    }
+    float sum_sq = simd_sum(partial_sq);
+    float rms = 1.0f / sqrt(sum_sq / float(K) + eps);
+
+    uint total_rows = q_rows + k_rows + v_rows;
+    uint global_row = tg_id * Q4K_QKV_ROWS_PER_TG + sg_id;
+    if (global_row >= total_rows) return;
+
+    uint superblocks = K / 256;
+    uint total_subs = superblocks * 8;
+
+    device const block_q4_K* W;
+    device float* out_buf;
+    uint local_row;
+    if (global_row < q_rows) {
+        W = Wq; out_buf = Q_out; local_row = global_row;
+    } else if (global_row < q_rows + k_rows) {
+        W = Wk; out_buf = K_out; local_row = global_row - q_rows;
+    } else {
+        W = Wv; out_buf = V_out; local_row = global_row - q_rows - k_rows;
+    }
+
+    device const block_q4_K* row = W + local_row * superblocks;
+    float acc = 0.0f;
+
+    for (uint sub = lane; sub < total_subs; sub += 32) {
+        uint sb = sub / 8;
+        uint j = sub % 8;
+
+        device const block_q4_K& blk = row[sb];
+        float d    = decode_f16_metal(blk.d);
+        float dmin = decode_f16_metal(blk.dmin);
+
+        float sc = d * float(blk.scales[j] & 0x3F);
+        float mn;
+        if (j < 4) mn = dmin * float(blk.mins[j] & 0x0F);
+        else mn = dmin * float((blk.mins[j - 4] >> 4) & 0x0F);
+
+        device const uint4* qp = (device const uint4*)(blk.qs + j * 16);
+        uint4 w = qp[0];
+        uint xi = sb * 256 + j * 32;
+
+        float dot = 0.0f, xs = 0.0f;
+        #define P(W, S, I) { \
+            float a = X[xi+I] * (norm_w[xi+I] + norm_off) * rms; \
+            float b = X[xi+I+1] * (norm_w[xi+I+1] + norm_off) * rms; \
+            dot += float((W>>S)&0xFu)*a + float((W>>(S+4))&0xFu)*b; \
+            xs += a + b; }
+        P(w.x, 0, 0); P(w.x, 8, 2); P(w.x,16, 4); P(w.x,24, 6);
+        P(w.y, 0, 8); P(w.y, 8,10); P(w.y,16,12); P(w.y,24,14);
+        P(w.z, 0,16); P(w.z, 8,18); P(w.z,16,20); P(w.z,24,22);
+        P(w.w, 0,24); P(w.w, 8,26); P(w.w,16,28); P(w.w,24,30);
+        #undef P
+        acc += sc * dot - mn * xs;
+    }
+
+    acc = simd_sum(acc);
+    if (lane == 0) out_buf[local_row] = acc;
+}
+
+// Original (non-fused) variant — kept for backward compatibility.
 kernel void q4k_qkv_proj(
     device const block_q4_K* Wq  [[buffer(0)]],
     device const block_q4_K* Wk  [[buffer(1)]],

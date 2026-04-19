@@ -141,7 +141,7 @@ impl RagStore {
 /// Falls back to mean-of-token-embeddings when backend is unavailable.
 pub fn sentence_embedding(
     tokenizer: &larql_vindex::tokenizers::Tokenizer,
-    embeddings: &larql_vindex::ndarray::Array2<f32>,
+    embeddings: &larql_vindex::ndarray::ArrayBase<impl larql_vindex::ndarray::Data<Elem = f32>, larql_vindex::ndarray::Ix2>,
     text: &str,
 ) -> Option<Vec<f32>> {
     sentence_embedding_token_mean(tokenizer, embeddings, text)
@@ -247,7 +247,7 @@ pub fn sentence_embedding_model(
 /// Fallback: mean of token embeddings (no forward pass).
 fn sentence_embedding_token_mean(
     tokenizer: &larql_vindex::tokenizers::Tokenizer,
-    embeddings: &larql_vindex::ndarray::Array2<f32>,
+    embeddings: &larql_vindex::ndarray::ArrayBase<impl larql_vindex::ndarray::Data<Elem = f32>, larql_vindex::ndarray::Ix2>,
     text: &str,
 ) -> Option<Vec<f32>> {
     let encoding = tokenizer.encode(text, false).ok()?;

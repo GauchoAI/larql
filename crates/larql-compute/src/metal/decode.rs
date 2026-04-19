@@ -455,9 +455,16 @@ impl MetalBackend {
                 enc, &kv_cache.layers[l],
                 &self.kv_append_pipeline, &k_out, &v_out,
             );
+            // Pick fast (4KB tg, high occupancy) or long (32KB tg) based on T
+            let t_after = kv_cache.layers[l].current_len + 1;
+            let kv_attend = if t_after <= 1024 {
+                &self.kv_attend_fast_pipeline
+            } else {
+                &self.kv_attend_long_pipeline
+            };
             ops::kv_cache::encode_kv_attend_softcap(
                 enc, &kv_cache.layers[l],
-                &self.kv_attend_pipeline, &q_out, &attn_out,
+                kv_attend, &q_out, &attn_out,
                 layer_num_q_heads, scale, window_size, layer.softcap,
             );
             kv_cache.layers[l].current_len += 1;

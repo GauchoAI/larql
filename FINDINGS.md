@@ -656,3 +656,80 @@ inference. To go lower requires:
 - Smaller model (not Gemma 3 4B)
 - Lazy layer loading (only page in the current layer's weights — would
   add ~1ms latency per layer from page faults)
+
+## KNN Overlay — Fixed and Validated (2026-04-19)
+
+### Root Cause: Batch Prefill Skipped KNN Probe
+
+The KNN overlay was broken since the GPU batch prefill was introduced.
+`decode_token_batch` processes all prefill tokens in one dispatch but
+does NOT probe at the last position. The KNN check only fired during
+single-token decode, where the residual is from a DIFFERENT position
+(the next generated token, not the last prompt token).
+
+**Fix**: When KNN entries exist, force sequential prefill so the probe
+fires at the last prefill position — matching the residual from the
+insert-time capture.
+
+| Metric | Before Fix | After Fix |
+|--------|-----------|-----------|
+| Cosine (insert vs probe) | 0.11 | **0.96** |
+| KNN override | never fires | **works** |
+| Latency (seq prefill) | +0ms | +200ms (7 tok × 24ms) |
+
+### KNN Override Test Results (Reproducible Scenario)
+
+```
+larql --scenario tests/scenarios/knn-override.json
+```
+
+| Step | Insert | Query | Result |
+|------|--------|-------|--------|
+| 1 | capital of Italy → Berlin | What is the capital of Italy? | **Berlin** (cos=0.91) |
+| 2 | inventor of telephone → Einstein | Who invented the telephone? | **Einstein** (cos=0.91) |
+| 3 | (none) | What is 2+2? | **4** (no false positive) |
+
+**3/3 passed.** Model correctly returns overridden facts and doesn't
+false-positive on unrelated queries.
+
+### Self-Annotation System
+
+The TUI has a complete self-annotation pipeline:
+
+```
+Model responds → TUI extracts ```fact```/```status```/```plan``` blocks
+  → Facts persisted to ~/.larql/facts.jsonl
+  → Workflows persisted to ~/.larql/workflows.json
+  → Blocks stripped from displayed text
+  → Facts re-injected into model via /v1/insert at startup
+  → Sidebar shows live workflow state (Ctrl+B)
+```
+
+**Limitation**: Gemma 3 4B doesn't reliably emit structured annotation
+blocks. The model understands the instruction but doesn't format its
+output with ```fact``` blocks. Larger models (Gemma 4 26B, Claude) do
+this reliably. The TUI plumbing is complete — just needs a bigger model.
+
+### TUI Architecture (post-refactor)
+
+Split from 804-line monolith into 11 modules:
+
+| Module | Purpose |
+|--------|---------|
+| app.rs | AppState, Message types, chat message building |
+| draw.rs | Layout + sidebar + message rendering |
+| events.rs | Event loop, key handling, stream processing |
+| stream.rs | HTTP streaming to server |
+| annotations.rs | Extract/persist fact/status/plan blocks |
+| skills.rs | Tool execution (```tool``` blocks) |
+| workflows.rs | Workflow store (hierarchical plans with steps) |
+| log.rs | Structured JSONL logging |
+| headless.rs | Headless mode + scenario runner |
+| session.rs | Claude session import |
+
+**New features:**
+- `larql --headless`: stdin → server → stdout (piping/automation)
+- `larql --scenario <file>`: automated test runner with assertions
+- Sidebar: Ctrl+B toggles workflow panel
+- Logging: `~/.larql/logs/YYYY-MM-DD.jsonl`
+- Scenario format supports INSERT setup + contains/not_contains assertions

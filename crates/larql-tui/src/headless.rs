@@ -71,12 +71,48 @@ pub async fn run_scenario(server_url: &str, scenario_path: &str) -> io::Result<(
     println!("Running {} scenario steps against {server_url}", total);
     println!();
 
+    let client = reqwest::Client::new();
+
     for (i, scenario) in scenarios.iter().enumerate() {
+        // Run setup commands (INSERT facts for KNN override tests)
+        if let Some(setup) = scenario["setup"].as_array() {
+            for cmd in setup {
+                if let Some(insert) = cmd.get("insert") {
+                    let resp = client
+                        .post(format!("{server_url}/v1/insert"))
+                        .json(insert)
+                        .timeout(std::time::Duration::from_secs(10))
+                        .send()
+                        .await;
+                    // Wait for insert to complete (KV cache needs to be ready)
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    match resp {
+                        Ok(r) if r.status().is_success() => {
+                            let entity = insert["entity"].as_str().unwrap_or("?");
+                            let target = insert["target"].as_str().unwrap_or("?");
+                            println!("  setup: INSERT {entity} → {target}");
+                        }
+                        Ok(r) => eprintln!("  setup: INSERT failed: {}", r.status()),
+                        Err(e) => eprintln!("  setup: INSERT error: {e}"),
+                    }
+                }
+            }
+            println!();
+        }
+
         let input = scenario["input"].as_str().unwrap_or("");
         if input.is_empty() {
             println!("  SKIP step {} -- no input", i + 1);
             continue;
         }
+
+        // Reset KV cache between scenario steps for deterministic matching
+        let _ = client
+            .post(format!("{server_url}/v1/kv/precompute"))
+            .json(&serde_json::json!({"text": ""}))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
 
         state.messages.push(Message::User(input.to_string()));
 
@@ -116,6 +152,22 @@ pub async fn run_scenario(server_url: &str, scenario_path: &str) -> io::Result<(
             } else {
                 details.push(format!("  contains \"{needle}\": FAIL (not found)"));
                 step_ok = false;
+            }
+        }
+
+        // Check "not_contains" assertions (any key starting with "not_contains")
+        if let Some(obj) = expect.as_object() {
+            for (key, val) in obj {
+                if key.starts_with("not_contains") {
+                    if let Some(needle) = val.as_str() {
+                        if cleaned.to_lowercase().contains(&needle.to_lowercase()) {
+                            details.push(format!("  not_contains \"{needle}\": FAIL (found!)"));
+                            step_ok = false;
+                        } else {
+                            details.push(format!("  not_contains \"{needle}\": PASS"));
+                        }
+                    }
+                }
             }
         }
 

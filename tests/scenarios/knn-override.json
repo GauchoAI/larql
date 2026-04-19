@@ -1,0 +1,27 @@
+[
+  {
+    "setup": [
+      {"insert": {"entity": "capital of Italy", "relation": "is", "target": "Berlin"}}
+    ],
+    "input": "What is the capital of Italy?",
+    "expect": {
+      "contains": "Berlin"
+    }
+  },
+  {
+    "setup": [
+      {"insert": {"entity": "inventor of telephone", "relation": "is", "target": "Einstein"}}
+    ],
+    "input": "Who invented the telephone?",
+    "expect": {
+      "contains": "Einstein"
+    }
+  },
+  {
+    "input": "What is 2+2?",
+    "expect": {
+      "not_contains": "Berlin",
+      "not_contains_2": "Einstein"
+    }
+  }
+]

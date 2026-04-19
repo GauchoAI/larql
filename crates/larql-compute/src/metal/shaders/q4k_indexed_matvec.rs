@@ -80,6 +80,30 @@ pub const THREADS_PER_TG: u64 = 128; // 4 × 32
 
 /// Threshold-based index selection: finds indices where |gate[i]| > threshold.
 /// Uses atomic counter for compact output.
+/// Two kernels for scatter:
+/// 1. zero_buffer: sets all N elements to 0
+/// 2. scatter_sparse: writes sparse[i] to full[indices[i]]
+pub const SCATTER_SHADER: &str = r#"
+kernel void zero_buffer(
+    device float* buf [[buffer(0)]],
+    constant uint& N  [[buffer(1)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid < N) buf[tid] = 0.0f;
+}
+
+kernel void scatter_sparse(
+    device const float*  sparse  [[buffer(0)]],  // [K_active] compact
+    device const uint*   indices [[buffer(1)]],  // [K_active] indices
+    device float*        full    [[buffer(2)]],  // [N] output
+    constant uint&       K_active [[buffer(3)]], // number of active
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= K_active) return;
+    full[indices[tid]] = sparse[tid];
+}
+"#;
+
 pub const SELECT_SHADER: &str = r#"
 kernel void select_active_indices(
     device const float*  gate     [[buffer(0)]],   // [N] gate outputs

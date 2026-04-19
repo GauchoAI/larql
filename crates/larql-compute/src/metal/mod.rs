@@ -67,6 +67,8 @@ pub struct MetalBackend {
     pub q4k_norm_qkv_pipeline: ComputePipelineState,
     pub q4k_indexed_pipeline: ComputePipelineState,
     pub select_active_pipeline: ComputePipelineState,
+    pub zero_buffer_pipeline: ComputePipelineState,
+    pub scatter_sparse_pipeline: ComputePipelineState,
     pub rms_norm_multihead_pipeline: ComputePipelineState,
     pub residual_add_pipeline: ComputePipelineState,
     q8_qkv_proj_pipeline: ComputePipelineState,
@@ -173,6 +175,10 @@ impl MetalBackend {
         let q4k_indexed_pipeline = device.new_compute_pipeline_state_with_function(&q4k_indexed_fn).ok()?;
         let select_active_fn = library.get_function("select_active_indices", None).ok()?;
         let select_active_pipeline = device.new_compute_pipeline_state_with_function(&select_active_fn).ok()?;
+        let zero_buffer_fn = library.get_function("zero_buffer", None).ok()?;
+        let zero_buffer_pipeline = device.new_compute_pipeline_state_with_function(&zero_buffer_fn).ok()?;
+        let scatter_sparse_fn = library.get_function("scatter_sparse", None).ok()?;
+        let scatter_sparse_pipeline = device.new_compute_pipeline_state_with_function(&scatter_sparse_fn).ok()?;
 
         // Q4_K and Q6_K matvec (Ollama-compatible quantization)
         let q4k_fn = library.get_function("q4k_matvec", None).ok()?;
@@ -276,7 +282,7 @@ impl MetalBackend {
             kv_attend_fast_pipeline, kv_attend_long_pipeline, kv_append_pipeline,
             kv_attend_batched_pipeline, kv_append_batch_pipeline,
             q8_matvec_pipeline,
-            rms_norm_pipeline, rms_norm_multihead_pipeline, q4k_norm_matvec_pipeline, q4k_norm_qkv_pipeline, q4k_indexed_pipeline, select_active_pipeline, residual_add_pipeline,
+            rms_norm_pipeline, rms_norm_multihead_pipeline, q4k_norm_matvec_pipeline, q4k_norm_qkv_pipeline, q4k_indexed_pipeline, select_active_pipeline, zero_buffer_pipeline, scatter_sparse_pipeline, residual_add_pipeline,
             q8_qkv_proj_pipeline,
             q4k_matvec_pipeline, q4k_ffn_gate_up_pipeline,
             q4kf_ffn_gate_up_pipeline,

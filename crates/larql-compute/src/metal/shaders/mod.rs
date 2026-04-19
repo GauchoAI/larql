@@ -99,5 +99,6 @@ pub fn all_shaders() -> String {
     // Indexed matvec (sparse FFN — read only active rows)
     src.push_str(q4k_indexed_matvec::SHADER);
     src.push_str(q4k_indexed_matvec::SELECT_SHADER);
+    src.push_str(q4k_indexed_matvec::SCATTER_SHADER);
     src
 }

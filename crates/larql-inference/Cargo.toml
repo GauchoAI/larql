@@ -4,40 +4,22 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Transformer inference engine — forward pass, attention, FFN, layer norm from safetensors weights"
-keywords = ["transformer", "inference", "llm", "interpretability"]
-categories = ["science"]
+description = "GGUF inference pipeline — Metal decode + sampling for the larql hot path"
 
 [dependencies]
 larql-models = { path = "../larql-models" }
 larql-compute = { path = "../larql-compute" }
-larql-core = { path = "../larql-core" }
 larql-vindex = { path = "../larql-vindex" }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
 
-# Model weights
-safetensors = "0.5"
-memmap2 = "0.9"
-
-# System
-libc = "0.2"
-
-# Matrix ops (BLAS-accelerated)
-ndarray = { version = "0.16", features = ["blas"] }
+# BLAS init shim for ndarray (used transitively by gguf_pipeline outputs).
 blas-src = { version = "0.10", features = ["accelerate"] }
 
-# Tokenizer
+# Tokenizer (used by GgufPipeline::predict_top_k_with_knn).
 tokenizers = "0.21"
 
-# Sampling (token-level RNG for temperature + top-p sampling)
+# Sampling RNG (temperature + top-p).
 rand = "0.9"
 
 [features]
 default = []
 metal = ["larql-compute/metal"]
-
-[dev-dependencies]
-assert_approx_eq = "1"
-tempfile = "3"

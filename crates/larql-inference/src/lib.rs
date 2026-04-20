@@ -1,82 +1,23 @@
+//! larql-inference — the GGUF hot path.
+//!
+//! Two responsibilities:
+//! 1. `gguf_pipeline::GgufPipeline` — load a GGUF, build per-layer
+//!    `FullPipelineLayer` views, run `decode_token` through Metal,
+//!    capture residuals for KNN, sample logits.
+//! 2. `sampling::Sampler` — temperature/top-p/top-k token sampling
+//!    used by the streaming generate path.
+//!
+//! Everything else (vindex weight loading, walk-FFN, dense matmul,
+//! per-layer trace) was deleted with the GGUF-only refactor.
+
 extern crate blas_src;
 
-pub mod attention;
-pub mod capture;
-pub mod error;
-pub mod ffn;
-pub mod forward;
 pub mod gguf_pipeline;
-pub mod graph_ffn;
-pub mod layer_graph;
-pub mod model;
-pub mod perf;
-pub mod route_ffn;
-pub mod residual;
 pub mod sampling;
-pub mod tokenizer;
-pub mod trace;
-pub mod vindex;
-pub mod walker;
 
-// Re-export dependencies for downstream crates.
+// Re-export dependencies used by the server.
 pub use larql_models;
 pub use larql_vindex;
-pub use ndarray;
-pub use safetensors;
-pub use tokenizers;
-
-// Backend re-exports (from larql-compute).
-pub use larql_compute::{ComputeBackend, MatMulOp, default_backend, cpu_backend, dot_proj_gpu, matmul_gpu};
-pub use larql_compute::CpuBackend;
+pub use larql_compute::{ComputeBackend, default_backend};
 #[cfg(feature = "metal")]
 pub use larql_compute::MetalBackend;
-
-// Re-export essentials at crate root.
-pub use capture::{
-    CaptureCallbacks, CaptureConfig, InferenceModel, TopKEntry, VectorFileHeader, VectorRecord,
-};
-pub use error::InferenceError;
-pub use ffn::{FfnBackend, HighwayFfn, LayerFfnRouter, SparseFfn, WeightFfn};
-pub use attention::AttentionWeights;
-pub use forward::{
-    calibrate_scalar_gains, capture_decoy_residuals, capture_ffn_activation_matrix,
-    capture_residuals, estimate_ffn_covariance, forward_to_layer, logit_lens_top1, predict,
-    predict_from_hidden, predict_from_hidden_with_ffn, predict_with_ffn,
-    predict_with_ffn_attention, predict_with_ffn_trace, predict_with_router,
-    predict_with_strategy, trace_forward, trace_forward_full, trace_forward_with_ffn,
-    LayerAttentionCapture, LayerMode, PredictResult, PredictResultWithAttention,
-    PredictResultWithResiduals, TraceResult,
-    run_memit, MemitFact, MemitResult, MemitFactResult,
-};
-pub use graph_ffn::{GateIndex, IndexBuildCallbacks, SilentIndexCallbacks};
-pub use route_ffn::{RouteFfn, RouteGuidedFfn, RouteTable};
-pub use trace::{
-    trace_residuals, trace as trace_decomposed, AnswerWaypoint, LayerSummary,
-    ResidualTrace, TraceNode, TracePositions, TraceStore, TraceWriter,
-    BoundaryStore, BoundaryWriter,
-    ContextStore, ContextWriter, ContextTier,
-};
-pub use layer_graph::{
-    // Production
-    LayerGraph, LayerOutput, DenseLayerGraph, WalkLayerGraph, PipelinedLayerGraph,
-    CachedLayerGraph, PerLayerGraph,
-    predict_honest_with_knn_ffn, capture_residual_post_attn_norm,
-    capture_knn_key_gpu, capture_knn_key_perlayer,
-    generate, GenerateResult, AttentionCache,
-    build_adaptive_graph,
-    // Analysis/validation
-    TemplatePattern, TemplateUniverse, GuidedWalkLayerGraph,
-    detect_template,
-};
-pub use vindex::WalkFfn;
-pub use model::{load_model_dir, resolve_model_path, ModelWeights};
-pub use tokenizer::{decode_token, decode_token_raw, load_tokenizer};
-
-// Walker re-exports.
-pub use walker::attention_walker::{AttentionLayerResult, AttentionWalker};
-pub use walker::vector_extractor::{
-    ExtractCallbacks, ExtractConfig, ExtractSummary, VectorExtractor,
-};
-pub use walker::weight_walker::{
-    walk_model, LayerResult, LayerStats, WalkCallbacks, WalkConfig, WeightWalker,
-};

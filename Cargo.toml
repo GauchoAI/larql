@@ -1,31 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/larql-tui",
-    "crates/gc-markdown",
     "crates/larql-models",
     "crates/larql-compute",
-    "crates/larql-core",
     "crates/larql-vindex",
     "crates/larql-inference",
-    "crates/larql-lql",
-    "crates/larql-cli",
     "crates/larql-server",
-    "crates/larql-python",
-    "crates/kv-cache-benchmark",
-]
-default-members = [
-    "crates/larql-tui",
-    "crates/gc-markdown",
-    "crates/larql-models",
-    "crates/larql-compute",
-    "crates/larql-core",
-    "crates/larql-vindex",
-    "crates/larql-inference",
-    "crates/larql-lql",
-    "crates/larql-cli",
-    "crates/larql-server",
-    "crates/kv-cache-benchmark",
 ]
 
 [workspace.package]

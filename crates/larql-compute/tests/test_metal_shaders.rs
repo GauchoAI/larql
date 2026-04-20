@@ -1544,7 +1544,7 @@ fn full_pipeline_seq1_produces_nonzero() {
             head_dim,
             num_q_heads,
             num_kv_heads,
-            rope_base: 10000.0,
+            rope_base: 10000.0, rope_freq_scale: 1.0,
             rotary_dim: 0,
             sliding_window: 0,
             has_v_norm: false,
@@ -1915,7 +1915,7 @@ fn decode_token_gemma3_produces_finite() {
         head_dim,
         num_q_heads,
         num_kv_heads,
-        rope_base: 10000.0,
+        rope_base: 10000.0, rope_freq_scale: 1.0,
         rotary_dim: 0,
         sliding_window: 0,
         has_v_norm: false,
@@ -2067,9 +2067,9 @@ fn decode_token_real_layer0_produces_finite() {
     let wo_bytes = &attn_mmap[o_off..o_off + o_len];
     println!("Q4K attn layer 0: q={}B k={}B v={}B o={}B", q_len, k_len, v_len, o_len);
 
-    // ── 3. Layer 0 FFN weights from interleaved_q4k.bin ──
+    // ── 3. Layer 0 FFN weights from interleaved_q4k_real.bin ──
     // Detect layout from file size (Q4_K 148 B, Q4_KF 144 B, Q6_K 210 B per 256 vals).
-    let inter_file = std::fs::File::open(dir.join("interleaved_q4k.bin")).unwrap();
+    let inter_file = std::fs::File::open(dir.join("interleaved_q4k_real.bin")).unwrap();
     let inter_mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&inter_file).unwrap() });
     let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 148;
     let q4kf_bytes_per_matrix = (inter * hidden).div_ceil(256) * 144;
@@ -2086,7 +2086,7 @@ fn decode_token_real_layer0_produces_finite() {
              larql_compute::QuantFormat::Q4_K, larql_compute::QuantFormat::Q4_K,
              larql_compute::QuantFormat::Q6_K)
         } else if file_per_layer == 3 * q6k_bytes_per_matrix {
-            // Uniform Q6_K — current Gemma 3 4B vindex layout (interleaved_q4k.bin
+            // Uniform Q6_K — current Gemma 3 4B vindex layout (interleaved_q4k_real.bin
             // despite the name actually contains Q6_K).
             (q6k_bytes_per_matrix, q6k_bytes_per_matrix, q6k_bytes_per_matrix,
              larql_compute::QuantFormat::Q6_K, larql_compute::QuantFormat::Q6_K,
@@ -2100,7 +2100,7 @@ fn decode_token_real_layer0_produces_finite() {
         };
     let layer_bytes = gate_bytes_per + up_bytes_per + down_bytes_per;
     let inter_total = inter_mmap.len();
-    println!("interleaved_q4k.bin: {}B total, layer 0 computed bytes={}B", inter_total, layer_bytes);
+    println!("interleaved_q4k_real.bin: {}B total, layer 0 computed bytes={}B", inter_total, layer_bytes);
 
     // Layer 0 offsets
     let gate_bytes = &inter_mmap[0..gate_bytes_per];
@@ -2134,7 +2134,7 @@ fn decode_token_real_layer0_produces_finite() {
         head_dim,
         num_q_heads,
         num_kv_heads,
-        rope_base: 10000.0,
+        rope_base: 10000.0, rope_freq_scale: 1.0,
         rotary_dim: 0,
         sliding_window: 0,
         has_v_norm: false,
@@ -2197,7 +2197,7 @@ fn decode_token_real_layer0_produces_finite() {
             activation: larql_compute::Activation::GeluTanh,
             attn_scale: 1.0 / (head_dim as f32).sqrt(),
             head_dim, num_q_heads, num_kv_heads,
-            rope_base: 10000.0, rotary_dim: 0, sliding_window: 0,
+            rope_base: 10000.0, rope_freq_scale: 1.0, rotary_dim: 0, sliding_window: 0,
             has_v_norm: false, layer_scalar: 0.0,
             input_norm_bias: None, post_attn_norm_bias: None,
             ffn_up_bias: None, ffn_down_bias: None, softcap: 0.0,
@@ -3148,7 +3148,7 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
     let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 148;
     let q4kf_bytes_per_matrix = (inter * hidden).div_ceil(256) * 144;
     let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210;
-    let inter_file = std::fs::File::open(dir.join("interleaved_q4k.bin")).unwrap();
+    let inter_file = std::fs::File::open(dir.join("interleaved_q4k_real.bin")).unwrap();
     let inter_mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&inter_file).unwrap() });
     let file_per_layer = inter_mmap.len() / num_layers;
     let (gate_bytes_per, up_bytes_per, down_bytes_per, gate_format, up_format) =
@@ -3214,6 +3214,7 @@ fn decode_token_all_34_layers_matches_cpu_ref() {
             attn_scale: 1.0 / (head_dim as f32).sqrt(),
             head_dim, num_q_heads, num_kv_heads,
             rope_base: rope_base_for(l),
+            rope_freq_scale: 1.0,
             rotary_dim: 0,
             sliding_window: sliding_window_for(l),
             has_v_norm: false, layer_scalar: 0.0,

@@ -65,8 +65,6 @@ pub trait GateIndex {
     fn interleaved_q4_down(&self, _layer: usize) -> Option<ndarray::Array2<f32>> { None }
     fn prefetch_interleaved_q4_layer(&self, _layer: usize) {}
     fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> { None }
-    fn has_interleaved_q4k(&self) -> bool { false }
-    fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> { None }
     fn has_interleaved_q4k_real(&self) -> bool { false }
     fn interleaved_q4k_real_mmap_ref(&self) -> Option<&[u8]> { None }
     fn attn_q4k_layer_data(&self, _layer: usize) -> Option<[(&[u8], &str); 4]> { None }

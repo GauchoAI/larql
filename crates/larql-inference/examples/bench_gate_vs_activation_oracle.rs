@@ -82,7 +82,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = index.load_attn_q4k(std::path::Path::new(&vindex_path));
     let _ = index.load_attn_q8(std::path::Path::new(&vindex_path));
     let _ = index.load_interleaved_q4(std::path::Path::new(&vindex_path));
-    let _ = index.load_interleaved_q4k(std::path::Path::new(&vindex_path));
 
     let walk = WalkFfn::new_unlimited(weights, &index);
 

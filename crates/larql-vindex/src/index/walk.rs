@@ -221,26 +221,8 @@ impl VectorIndex {
         self.interleaved_q4_mmap.is_some()
     }
 
-    /// Load Q4_K/Q6_K interleaved FFN data (Ollama-compatible, matches attn format).
-    pub fn load_interleaved_q4k(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join("interleaved_q4k.bin");
-        if !path.exists() {
-            return Err(VindexError::Parse("interleaved_q4k.bin not found".into()));
-        }
-        let file = std::fs::File::open(&path)?;
-        let mmap = unsafe { mmap_optimized(&file)? };
-        self.interleaved_q4k_mmap = Some(Arc::new(mmap));
-        Ok(())
-    }
-
-    pub fn has_interleaved_q4k(&self) -> bool {
-        self.interleaved_q4k_mmap.is_some()
-    }
-
     /// Load the true Q4_K interleaved FFN file (`interleaved_q4k_real.bin`,
     /// 148-byte Ollama Q4_K blocks — matches the `q4k_matvec` Metal shader).
-    /// The older `interleaved_q4k.bin` on disk is actually Q6_K data despite
-    /// its name, so we keep the new file on a separate mmap slot.
     pub fn load_interleaved_q4k_real(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
         let path = dir.join("interleaved_q4k_real.bin");
         if !path.exists() {

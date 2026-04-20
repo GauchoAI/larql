@@ -107,8 +107,6 @@ pub fn capture_knn_key_perlayer(
     let has_q4k = gate_index.attn_q4k_layer_data(0).is_some();
     let (q4_ffn, ffn_is_q4k) = if let Some(mmap) = gate_index.interleaved_q4k_real_mmap_ref() {
         (Some(mmap), true)
-    } else if let Some(mmap) = gate_index.interleaved_q4k_mmap_ref() {
-        (Some(mmap), true)
     } else if let Some(mmap) = gate_index.interleaved_q4_mmap_ref() {
         (Some(mmap), false)
     } else {
@@ -233,8 +231,6 @@ pub fn capture_knn_key_gpu(
 
     // Find Q4_K FFN mmap — same priority as predict_honest
     let (q4_ffn, ffn_is_q4k) = if let Some(mmap) = gate_index.interleaved_q4k_real_mmap_ref() {
-        (Some(mmap), true)
-    } else if let Some(mmap) = gate_index.interleaved_q4k_mmap_ref() {
         (Some(mmap), true)
     } else if let Some(mmap) = gate_index.interleaved_q4_mmap_ref() {
         (Some(mmap), false)
@@ -363,8 +359,6 @@ pub fn predict_honest_with_knn_ffn(
         // block structure preserves the distribution post_ffn_norm needs.
         // Walk-FFN already uses Q4_K via q4k_ffn_full and works correctly.
         let (q4_ffn, ffn_is_q4k) = if let Some(mmap) = gate_index.interleaved_q4k_real_mmap_ref() {
-            (Some(mmap), true)
-        } else if let Some(mmap) = gate_index.interleaved_q4k_mmap_ref() {
             (Some(mmap), true)
         } else if let Some(mmap) = gate_index.interleaved_q4_mmap_ref() {
             (Some(mmap), false)

@@ -147,13 +147,11 @@ fn load_single_vindex(path_str: &str, no_infer: bool, walk_only: bool) -> Result
     let _ = index.load_attn_q4k(&path);
     let _ = index.load_attn_q8(&path);
     // Prefer interleaved_q4k_real.bin (true Q4_K, validated cos=0.9994 on
-    // Gemma 3 4B) over interleaved_q4k.bin (Q6_K — cos=0.84/layer, garbage).
-    // Only load fallback formats if the preferred format isn't available.
+    // Gemma 3 4B). Fall back to Q4_0 if the preferred file isn't present.
     if index.load_interleaved_q4k_real(&path).is_ok() {
         info!("  FFN: interleaved_q4k_real.bin (GPU decode default)");
     } else {
         let _ = index.load_interleaved_q4(&path);
-        let _ = index.load_interleaved_q4k(&path);
     }
     index.warmup();
     info!("  Warmup: done");

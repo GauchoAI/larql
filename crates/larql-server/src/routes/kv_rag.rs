@@ -134,8 +134,6 @@ fn extract_k_vector(
     let gate_index: &dyn larql_vindex::GateIndex = patched.base();
     let (q4_ffn, ffn_is_q4k) = if let Some(mmap) = gate_index.interleaved_q4k_real_mmap_ref() {
         (Some(mmap), true)
-    } else if let Some(mmap) = gate_index.interleaved_q4k_mmap_ref() {
-        (Some(mmap), true)
     } else {
         return None;
     };

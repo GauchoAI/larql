@@ -84,12 +84,6 @@ pub struct VectorIndex {
     pub(crate) interleaved_mmap: Option<Arc<memmap2::Mmap>>,
     /// Q4_0 quantized interleaved FFN data (7x smaller, dequant on read).
     pub(crate) interleaved_q4_mmap: Option<Arc<memmap2::Mmap>>,
-    /// LEGACY Q6_K interleaved FFN data, mis-named `interleaved_q4k.bin`
-    /// for historical reasons. cos = 0.84/layer accumulates to garbage
-    /// over 34 layers. Prefer `interleaved_q4k_real_mmap` (true Q4_K) or
-    /// — better — drop a `weights.gguf` into the vindex dir and let the
-    /// GGUF pipeline supply FFN weights instead.
-    pub(crate) interleaved_q4k_mmap: Option<Arc<memmap2::Mmap>>,
     /// True Q4_K interleaved FFN data (148-byte Ollama Q4_K blocks, matching
     /// the `q4k_matvec` Metal shader). File: `interleaved_q4k_real.bin`.
     pub(crate) interleaved_q4k_real_mmap: Option<Arc<memmap2::Mmap>>,
@@ -143,7 +137,6 @@ impl Clone for VectorIndex {
             vocab_size: self.vocab_size,
             interleaved_mmap: self.interleaved_mmap.clone(),
             interleaved_q4_mmap: self.interleaved_q4_mmap.clone(),
-            interleaved_q4k_mmap: self.interleaved_q4k_mmap.clone(),
             interleaved_q4k_real_mmap: self.interleaved_q4k_real_mmap.clone(),
             gate_q4_mmap: self.gate_q4_mmap.clone(),
             gate_q4_slices: self.gate_q4_slices.clone(),
@@ -189,7 +182,6 @@ impl VectorIndex {
             vocab_size: 0,
             interleaved_mmap: None,
             interleaved_q4_mmap: None,
-            interleaved_q4k_mmap: None,
             interleaved_q4k_real_mmap: None,
             gate_q4_mmap: None,
             gate_q4_slices: Vec::new(),
@@ -236,7 +228,6 @@ impl VectorIndex {
             vocab_size: 0,
             interleaved_mmap: None,
             interleaved_q4_mmap: None,
-            interleaved_q4k_mmap: None,
             interleaved_q4k_real_mmap: None,
             gate_q4_mmap: None,
             gate_q4_slices: Vec::new(),
@@ -411,7 +402,6 @@ impl VectorIndex {
             vocab_size: 0,
             interleaved_mmap: None,
             interleaved_q4_mmap: None,
-            interleaved_q4k_mmap: None,
             interleaved_q4k_real_mmap: None,
             gate_q4_mmap: None,
             gate_q4_slices: Vec::new(),
@@ -541,9 +531,8 @@ impl VectorIndex {
         advise(&self.gate_mmap_bytes, "gate_vectors", &mut freed);
         // f32 interleaved (replaced by Q4_K real)
         advise(&self.interleaved_mmap, "interleaved_f32", &mut freed);
-        // Fallback quant formats (Q4_0, Q6_K) when Q4_K real is available
+        // Fallback quant format (Q4_0) when Q4_K real is available
         advise(&self.interleaved_q4_mmap, "interleaved_q4", &mut freed);
-        advise(&self.interleaved_q4k_mmap, "interleaved_q4k", &mut freed);
         // f32 lm_head (replaced by lm_head_q4)
         advise(&self.lm_head_mmap, "lm_head_f32", &mut freed);
         if freed > 0 {
@@ -663,14 +652,6 @@ impl GateIndex for VectorIndex {
 
     fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> {
         self.interleaved_q4_mmap.as_ref().map(|m| m.as_ref() as &[u8])
-    }
-
-    fn has_interleaved_q4k(&self) -> bool {
-        self.has_interleaved_q4k()
-    }
-
-    fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> {
-        self.interleaved_q4k_mmap.as_ref().map(|m| m.as_ref() as &[u8])
     }
 
     fn has_interleaved_q4k_real(&self) -> bool {

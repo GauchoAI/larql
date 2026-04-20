@@ -38,7 +38,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = index.load_attn_q4k(&vindex_path);
     let _ = index.load_attn_q8(&vindex_path);
     let _ = index.load_interleaved_q4(&vindex_path);
-    let _ = index.load_interleaved_q4k(&vindex_path);
 
     let gpu_be = default_backend();
     let dense_ffn = WeightFfn { weights };

@@ -62,7 +62,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = index.load_attn_q8(std::path::Path::new(&vindex_path));
     let _ = index.load_interleaved(std::path::Path::new(&vindex_path));
     let _ = index.load_interleaved_q4(std::path::Path::new(&vindex_path));
-    let _ = index.load_interleaved_q4k(std::path::Path::new(&vindex_path));
     let _ = index.load_interleaved_q4k_real(std::path::Path::new(&vindex_path));
 
     let enc = tokenizer.encode(prompt.as_str(), true).map_err(|e| format!("{e}"))?;

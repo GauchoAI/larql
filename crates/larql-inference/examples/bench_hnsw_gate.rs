@@ -55,7 +55,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = index.load_attn_q4k(std::path::Path::new(&vindex_path));
     let _ = index.load_attn_q8(std::path::Path::new(&vindex_path));
     let _ = index.load_interleaved_q4(std::path::Path::new(&vindex_path));
-    let _ = index.load_interleaved_q4k(std::path::Path::new(&vindex_path));
 
     let encs: Vec<(String, Vec<u32>)> = PROMPTS.iter()
         .map(|p| (p.to_string(), tokenizer.encode(*p, true).expect("enc").get_ids().to_vec()))

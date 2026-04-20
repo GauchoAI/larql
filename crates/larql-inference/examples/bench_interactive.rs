@@ -95,7 +95,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let _ = index.load_interleaved(&vindex_path);
                 let _ = index.load_interleaved_q4(&vindex_path);
-                let _ = index.load_interleaved_q4k(&vindex_path);
             }
         }
     }
@@ -330,7 +329,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Build pipeline layers once for GPU capture
                 let gi: &dyn larql_vindex::GateIndex = &index;
                 let ins_mmap = gi.interleaved_q4k_real_mmap_ref()
-                    .or_else(|| gi.interleaved_q4k_mmap_ref())
                     .unwrap_or(&[][..]);
                 let ins_inter = gi.num_features(0);
                 if ins_mmap.is_empty() || ins_inter == 0 {
@@ -440,7 +438,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Build pipeline layers for decode_token
                     let gi: &dyn larql_vindex::GateIndex = &index;
                     let ins_mmap = gi.interleaved_q4k_real_mmap_ref()
-                        .or_else(|| gi.interleaved_q4k_mmap_ref())
                         .unwrap_or(&[][..]);
                     let ins_inter = gi.num_features(0);
                     let ins_q4_per = (ins_inter * weights.hidden_size).div_ceil(256) * 148;

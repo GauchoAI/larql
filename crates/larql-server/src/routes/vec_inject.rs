@@ -134,8 +134,6 @@ fn extract_k_and_coef(
     // GPU pipeline for L0-28 (Q4_K, fast)
     let (q4_ffn, ffn_is_q4k) = if let Some(mmap) = gate_index.interleaved_q4k_real_mmap_ref() {
         (Some(mmap), true)
-    } else if let Some(mmap) = gate_index.interleaved_q4k_mmap_ref() {
-        (Some(mmap), true)
     } else { return None; };
     let q4_ffn = q4_ffn?;
     let intermediate = gate_index.num_features(0);
@@ -244,8 +242,6 @@ fn extract_q(
     let gate_index: &dyn larql_vindex::GateIndex = patched.base();
 
     let (q4_ffn, ffn_is_q4k) = if let Some(mmap) = gate_index.interleaved_q4k_real_mmap_ref() {
-        (Some(mmap), true)
-    } else if let Some(mmap) = gate_index.interleaved_q4k_mmap_ref() {
         (Some(mmap), true)
     } else { return None; };
     let q4_ffn = q4_ffn?;

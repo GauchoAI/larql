@@ -86,7 +86,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut index = VectorIndex::load_vindex(std::path::Path::new(&vindex_path), &mut cb)?;
     let _ = index.load_attn_q4k(std::path::Path::new(&vindex_path));
     // Load BOTH interleaved files; preference via --use-real-q4k flag.
-    let _ = index.load_interleaved_q4k(std::path::Path::new(&vindex_path));
     let _ = index.load_interleaved_q4k_real(std::path::Path::new(&vindex_path));
 
     let token_ids = tokenizer.encode(&prompt[..], true)?.get_ids().to_vec();
@@ -156,16 +155,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Just look up via index for now — if not available, FFN-side path won't fire
     // but attention-side will, which is what we're bisecting.
     let gi: &dyn larql_vindex::GateIndex = &index;
-    let use_real_q4k = args.iter().any(|a| a == "--use-real-q4k");
-    let inter_mmap_data: Option<&[u8]> = if use_real_q4k {
-        println!("  Using interleaved_q4k_real.bin (true Q4_K weights)");
-        gi.interleaved_q4k_real_mmap_ref()
-    } else {
-        println!("  Using interleaved_q4k.bin (Q6_K weights)");
-        gi.interleaved_q4k_mmap_ref()
-    };
+    let inter_mmap_data: Option<&[u8]> = gi.interleaved_q4k_real_mmap_ref();
     if inter_mmap_data.is_none() {
-        eprintln!("WARNING: interleaved_q4k mmap not loaded; FFN side will be empty");
+        eprintln!("WARNING: interleaved_q4k_real.bin not loaded; FFN side will be empty");
     }
     let hidden = weights.hidden_size;
     let inter = weights.intermediate_size;

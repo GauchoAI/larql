@@ -63,8 +63,7 @@ impl LoadedModel {
         }
         // Skip loading f32 tensors when Q4_K equivalents exist on disk.
         // Never allocates them — no load-then-drop, no malloc arena ghost.
-        let has_q4k_ffn = self.path.join("interleaved_q4k_real.bin").exists()
-            || self.path.join("interleaved_q4k.bin").exists();
+        let has_q4k_ffn = self.path.join("interleaved_q4k_real.bin").exists();
         let has_q4k_attn = self.path.join("attn_weights_q4k.bin").exists();
         let has_q4_lm = self.path.join("lm_head_q4.bin").exists();
         let mut skip: Vec<&str> = Vec::new();

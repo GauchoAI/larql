@@ -4,6 +4,17 @@ use larql_models::quant::ggml;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).expect("usage: probe <gguf>");
     let gguf = GgufFile::open(&std::path::PathBuf::from(&path))?;
+    // Print RoPE-relevant metadata
+    // RoPE / attention metadata
+    for k in ["gemma3.rope.freq_base", "gemma3.rope.freq_base_swa",
+              "gemma3.rope.scaling.type", "gemma3.rope.scaling.factor",
+              "gemma3.attention.head_count", "gemma3.attention.head_count_kv",
+              "gemma3.attention.key_length", "gemma3.attention.sliding_window"] {
+        if let Some(v) = gguf.metadata.get(k) {
+            println!("META {} = {:?}", k, v);
+        }
+    }
+    println!("---");
     let qdata = GgufQuantizedData::open(&std::path::PathBuf::from(&path), gguf.data_offset)?;
     // Norm tensor stats — to check if +1 is baked in
     let norm_names = ["blk.0.attn_norm.weight", "blk.0.post_attention_norm.weight",

@@ -288,6 +288,13 @@ pub trait ModelArchitecture: Send + Sync {
         self.config().rope_base
     }
 
+    /// Multiplier applied to the RoPE angle for a given layer (1.0 = no scaling).
+    /// For Gemma 3 with `rope_scaling: {type: linear, factor: F}`, global layers
+    /// use 1/F; sliding-window layers use 1.0.
+    fn rope_freq_scale_for_layer(&self, _layer: usize) -> f64 {
+        1.0
+    }
+
     /// Head dimension for a given layer. Models with different head dims for
     /// sliding vs global attention (e.g., Gemma 4) override this.
     /// Default: config.head_dim for all layers.

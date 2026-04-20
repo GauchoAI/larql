@@ -461,6 +461,7 @@ impl MetalBackend {
                 let rope_pairs = (layer_rotary_dim / 2) as u64;
                 let num_q = layer_num_q_heads as u32;
                 let num_kv = layer_num_kv_heads as u32;
+                let freq_scale = layer.rope_freq_scale;
 
                 // Q heads — all in one dispatch
                 enc.set_compute_pipeline_state(&self.rope_at_pos_batched_pipeline);
@@ -470,6 +471,7 @@ impl MetalBackend {
                 enc.set_bytes(3, 4, &pos as *const u32 as *const std::ffi::c_void);
                 enc.set_bytes(4, 4, &rdim as *const u32 as *const std::ffi::c_void);
                 enc.set_bytes(5, 4, &num_q as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &freq_scale as *const f32 as *const std::ffi::c_void);
                 enc.dispatch_threads(
                     MTLSize::new(rope_pairs, layer_num_q_heads as u64, 1),
                     MTLSize::new(rope_pairs.min(256), 1, 1),
@@ -1550,6 +1552,7 @@ impl MetalBackend {
                 let rope_pairs = (layer_rotary_dim / 2) as u64;
                 let num_q = layer_num_q_heads as u32;
                 let num_kv = layer_num_kv_heads as u32;
+                let freq_scale = layer.rope_freq_scale;
                 enc.set_compute_pipeline_state(&self.rope_at_pos_batched_pipeline);
                 enc.set_buffer(0, Some(&q_out), 0);
                 enc.set_bytes(1, 4, &hd as *const u32 as *const std::ffi::c_void);
@@ -1557,6 +1560,7 @@ impl MetalBackend {
                 enc.set_bytes(3, 4, &pos as *const u32 as *const std::ffi::c_void);
                 enc.set_bytes(4, 4, &rdim as *const u32 as *const std::ffi::c_void);
                 enc.set_bytes(5, 4, &num_q as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &freq_scale as *const f32 as *const std::ffi::c_void);
                 enc.dispatch_threads(
                     MTLSize::new(rope_pairs, layer_num_q_heads as u64, 1),
                     MTLSize::new(rope_pairs.min(256), 1, 1),
@@ -2569,6 +2573,7 @@ impl MetalBackend {
                     let rope_pairs = (layer_rotary_dim / 2) as u64;
                     let num_q = layer_nq as u32;
                     let num_kv = layer_nkv as u32;
+                    let freq_scale = layer.rope_freq_scale;
                     enc.set_compute_pipeline_state(&self.rope_at_pos_batched_pipeline);
                     enc.set_buffer(0, Some(&q_out), q_off);
                     enc.set_bytes(1, 4, &hd as *const u32 as *const std::ffi::c_void);
@@ -2576,6 +2581,7 @@ impl MetalBackend {
                     enc.set_bytes(3, 4, &pos as *const u32 as *const std::ffi::c_void);
                     enc.set_bytes(4, 4, &rdim as *const u32 as *const std::ffi::c_void);
                     enc.set_bytes(5, 4, &num_q as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(6, 4, &freq_scale as *const f32 as *const std::ffi::c_void);
                     enc.dispatch_threads(
                         MTLSize::new(rope_pairs, layer_nq as u64, 1),
                         MTLSize::new(rope_pairs.min(256), 1, 1),

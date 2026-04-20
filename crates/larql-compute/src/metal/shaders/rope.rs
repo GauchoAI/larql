@@ -78,6 +78,7 @@ kernel void rope_at_pos_batched(
     constant uint&      pos        [[buffer(3)]],
     constant uint&      rotary_dim [[buffer(4)]],
     constant uint&      num_heads  [[buffer(5)]],
+    constant float&     freq_scale [[buffer(6)]],   // 1/linear_factor (1.0 = no scaling)
     uint2 tid [[thread_position_in_grid]])
 {
     uint d  = tid.x;   // pair index within head
@@ -88,7 +89,7 @@ kernel void rope_at_pos_batched(
     if (d >= hdim) return;
 
     float freq  = 1.0f / pow(base, float(2 * d) / float(rdim));
-    float angle = float(pos) * freq;
+    float angle = float(pos) * freq * freq_scale;
     float cos_a = cos(angle);
     float sin_a = sin(angle);
 

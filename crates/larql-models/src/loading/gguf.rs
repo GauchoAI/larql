@@ -319,6 +319,17 @@ impl GgufFile {
         if let Some(rope) = get_arch_opt_f64("rope.freq_base") {
             config["rope_theta"] = serde_json::json!(rope);
         }
+        // Gemma 3 + Gemma 4 store the SWA RoPE base under rope.freq_base_swa.
+        if let Some(swa_base) = get_arch_opt_f64("rope.freq_base_swa") {
+            config["rope_local_base_freq"] = serde_json::json!(swa_base);
+        }
+        // RoPE scaling (linear / longrope etc.) — both type and factor.
+        if let (Some(rt), Some(rf)) = (
+            self.metadata.get(&format!("{prefix}rope.scaling.type")).and_then(|v| v.as_str()),
+            get_arch_opt_f64("rope.scaling.factor"),
+        ) {
+            config["rope_scaling"] = serde_json::json!({"rope_type": rt, "factor": rf});
+        }
         if let Some(vs) = get_arch_opt_u32("vocab_size") {
             config["vocab_size"] = serde_json::json!(vs);
         }

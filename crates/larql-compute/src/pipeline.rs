@@ -112,6 +112,9 @@ pub struct FullPipelineLayer<'a> {
     pub num_kv_heads: usize,
     /// RoPE base frequency for this layer. Gemma 3/4: 10k (sliding) or 1M (global).
     pub rope_base: f32,
+    /// Multiplier applied to RoPE angles. 1.0 = no scaling. For Gemma 3 linear
+    /// scaling with factor F, this is 1/F (e.g. 0.125 for factor=8 on global layers).
+    pub rope_freq_scale: f32,
     /// Dimensions to apply RoPE to. 0 = full head_dim. Gemma 4 global: head_dim * 0.25.
     pub rotary_dim: usize,
     /// Sliding window size. 0 = full attention (no window).

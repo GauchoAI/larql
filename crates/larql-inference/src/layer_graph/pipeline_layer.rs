@@ -84,6 +84,7 @@ pub fn build_arch_params<'a>(
         num_q_heads: layer_nq,
         num_kv_heads: layer_nkv,
         rope_base: arch.rope_base_for_layer(layer) as f32,
+        rope_freq_scale: arch.rope_freq_scale_for_layer(layer) as f32,
         rotary_dim,
         sliding_window: sw,
         has_v_norm: arch.has_v_norm(),

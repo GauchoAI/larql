@@ -38,6 +38,7 @@ impl MetalBackend {
                 num_q_heads: 0,
                 num_kv_heads: 0,
                 rope_base: 10000.0,
+                rope_freq_scale: 1.0,
                 rotary_dim: 0,
                 sliding_window: 0,
                 has_v_norm: false,

@@ -89,4 +89,19 @@ impl ModelArchitecture for Gemma3Arch {
             self.config.rope_base
         }
     }
+
+    /// Gemma 3 applies linear RoPE scaling on global layers only.
+    /// `rope_scaling: {type: linear, factor: 8.0}` → freq_scale = 1/8 globally.
+    fn rope_freq_scale_for_layer(&self, layer: usize) -> f64 {
+        if self.is_sliding_window_layer(layer) {
+            1.0
+        } else {
+            // Linear scaling: angle = pos * freq * (1/factor)
+            let factor = self.config.rope_scaling.as_ref()
+                .filter(|s| s.scaling_type == "linear")
+                .map(|s| s.factor)
+                .unwrap_or(1.0);
+            if factor > 0.0 { 1.0 / factor } else { 1.0 }
+        }
+    }
 }

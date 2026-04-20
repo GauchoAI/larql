@@ -1,5 +1,6 @@
-//! POST /v1/probe — capture L26 residual for a prompt, return as JSON.
-//! Used for offline cosine experiments without KNN storage.
+//! POST /v1/probe — capture the pre-FFN-normalized residual at a layer
+//! for a prompt, return as JSON. Used for offline cosine experiments
+//! and KNN-store debugging without storing anything.
 
 use std::sync::Arc;
 use axum::Json;
@@ -27,8 +28,9 @@ pub async fn handle_probe(
     let model = Arc::clone(model);
 
     let result = tokio::task::spawn_blocking(move || {
-        let weights = model.get_or_load_weights()
-            .map_err(ServerError::InferenceUnavailable)?;
+        let gguf = model.gguf.as_ref().ok_or_else(|| ServerError::InferenceUnavailable(
+            "probe requires weights.gguf in vindex dir".into(),
+        ))?;
         let backend = model.get_or_init_backend();
         let _guard = match model.inference_lock.lock() {
             Ok(g) => g,
@@ -36,14 +38,11 @@ pub async fn handle_probe(
         };
         backend.reset_kv_cache();
 
-        let encoding = model.tokenizer.encode(req.prompt.as_str(), true)
-            .map_err(|e| ServerError::Internal(format!("tokenize: {e}")))?;
-        let token_ids: Vec<u32> = encoding.get_ids().to_vec();
+        let token_ids: Vec<u32> = model.tokenizer.encode(req.prompt.as_str(), true)
+            .map_err(|e| ServerError::Internal(format!("tokenize: {e}")))?
+            .get_ids().to_vec();
 
-        let patched = model.patched.blocking_read();
-        let key = larql_inference::capture_knn_key_gpu(
-            weights, &token_ids, req.layer, patched.base(), &**backend,
-        );
+        let key = gguf.capture_residual_at_layer(&token_ids, req.layer, &**backend);
         backend.reset_kv_cache();
 
         match key {

@@ -1,11 +1,9 @@
-//! AppState: loaded vindex + config, shared across all handlers.
+//! AppState: loaded vindex + GGUF, shared across all handlers.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use larql_inference::ComputeBackend;
-use larql_models::ModelWeights;
 use larql_vindex::{PatchedVindex, VindexConfig, tokenizers};
 use tokio::sync::RwLock;
 
@@ -13,84 +11,40 @@ use crate::cache::DescribeCache;
 use crate::session::SessionManager;
 
 /// A single loaded model.
+///
+/// The vindex side supplies KNN store, patches, graph indices, tokenizer,
+/// probe labels. Inference always runs through `gguf` — the only weight
+/// source — using the Metal `decode_token` path.
 pub struct LoadedModel {
     /// Model ID derived from config (e.g., "gemma-3-4b-it").
     pub id: String,
-    /// Vindex directory on disk.
-    pub path: PathBuf,
     /// Vindex config (index.json).
     pub config: VindexConfig,
     /// Base index with patch overlay (starts with no patches).
     pub patched: RwLock<PatchedVindex>,
-    /// Embeddings matrix + scale factor, loaded once.
+    /// Embedding matrix from the vindex — used by /v1/describe and
+    /// /v1/patches to convert entity strings to query vectors. NOT used
+    /// by inference (GGUF supplies its own quantized embeddings).
     pub embeddings: larql_models::WeightArray,
     pub embed_scale: f32,
     /// Tokenizer for embedding lookups.
     pub tokenizer: tokenizers::Tokenizer,
-    /// Whether inference is disabled (--no-infer).
-    pub infer_disabled: bool,
-    /// Model weights, lazy-loaded on first INFER request.
-    pub weights: std::sync::OnceLock<ModelWeights>,
-    /// ComputeBackend for the fast Metal path (mode=fast, mode=knn).
+    /// ComputeBackend for the Metal GGUF path.
     /// Lazy-initialized on first use; serializes inference requests via
     /// `inference_lock` because the KV cache inside is shared mutable state.
     pub backend: std::sync::OnceLock<std::sync::Arc<dyn ComputeBackend>>,
     /// Serializes access to the Metal backend's KV cache. Held around any
-    /// `predict_honest_with_knn` / `capture_residual_post_attn_norm` call.
+    /// `predict_top_k_with_knn` / `capture_residual_at_layer` call.
     pub inference_lock: std::sync::Mutex<()>,
     /// Probe-confirmed feature labels: (layer, feature) → relation name.
     /// Loaded from feature_labels.json if present.
     pub probe_labels: HashMap<(usize, usize), String>,
-    /// Optional GGUF weight source. When `weights.gguf` is present in the
-    /// vindex dir, `mode=fast` reads attention/FFN weights from this pipeline
-    /// instead of the (possibly stale) Q4_K binaries. The vindex still
-    /// supplies KNN store, embeddings (for KNN), tokenizer, and patches.
+    /// GGUF weight source — the only inference path. Required for the
+    /// /v1/infer, /v1/insert, /v1/generate endpoints.
     pub gguf: Option<Arc<larql_inference::gguf_pipeline::GgufPipeline>>,
 }
 
 impl LoadedModel {
-    /// Get or lazy-load model weights for inference. Drops f32 FFN tensors
-    /// when Q4_K FFN weights exist on disk (saves ~10.7 GB — the Q4_K pipeline
-    /// reads from the mmap'd interleaved_q4k_real.bin, not from f32 tensors).
-    /// Also drops in walk-only mode as before.
-    pub fn get_or_load_weights(&self) -> Result<&ModelWeights, String> {
-        if let Some(w) = self.weights.get() {
-            return Ok(w);
-        }
-        // Skip loading f32 tensors when Q4_K equivalents exist on disk.
-        // Never allocates them — no load-then-drop, no malloc arena ghost.
-        let has_q4k_ffn = self.path.join("interleaved_q4k_real.bin").exists();
-        let has_q4k_attn = self.path.join("attn_weights_q4k.bin").exists();
-        let has_q4_lm = self.path.join("lm_head_q4.bin").exists();
-        let mut skip: Vec<&str> = Vec::new();
-        if has_q4k_ffn {
-            skip.extend_from_slice(&["gate_proj", "up_proj", "down_proj",
-                "ffn_gate", "ffn_up", "ffn_down", "mlp.experts",
-                "packed_gate_up", "packed_down"]);
-        }
-        if has_q4k_attn {
-            skip.extend_from_slice(&["q_proj", "k_proj", "v_proj", "o_proj",
-                "attn_q", "attn_k", "attn_v", "attn_output"]);
-        }
-        if has_q4_lm { skip.push("lm_head"); }
-
-        let mut cb = larql_vindex::SilentLoadCallbacks;
-        let mut weights = larql_vindex::load_model_weights_filtered(&self.path, &mut cb, &skip)
-            .map_err(|e| format!("failed to load model weights: {e}"))?;
-        if !skip.is_empty() {
-            tracing::info!("[skip-load] skipped {} tensor patterns — never allocated", skip.len());
-        }
-        // Share embedding matrix: replace weights.embed with a clone of
-        // LoadedModel.embeddings (same ArcArray2, one allocation).
-        // Saves ~2.7 GB by deduplicating the embedding matrix.
-        let old_embed_size = weights.embed.len() * 4;
-        weights.embed = self.embeddings.clone(); // ArcArray2 clone = refcount bump, not copy
-        tracing::info!("[shared embed] deduplicated embedding matrix: {:.1} GB freed",
-            old_embed_size as f64 / 1e9);
-        let _ = self.weights.set(weights);
-        Ok(self.weights.get().unwrap())
-    }
-
     /// Get or lazy-init the shared ComputeBackend (Metal when available).
     pub fn get_or_init_backend(&self) -> &std::sync::Arc<dyn ComputeBackend> {
         self.backend.get_or_init(|| {

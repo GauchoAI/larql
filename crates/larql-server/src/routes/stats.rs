@@ -25,10 +25,6 @@ fn build_stats(model: &LoadedModel) -> serde_json::Value {
         })
     });
 
-    let has_inference = config.extract_level == larql_vindex::ExtractLevel::Inference
-        || config.extract_level == larql_vindex::ExtractLevel::All
-        || config.has_model_weights;
-
     serde_json::json!({
         "model": config.model,
         "family": config.family,
@@ -42,7 +38,7 @@ fn build_stats(model: &LoadedModel) -> serde_json::Value {
         "layer_bands": layer_bands,
         "loaded": {
             "browse": true,
-            "inference": has_inference && !model.infer_disabled,
+            "inference": model.gguf.is_some(),
         },
     })
 }

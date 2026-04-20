@@ -4,7 +4,6 @@ mod auth;
 mod cache;
 mod error;
 mod etag;
-mod grpc;
 mod ratelimit;
 mod routes;
 mod session;
@@ -52,10 +51,6 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
 
-    /// Disable INFER endpoint (browse-only, reduces memory).
-    #[arg(long)]
-    no_infer: bool,
-
     /// Enable CORS for browser access.
     #[arg(long)]
     cors: bool,
@@ -80,10 +75,6 @@ struct Cli {
     #[arg(long, default_value = "info")]
     log_level: String,
 
-    /// gRPC port (enables gRPC server alongside HTTP).
-    #[arg(long)]
-    grpc_port: Option<u16>,
-
     /// TLS certificate path for HTTPS.
     #[arg(long)]
     tls_cert: Option<PathBuf>,
@@ -92,14 +83,9 @@ struct Cli {
     #[arg(long)]
     tls_key: Option<PathBuf>,
 
-    /// Skip Metal shader warmup at startup. Without warmup the first request
-    /// of each prompt length pays 10-20s of shader compilation; warmup moves
-    /// that cost out of the interactive loop. Default: warmup enabled.
-    #[arg(long)]
-    no_warmup: bool,
 }
 
-fn load_single_vindex(path_str: &str, no_infer: bool) -> Result<LoadedModel, BoxError> {
+fn load_single_vindex(path_str: &str) -> Result<LoadedModel, BoxError> {
     let path = if larql_vindex::is_hf_path(path_str) {
         info!("Resolving HuggingFace path: {}", path_str);
         larql_vindex::resolve_hf_vindex(path_str)?
@@ -114,52 +100,18 @@ fn load_single_vindex(path_str: &str, no_infer: bool) -> Result<LoadedModel, Box
     let id = model_id_from_name(&model_name);
 
     let mut cb = SilentLoadCallbacks;
-    let mut index = VectorIndex::load_vindex(&path, &mut cb)?;
+    let index = VectorIndex::load_vindex(&path, &mut cb)?;
     let total_features: usize = config.layers.iter().map(|l| l.num_features).sum();
-
-    let has_weights = config.has_model_weights
-        || config.extract_level == larql_vindex::ExtractLevel::Inference
-        || config.extract_level == larql_vindex::ExtractLevel::All;
 
     info!(
         "  Model: {} ({} layers, {} features)",
         model_name, config.num_layers, total_features
     );
 
-    // Load mmap'd feature-major vectors for walk FFN optimization
-    match index.load_down_features(&path) {
-        Ok(()) => info!("  Down features: loaded (mmap walk enabled)"),
-        Err(_) => info!("  Down features: not available"),
-    }
-    if let Ok(()) = index.load_up_features(&path) { info!("  Up features: loaded (full mmap FFN)") }
-    // Tiers the Metal fast path needs: lm_head (for finalize_logits), q4k/q8
-    // attn weights, interleaved Q4_K FFN mmaps. Matches bench_interactive.
-    let _ = index.load_lm_head(&path);
-    let _ = index.load_lm_head_q4(&path);
-    let _ = index.load_attn_q4k(&path);
-    let _ = index.load_attn_q8(&path);
-    // Prefer interleaved_q4k_real.bin (true Q4_K, validated cos=0.9994 on
-    // Gemma 3 4B). Fall back to Q4_0 if the preferred file isn't present.
-    if index.load_interleaved_q4k_real(&path).is_ok() {
-        info!("  FFN: interleaved_q4k_real.bin (GPU decode default)");
-    } else {
-        let _ = index.load_interleaved_q4(&path);
-    }
-    index.warmup();
-    info!("  Warmup: done");
-
-    // Release pages for mmaps not needed during Q4_K inference.
-    // The mmaps stay open (capability detection still works) but the OS
-    // can reclaim the physical memory. Saves ~9.4 GB of resident pages.
-    if path.join("interleaved_q4k_real.bin").exists() {
-        index.advise_dontneed_unused();
-    }
-
+    let tokenizer = load_vindex_tokenizer(&path)?;
     let (embeddings_owned, embed_scale) = load_vindex_embeddings(&path)?;
     info!("  Embeddings: {}x{}", embeddings_owned.shape()[0], embeddings_owned.shape()[1]);
     let embeddings: larql_models::WeightArray = embeddings_owned.into_shared();
-
-    let tokenizer = load_vindex_tokenizer(&path)?;
     let patched = PatchedVindex::new(index);
 
     let probe_labels = load_probe_labels(&path);
@@ -167,16 +119,9 @@ fn load_single_vindex(path_str: &str, no_infer: bool) -> Result<LoadedModel, Box
         info!("  Labels: {} probe-confirmed", probe_labels.len());
     }
 
-    if no_infer {
-        info!("  Infer: disabled (--no-infer)");
-    } else if has_weights {
-        info!("  Infer: available (weights detected, will lazy-load on first request)");
-    } else {
-        info!("  Infer: not available (no model weights in vindex)");
-    }
-
-    // Detect optional GGUF weight source. If present, fast-path inference
-    // reads weights from it instead of the (possibly stale) Q4_K binaries.
+    // GGUF is the only inference weight source. Required for /v1/infer,
+    // /v1/insert, /v1/generate. Without it the vindex still serves graph
+    // browsing endpoints (DESCRIBE, SELECT, RELATIONS, PROBE, EXPLAIN).
     let gguf = {
         let p = path.join("weights.gguf");
         if p.exists() {
@@ -187,25 +132,24 @@ fn load_single_vindex(path_str: &str, no_infer: bool) -> Result<LoadedModel, Box
                     Some(Arc::new(g))
                 }
                 Err(e) => {
-                    info!("  GGUF: failed to load weights.gguf: {e}");
+                    warn!("  GGUF: failed to load weights.gguf: {e}");
                     None
                 }
             }
         } else {
+            warn!("  GGUF: no weights.gguf in vindex dir — inference endpoints \
+                  will return 503. Drop a GGUF in to enable inference.");
             None
         }
     };
 
     Ok(LoadedModel {
         id,
-        path,
         config,
         patched: RwLock::new(patched),
         embeddings,
         embed_scale,
         tokenizer,
-        infer_disabled: no_infer,
-        weights: std::sync::OnceLock::new(),
         backend: std::sync::OnceLock::new(),
         inference_lock: std::sync::Mutex::new(()),
         probe_labels,
@@ -256,13 +200,13 @@ async fn main() -> Result<(), BoxError> {
         }
         info!("Found {} vindexes in {}", paths.len(), dir.display());
         for p in &paths {
-            match load_single_vindex(&p.to_string_lossy(), cli.no_infer) {
+            match load_single_vindex(&p.to_string_lossy()) {
                 Ok(m) => models.push(Arc::new(m)),
                 Err(e) => warn!("  Skipping {}: {}", p.display(), e),
             }
         }
     } else if let Some(ref vindex_path) = cli.vindex_path {
-        let m = load_single_vindex(vindex_path, cli.no_infer)?;
+        let m = load_single_vindex(vindex_path)?;
         models.push(Arc::new(m));
     } else {
         return Err("must provide a vindex path or --dir".into());
@@ -270,55 +214,6 @@ async fn main() -> Result<(), BoxError> {
 
     if models.is_empty() {
         return Err("no vindexes loaded".into());
-    }
-
-    // Metal shader warmup: compile pipelines for common seq_lens up front
-    // so clients don't pay 10-20s for the first request of each length.
-    // Runs on spawn_blocking before the HTTP listener binds — we cannot
-    // call `RwLock::blocking_read` directly from the async runtime.
-    if !cli.no_warmup {
-        for m in &models {
-            if m.infer_disabled || !m.config.has_model_weights {
-                continue;
-            }
-            let m_cl = Arc::clone(m);
-            let id = m.id.clone();
-            info!("Warming up Metal shaders for model '{}' ...", id);
-            let t0 = std::time::Instant::now();
-            let report = tokio::task::spawn_blocking(move || -> Result<Vec<(usize, f64)>, String> {
-                let tw = std::time::Instant::now();
-                let weights = m_cl.get_or_load_weights()?;
-                tracing::info!("  weights loaded in {:.1}s", tw.elapsed().as_secs_f64());
-                let backend = m_cl.get_or_init_backend();
-                let bos = m_cl.tokenizer.encode("", true).ok()
-                    .and_then(|e| e.get_ids().first().copied())
-                    .unwrap_or(1);
-                let patched = m_cl.patched.blocking_read();
-                let mut timings = Vec::new();
-                for &n in &[1usize, 4, 8, 16, 32] {
-                    let ids: Vec<u32> = std::iter::repeat(bos).take(n).collect();
-                    let cache = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
-                    backend.reset_kv_cache();
-                    let t = std::time::Instant::now();
-                    let _ = larql_inference::predict_honest_with_knn_ffn(
-                        weights, &m_cl.tokenizer, &ids, 1, patched.base(),
-                        &**backend, &cache, 0..weights.num_layers, None, None,
-                    );
-                    let s = t.elapsed().as_secs_f64();
-                    tracing::info!("  seq_len={} {:.1}s", n, s);
-                    timings.push((n, s));
-                }
-                backend.reset_kv_cache();
-                Ok(timings)
-            }).await.map_err(|e| e.to_string())?;
-            match report {
-                Ok(timings) => {
-                    for (n, s) in timings { info!("  seq_len={} {:.1}s", n, s); }
-                    info!("Warmup done for '{}' in {:.1}s", id, t0.elapsed().as_secs_f64());
-                }
-                Err(e) => warn!("  warmup failed for '{}': {}", id, e),
-            }
-        }
     }
 
     // Parse rate limiter if specified.
@@ -391,23 +286,6 @@ async fn main() -> Result<(), BoxError> {
 
     // Trace middleware.
     app = app.layer(tower_http::trace::TraceLayer::new_for_http());
-
-    // gRPC server (if --grpc-port set).
-    if let Some(grpc_port) = cli.grpc_port {
-        let grpc_addr = format!("{}:{}", cli.host, grpc_port).parse()?;
-        let grpc_state = Arc::clone(&state);
-        info!("gRPC: listening on {}", grpc_addr);
-        tokio::spawn(async move {
-            let svc = grpc::VindexGrpcService { state: grpc_state };
-            if let Err(e) = tonic::transport::Server::builder()
-                .add_service(grpc::proto::vindex_service_server::VindexServiceServer::new(svc))
-                .serve(grpc_addr)
-                .await
-            {
-                tracing::error!("gRPC server error: {}", e);
-            }
-        });
-    }
 
     let addr = format!("{}:{}", cli.host, cli.port);
 

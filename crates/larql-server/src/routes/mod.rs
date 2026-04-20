@@ -6,7 +6,6 @@
 //! KNN overlay at the configured probe layer).
 
 pub mod describe;
-pub mod explain;
 pub mod generate_stream;
 pub mod health;
 pub mod infer;
@@ -36,7 +35,6 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/describe", get(describe::handle_describe))
         .route("/v1/select", post(select::handle_select))
         .route("/v1/relations", get(relations::handle_relations))
-        .route("/v1/explain-infer", post(explain::handle_explain))
         .route("/v1/probe", post(probe::handle_probe))
         // Patches
         .route("/v1/patches/apply", post(patches::handle_apply_patch))
@@ -62,7 +60,6 @@ pub fn multi_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/{model_id}/patches/apply", post(patches::handle_apply_patch_multi))
         .route("/v1/{model_id}/patches", get(patches::handle_list_patches_multi))
         .route("/v1/{model_id}/patches/{name}", delete(patches::handle_remove_patch_multi))
-        .route("/v1/{model_id}/explain-infer", post(explain::handle_explain_multi))
         .route("/v1/{model_id}/insert", post(insert::handle_insert_multi))
         .with_state(state)
 }

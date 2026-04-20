@@ -28,14 +28,12 @@ mod direct_ops;
 mod decode;
 // decode_hybrid removed — was experimental GPU-attn + CPU-FFN split, never integrated
 mod pipeline;
-mod prefill;
 mod trait_impl;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use ndarray::{Array2, ArrayView2};
 use metal::*;
 
-use crate::backend::{ComputeBackend, MatMulOp};
+use crate::backend::ComputeBackend;
 use buffers::BufferCache;
 use f32_ops::F32Ops;
 use ops::q4_common::Q4Pipelines;

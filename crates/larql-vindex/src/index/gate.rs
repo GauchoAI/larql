@@ -4,28 +4,19 @@
 //! score computation, HNSW integration, and top-K selection.
 
 use ndarray::{Array1, Array2, ArrayView2};
-use larql_compute::ComputeBackend;
 
 use super::core::VectorIndex;
 use super::types::*;
 
 /// Matrix-vector multiply: view[N, hidden] × vec[hidden] → scores[N].
-/// All compute goes through larql-compute.
+/// ndarray's `.dot()` routes to BLAS (Accelerate on macOS).
 fn gemv(view: &ArrayView2<f32>, vec: &Array1<f32>) -> Array1<f32> {
-    let hidden = vec.len();
-    let x = vec.view().into_shape_with_order((1, hidden)).unwrap();
-    let cpu = larql_compute::CpuBackend;
-    // x[1, hidden] @ view[N, hidden]^T → [1, N]
-    let result = cpu.matmul_transb(x, *view);
-    Array1::from_vec(result.into_raw_vec_and_offset().0)
+    view.dot(vec)
 }
 
 /// Gate scores batch: gate[N, hidden] × x[seq, hidden]^T → [N, seq].
-/// Equivalent to original gate.dot(&x.t()).
 fn gate_matmul(gate: &ArrayView2<f32>, x: &ArrayView2<f32>) -> Array2<f32> {
-    let cpu = larql_compute::CpuBackend;
-    // gate[N, hidden] @ x[seq, hidden]^T = matmul_transb(gate, x) → [N, seq]
-    cpu.matmul_transb(*gate, *x)
+    gate.dot(&x.t())
 }
 
 /// Resolved gate matrix data — owned f32 with feature count.

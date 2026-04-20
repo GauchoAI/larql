@@ -6,4 +6,3 @@ pub mod down_meta;
 pub mod huggingface;
 pub mod load;
 pub mod quant;
-pub mod weights;

@@ -318,4 +318,36 @@ impl MetalBackend {
         }
         guard
     }
+
+    /// Single-shot Q8_0Gguf matvec: y[n] = sum_k W[n,k] * x[k].
+    /// W is GGUF-format Q8_0 (34 bytes per 32-value block), stored row-major
+    /// with K elements per row. Used for GGUF lm_head matmul (262208×2560 in
+    /// Gemma 3) where doing 671M floats of CPU dequant per token is too slow.
+    pub fn matvec_q8_0_gguf(&self, weight: &[u8], x: &[f32], n: usize, k: usize) -> Vec<f32> {
+        use crate::metal::shaders::q8_0_gguf_matvec as q8gm;
+        assert_eq!(weight.len(), n * (k / 32) * 34, "weight bytes mismatch");
+        assert_eq!(x.len(), k, "x length mismatch");
+        let w_buf = self.bufs.get_bytes(weight);
+        let x_buf = self.bufs.transient_from_f32(x);
+        let y_buf = self.bufs.output((n * 4) as u64);
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.q8_0_gguf_matvec_pipeline);
+        enc.set_buffer(0, Some(&w_buf), 0);
+        enc.set_buffer(1, Some(&x_buf), 0);
+        enc.set_buffer(2, Some(&y_buf), 0);
+        let n_u32 = n as u32;
+        let k_u32 = k as u32;
+        enc.set_bytes(3, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+        let num_tgs = (n as u64).div_ceil(q8gm::ROWS_PER_TG);
+        enc.dispatch_thread_groups(
+            metal::MTLSize::new(num_tgs, 1, 1),
+            metal::MTLSize::new(q8gm::THREADS_PER_TG, 1, 1),
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        buffers::read_buffer_f32(&y_buf, n)
+    }
 }

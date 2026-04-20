@@ -179,31 +179,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let lm_head_bpr = ggml::tensor_data_size(lm_head_type, hidden)?;
 
-    /// Compute logits by dequantizing lm_head rows in chunks and dot-producting with h.
-    /// Returns top-1 token ID. Does NOT allocate full [vocab x hidden] matrix.
-    fn argmax_logits(h: &[f32], lm_bytes: &[u8], lm_type: u32, lm_vocab: usize,
-                     hidden: usize, lm_bpr: usize, softcap: f32) -> u32 {
-        let mut best_id = 0u32;
-        let mut best_val = f32::NEG_INFINITY;
-        // Process in chunks to amortize dequant overhead
-        let chunk = 256;
-        for start in (0..lm_vocab).step_by(chunk) {
-            let end = (start + chunk).min(lm_vocab);
-            let chunk_bytes = &lm_bytes[start * lm_bpr..end * lm_bpr];
-            let chunk_f32 = ggml::dequantize(chunk_bytes, lm_type, (end - start) * hidden).unwrap();
-            for i in 0..(end - start) {
-                let row = &chunk_f32[i * hidden..(i + 1) * hidden];
-                let mut dot: f32 = row.iter().zip(h.iter()).map(|(a, b)| a * b).sum();
-                if softcap > 0.0 {
-                    dot = softcap * (dot / softcap).tanh();
-                }
-                if dot > best_val {
-                    best_val = dot;
-                    best_id = (start + i) as u32;
+    /// Compute the full vocab logits for `h`. Tries the GPU Q8_0Gguf matvec
+    /// when the backend supports it AND lm_head is Q8_0; otherwise falls back
+    /// to chunked CPU dequant + dot (slow on a 262208-vocab model).
+    fn compute_logits(h: &[f32], lm_bytes: &[u8], lm_type: u32, lm_vocab: usize,
+                      hidden: usize, lm_bpr: usize, softcap: f32,
+                      backend: &dyn larql_compute::ComputeBackend) -> Vec<f32> {
+        let logits = if lm_type == ggml::TYPE_Q8_0 {
+            backend.matvec_q8_0_gguf(lm_bytes, h, lm_vocab, hidden)
+        } else {
+            None
+        };
+        let mut logits = logits.unwrap_or_else(|| {
+            let mut out = vec![0.0f32; lm_vocab];
+            let chunk = 256;
+            for start in (0..lm_vocab).step_by(chunk) {
+                let end = (start + chunk).min(lm_vocab);
+                let chunk_bytes = &lm_bytes[start * lm_bpr..end * lm_bpr];
+                let chunk_f32 = ggml::dequantize(chunk_bytes, lm_type, (end - start) * hidden).unwrap();
+                for i in 0..(end - start) {
+                    let row = &chunk_f32[i * hidden..(i + 1) * hidden];
+                    out[start + i] = row.iter().zip(h.iter()).map(|(a, b)| a * b).sum();
                 }
             }
+            out
+        });
+        if softcap > 0.0 {
+            for v in &mut logits {
+                *v = softcap * (*v / softcap).tanh();
+            }
         }
-        best_id
+        logits
     }
 
     println!("[4] Embed + lm_head setup in {:.1}ms (on-demand, 0 MB allocated)",
@@ -296,25 +302,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let h_normed = apply_final_norm(&h_out, final_norm_vec, norm_offset);
 
     // Show top-5 for diagnostics
-    // Top-5 via on-demand dequant
     let softcap = arch.config().final_logit_softcapping.unwrap_or(0.0) as f32;
+    let logits = compute_logits(&h_normed, lm_head_bytes, lm_head_type, lm_head_vocab,
+        hidden, lm_head_bpr, softcap, &*backend);
     let top5 = {
-        let mut scores: Vec<(u32, f32)> = Vec::new();
-        let chunk = 256;
-        for start in (0..lm_head_vocab).step_by(chunk) {
-            let end = (start + chunk).min(lm_head_vocab);
-            let cb = &lm_head_bytes[start * lm_head_bpr..end * lm_head_bpr];
-            let cf = ggml::dequantize(cb, lm_head_type, (end - start) * hidden).unwrap();
-            for i in 0..(end - start) {
-                let row = &cf[i * hidden..(i + 1) * hidden];
-                let mut dot: f32 = row.iter().zip(h_normed.iter()).map(|(a, b)| a * b).sum();
-                if softcap > 0.0 { dot = softcap * (dot / softcap).tanh(); }
-                scores.push(((start + i) as u32, dot));
-            }
-        }
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scores.truncate(5);
-        scores
+        let mut indexed: Vec<(u32, f32)> = logits.iter().enumerate()
+            .map(|(i, &v)| (i as u32, v)).collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        indexed.truncate(5);
+        indexed
     };
     print!("    Top-5: ");
     for (i, &(tid, score)) in top5.iter().enumerate() {
@@ -352,8 +348,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let h_normed = apply_final_norm(&h, final_norm_vec, norm_offset);
-        let next_id = argmax_logits(&h_normed, lm_head_bytes, lm_head_type, lm_head_vocab,
-            hidden, lm_head_bpr, softcap);
+        let logits = compute_logits(&h_normed, lm_head_bytes, lm_head_type, lm_head_vocab,
+            hidden, lm_head_bpr, softcap, &*backend);
+        let (next_id, _) = logits.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, &v)| (i as u32, v))
+            .unwrap();
         let dec_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
         decode_times.push(dec_ms);
 

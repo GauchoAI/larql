@@ -161,6 +161,11 @@ pub trait ComputeBackend: Send + Sync {
         _rope_base: f32,
     ) -> Option<Vec<f32>> { None }
 
+    /// Q8_0Gguf row-major matvec, used for GGUF lm_head. Default: None
+    /// (caller falls back to CPU dequant + dot).
+    fn matvec_q8_0_gguf(&self, _weight: &[u8], _x: &[f32], _n: usize, _k: usize)
+        -> Option<Vec<f32>> { None }
+
     /// Like decode_token but also probes h_post_attn at a specific layer.
     /// Returns (final_h, Some(probe_h)) when probe_layer is set.
     /// The probe is a single residual_copy inside the same cmd buffer — zero

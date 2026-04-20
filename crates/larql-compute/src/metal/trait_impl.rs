@@ -676,6 +676,11 @@ impl ComputeBackend for MetalBackend {
             num_q_heads, num_kv_heads, head_dim, rope_base))
     }
 
+    fn matvec_q8_0_gguf(&self, weight: &[u8], x: &[f32], n: usize, k: usize)
+        -> Option<Vec<f32>> {
+        Some(MetalBackend::matvec_q8_0_gguf(self, weight, x, n, k))
+    }
+
     fn decode_token_with_probe(
         &self,
         layers: &[crate::FullPipelineLayer<'_>],

@@ -25,70 +25,20 @@ pub struct WalkTrace {
     pub layers: Vec<(usize, Vec<WalkHit>)>,
 }
 
-/// Trait for gate-based feature lookup.
+/// Trait for gate-based feature lookup. Both `VectorIndex` (base) and
+/// `PatchedVindex` (with overlay) implement this — used by /v1/describe,
+/// /v1/select, /v1/relations, /v1/patches.
 ///
-/// Both `VectorIndex` (base, readonly) and `PatchedVindex` (with overlay)
-/// implement this trait, allowing `WalkFfn` and other consumers to work
-/// transparently with patched or unpatched indexes.
+/// All inference-related methods (interleaved_*, attn_q4*, gate_knn_q4,
+/// HNSW) were removed with the GGUF-only refactor.
 pub trait GateIndex {
     fn gate_knn(&self, layer: usize, residual: &Array1<f32>, top_k: usize) -> Vec<(usize, f32)>;
     fn feature_meta(&self, layer: usize, feature: usize) -> Option<FeatureMeta>;
     fn num_features(&self, layer: usize) -> usize;
     fn down_override(&self, _layer: usize, _feature: usize) -> Option<&[f32]> { None }
-    /// Up vector override at (layer, feature). Used by INSERT to write
-    /// the slot's up component when installing a constellation fact.
-    /// `walk_ffn_sparse` checks this before reading from `up_layer_matrix`,
-    /// matching the parallel pattern for `down_override`.
     fn up_override(&self, _layer: usize, _feature: usize) -> Option<&[f32]> { None }
-    /// Gate vector override at (layer, feature). Lives in the patch
-    /// overlay (`PatchedVindex.overrides_gate`). Used by the sparse
-    /// inference fallback to recompute `silu(gate_override · x)` so
-    /// the strong installed gate actually drives the activation —
-    /// without this, gather-from-dense reads the original weak slot.
     fn gate_override(&self, _layer: usize, _feature: usize) -> Option<&[f32]> { None }
-    /// Check if any down vector overrides or gate overrides exist at this layer.
     fn has_overrides_at(&self, _layer: usize) -> bool { false }
-    fn down_feature_vector(&self, _layer: usize, _feature: usize) -> Option<&[f32]> { None }
-    fn has_down_features(&self) -> bool { false }
-    fn down_layer_matrix(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> { None }
-    fn gate_scores_batch(&self, _layer: usize, _x: &Array2<f32>) -> Option<Array2<f32>> { None }
-    fn up_layer_matrix(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> { None }
-    fn has_full_mmap_ffn(&self) -> bool { false }
-    fn has_interleaved(&self) -> bool { false }
-    fn interleaved_gate(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> { None }
-    fn interleaved_up(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> { None }
-    fn interleaved_down(&self, _layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> { None }
-    fn prefetch_interleaved_layer(&self, _layer: usize) {}
-    fn has_interleaved_q4(&self) -> bool { false }
-    fn interleaved_q4_gate(&self, _layer: usize) -> Option<ndarray::Array2<f32>> { None }
-    fn interleaved_q4_up(&self, _layer: usize) -> Option<ndarray::Array2<f32>> { None }
-    fn interleaved_q4_down(&self, _layer: usize) -> Option<ndarray::Array2<f32>> { None }
-    fn prefetch_interleaved_q4_layer(&self, _layer: usize) {}
-    fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> { None }
-    fn has_interleaved_q4k_real(&self) -> bool { false }
-    fn interleaved_q4k_real_mmap_ref(&self) -> Option<&[u8]> { None }
-    fn attn_q4k_layer_data(&self, _layer: usize) -> Option<[(&[u8], &str); 4]> { None }
-
-    /// Gate KNN via Q4 matvec — scored by a ComputeBackend.
-    /// Returns None if Q4 gate data isn't loaded or backend doesn't support Q4.
-    fn gate_knn_q4(
-        &self,
-        _layer: usize,
-        _residual: &Array1<f32>,
-        _top_k: usize,
-        _backend: &dyn larql_compute::ComputeBackend,
-    ) -> Option<Vec<(usize, f32)>> { None }
-
-    /// Per-feature gate scoring: iterate all features, dot product each one.
-    /// No matrix multiplication — each feature scored individually.
-    /// Returns (feature_index, score) sorted by absolute score descending.
-    fn gate_walk(&self, _layer: usize, _residual: &Array1<f32>, _top_k: usize) -> Option<Vec<(usize, f32)>> {
-        None // Override in VectorIndex to use mmap
-    }
-
-    /// Whether HNSW graph search is enabled. When true, WalkFfn skips
-    /// brute-force gate_walk and routes through gate_knn (which dispatches HNSW).
-    fn is_hnsw_enabled(&self) -> bool { false }
 
     fn gate_knn_batch(&self, layer: usize, x: &Array2<f32>, top_k: usize) -> Vec<usize> {
         let seq_len = x.shape()[0];

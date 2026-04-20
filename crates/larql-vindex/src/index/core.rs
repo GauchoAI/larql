@@ -68,48 +68,11 @@ pub struct VectorIndex {
     /// KNN call, then reused. Eliminates repeated f16→f32 conversion.
     pub(crate) f16_decode_cache: Mutex<Vec<Option<Vec<f32>>>>,
     pub(crate) warmed_gates: std::sync::RwLock<Vec<Option<Vec<f32>>>>,
-    pub(crate) down_features_mmap: Option<Arc<memmap2::Mmap>>,
-    pub(crate) up_features_mmap: Option<Arc<memmap2::Mmap>>,
-    pub(crate) hnsw_cache: Mutex<Vec<Option<super::hnsw::HnswLayer>>>,
-    pub(crate) hnsw_enabled: std::sync::atomic::AtomicBool,
-    pub(crate) hnsw_ef_search: std::sync::atomic::AtomicUsize,
-    /// Cached f32 gate vectors per layer, shared via Arc so HNSW search
-    /// doesn't clone the ~100MB matrix on every call. Populated on first
-    /// HNSW call per layer.
-    pub(crate) hnsw_gate_refs: Mutex<Vec<Option<Arc<Vec<f32>>>>>,
-    /// Mmap'd lm_head (output projection): [vocab_size, hidden_size], f32.
-    pub(crate) lm_head_mmap: Option<Arc<memmap2::Mmap>>,
     pub vocab_size: usize,
-    /// Interleaved FFN data: [gate|up|down] per layer in one contiguous file.
-    pub(crate) interleaved_mmap: Option<Arc<memmap2::Mmap>>,
-    /// Q4_0 quantized interleaved FFN data (7x smaller, dequant on read).
-    pub(crate) interleaved_q4_mmap: Option<Arc<memmap2::Mmap>>,
-    /// True Q4_K interleaved FFN data (148-byte Ollama Q4_K blocks, matching
-    /// the `q4k_matvec` Metal shader). File: `interleaved_q4k_real.bin`.
-    pub(crate) interleaved_q4k_real_mmap: Option<Arc<memmap2::Mmap>>,
-
-    /// Q4_0 gate vectors mmap — for fast Q4 KNN via larql-compute.
-    pub(crate) gate_q4_mmap: Option<Arc<memmap2::Mmap>>,
-    /// Per-layer byte offset + byte length in gate_q4_mmap.
-    pub(crate) gate_q4_slices: Vec<GateQ4Slice>,
-    /// Q4_0 lm_head mmap — for GPU Q4 logits (replaces CPU f32 lm_head KNN).
-    pub(crate) lm_head_q4_mmap: Option<Arc<memmap2::Mmap>>,
-    /// Q4_K/Q6_K attention weights (Ollama-compatible).
-    pub(crate) attn_q4k_mmap: Option<Arc<memmap2::Mmap>>,
-    pub(crate) attn_q4k_manifest: Option<Vec<(usize, usize, String)>>,
-    /// Q4_0 attention weights mmap — for GPU full pipeline.
-    pub(crate) attn_q4_mmap: Option<Arc<memmap2::Mmap>>,
-    /// Per-matrix (offset, length) in attn_q4_mmap — from manifest.
-    pub(crate) attn_q4_manifest: Option<Vec<(usize, usize)>>,
-    /// Q8_0 attention weights mmap — higher precision for attention projections.
-    pub(crate) attn_q8_mmap: Option<Arc<memmap2::Mmap>>,
-    /// Per-matrix (offset, vals_len, scales_len) in attn_q8_mmap.
-    pub(crate) attn_q8_manifest: Option<Vec<(usize, usize, usize)>>,
 }
 
 impl Clone for VectorIndex {
     fn clone(&self) -> Self {
-        use std::sync::atomic::Ordering;
         Self {
             gate_vectors: self.gate_vectors.clone(),
             gate_mmap_bytes: self.gate_mmap_bytes.clone(),
@@ -123,30 +86,7 @@ impl Clone for VectorIndex {
             up_overrides: self.up_overrides.clone(),
             f16_decode_cache: Mutex::new(vec![None; self.num_layers]),
             warmed_gates: std::sync::RwLock::new(vec![None; self.num_layers]),
-            down_features_mmap: self.down_features_mmap.clone(),
-            up_features_mmap: self.up_features_mmap.clone(),
-            hnsw_cache: Mutex::new((0..self.num_layers).map(|_| None).collect()),
-            hnsw_enabled: std::sync::atomic::AtomicBool::new(
-                self.hnsw_enabled.load(Ordering::Relaxed)
-            ),
-            hnsw_ef_search: std::sync::atomic::AtomicUsize::new(
-                self.hnsw_ef_search.load(Ordering::Relaxed)
-            ),
-            hnsw_gate_refs: Mutex::new((0..self.num_layers).map(|_| None).collect()),
-            lm_head_mmap: self.lm_head_mmap.clone(),
             vocab_size: self.vocab_size,
-            interleaved_mmap: self.interleaved_mmap.clone(),
-            interleaved_q4_mmap: self.interleaved_q4_mmap.clone(),
-            interleaved_q4k_real_mmap: self.interleaved_q4k_real_mmap.clone(),
-            gate_q4_mmap: self.gate_q4_mmap.clone(),
-            gate_q4_slices: self.gate_q4_slices.clone(),
-            lm_head_q4_mmap: self.lm_head_q4_mmap.clone(),
-            attn_q4k_mmap: self.attn_q4k_mmap.clone(),
-            attn_q4k_manifest: self.attn_q4k_manifest.clone(),
-            attn_q4_mmap: self.attn_q4_mmap.clone(),
-            attn_q4_manifest: self.attn_q4_manifest.clone(),
-            attn_q8_mmap: self.attn_q8_mmap.clone(),
-            attn_q8_manifest: self.attn_q8_manifest.clone(),
         }
     }
 }
@@ -172,26 +112,7 @@ impl VectorIndex {
             up_overrides: HashMap::new(),
             f16_decode_cache: Mutex::new(vec![None; num_layers]),
             warmed_gates: std::sync::RwLock::new(vec![None; num_layers]),
-            down_features_mmap: None,
-            up_features_mmap: None,
-            hnsw_cache: Mutex::new((0..num_layers).map(|_| None).collect()),
-            hnsw_enabled: std::sync::atomic::AtomicBool::new(false),
-            hnsw_ef_search: std::sync::atomic::AtomicUsize::new(200),
-            hnsw_gate_refs: Mutex::new((0..num_layers).map(|_| None).collect()),
-            lm_head_mmap: None,
             vocab_size: 0,
-            interleaved_mmap: None,
-            interleaved_q4_mmap: None,
-            interleaved_q4k_real_mmap: None,
-            gate_q4_mmap: None,
-            gate_q4_slices: Vec::new(),
-            lm_head_q4_mmap: None,
-            attn_q4k_mmap: None,
-            attn_q4k_manifest: None,
-            attn_q4_mmap: None,
-            attn_q4_manifest: None,
-            attn_q8_mmap: None,
-            attn_q8_manifest: None,
         }
     }
 
@@ -218,26 +139,7 @@ impl VectorIndex {
             up_overrides: HashMap::new(),
             f16_decode_cache: Mutex::new(vec![None; num_layers]),
             warmed_gates: std::sync::RwLock::new(vec![None; num_layers]),
-            down_features_mmap: None,
-            up_features_mmap: None,
-            hnsw_cache: Mutex::new((0..num_layers).map(|_| None).collect()),
-            hnsw_enabled: std::sync::atomic::AtomicBool::new(false),
-            hnsw_ef_search: std::sync::atomic::AtomicUsize::new(200),
-            hnsw_gate_refs: Mutex::new((0..num_layers).map(|_| None).collect()),
-            lm_head_mmap: None,
             vocab_size: 0,
-            interleaved_mmap: None,
-            interleaved_q4_mmap: None,
-            interleaved_q4k_real_mmap: None,
-            gate_q4_mmap: None,
-            gate_q4_slices: Vec::new(),
-            lm_head_q4_mmap: None,
-            attn_q4k_mmap: None,
-            attn_q4k_manifest: None,
-            attn_q4_mmap: None,
-            attn_q4_manifest: None,
-            attn_q8_mmap: None,
-            attn_q8_manifest: None,
         }
     }
 
@@ -392,26 +294,7 @@ impl VectorIndex {
             up_overrides: HashMap::new(),
             f16_decode_cache: Mutex::new(vec![None; num_layers]),
             warmed_gates: std::sync::RwLock::new(vec![None; num_layers]),
-            down_features_mmap: None,
-            up_features_mmap: None,
-            hnsw_cache: Mutex::new((0..num_layers).map(|_| None).collect()),
-            hnsw_enabled: std::sync::atomic::AtomicBool::new(false),
-            hnsw_ef_search: std::sync::atomic::AtomicUsize::new(200),
-            hnsw_gate_refs: Mutex::new((0..num_layers).map(|_| None).collect()),
-            lm_head_mmap: None,
             vocab_size: 0,
-            interleaved_mmap: None,
-            interleaved_q4_mmap: None,
-            interleaved_q4k_real_mmap: None,
-            gate_q4_mmap: None,
-            gate_q4_slices: Vec::new(),
-            lm_head_q4_mmap: None,
-            attn_q4k_mmap: None,
-            attn_q4k_manifest: None,
-            attn_q4_mmap: None,
-            attn_q4_manifest: None,
-            attn_q8_mmap: None,
-            attn_q8_manifest: None,
             num_layers,
             hidden_size,
         })
@@ -504,41 +387,6 @@ impl VectorIndex {
         Ok(count)
     }
 
-    /// Tell the OS to release physical pages for mmaps not needed during
-    /// Q4_K inference. The mmaps stay mapped (pointers remain valid,
-    /// capability detection still works) but the OS can reclaim the RAM.
-    /// If the data is accessed later, it gets paged back in from disk.
-    pub fn advise_dontneed_unused(&self) {
-        let mut freed = 0u64;
-        let advise = |mmap: &Option<Arc<memmap2::Mmap>>, name: &str, freed: &mut u64| {
-            if let Some(ref m) = mmap {
-                let len = m.len();
-                #[cfg(unix)]
-                unsafe {
-                    libc::madvise(
-                        m.as_ptr() as *mut libc::c_void,
-                        len,
-                        libc::MADV_DONTNEED,
-                    );
-                }
-                *freed += len as u64;
-                eprintln!("[madvise] released {name}: {:.0} MB", len as f64 / 1e6);
-            }
-        };
-        // Walk-only files (not read during Q4_K inference)
-        advise(&self.down_features_mmap, "down_features", &mut freed);
-        advise(&self.up_features_mmap, "up_features", &mut freed);
-        advise(&self.gate_mmap_bytes, "gate_vectors", &mut freed);
-        // f32 interleaved (replaced by Q4_K real)
-        advise(&self.interleaved_mmap, "interleaved_f32", &mut freed);
-        // Fallback quant format (Q4_0) when Q4_K real is available
-        advise(&self.interleaved_q4_mmap, "interleaved_q4", &mut freed);
-        // f32 lm_head (replaced by lm_head_q4)
-        advise(&self.lm_head_mmap, "lm_head_f32", &mut freed);
-        if freed > 0 {
-            eprintln!("[madvise] total released: {:.1} GB", freed as f64 / 1e9);
-        }
-    }
 }
 
 impl GateIndex for VectorIndex {
@@ -552,10 +400,6 @@ impl GateIndex for VectorIndex {
 
     fn num_features(&self, layer: usize) -> usize {
         self.num_features(layer)
-    }
-
-    fn is_hnsw_enabled(&self) -> bool {
-        self.is_hnsw_enabled()
     }
 
     fn down_override(&self, layer: usize, feature: usize) -> Option<&[f32]> {
@@ -573,96 +417,5 @@ impl GateIndex for VectorIndex {
 
     fn gate_knn_batch(&self, layer: usize, x: &Array2<f32>, top_k: usize) -> Vec<usize> {
         self.gate_knn_batch(layer, x, top_k)
-    }
-
-    fn down_feature_vector(&self, layer: usize, feature: usize) -> Option<&[f32]> {
-        self.down_feature_vector(layer, feature)
-    }
-
-    fn has_down_features(&self) -> bool {
-        self.down_features_mmap.is_some()
-    }
-
-    fn gate_knn_q4(
-        &self,
-        layer: usize,
-        residual: &ndarray::Array1<f32>,
-        top_k: usize,
-        backend: &dyn larql_compute::ComputeBackend,
-    ) -> Option<Vec<(usize, f32)>> {
-        // Delegate to VectorIndex's existing gate_knn_q4 method
-        VectorIndex::gate_knn_q4(self, layer, residual, top_k, backend)
-    }
-
-    fn down_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.down_layer_matrix(layer)
-    }
-
-    fn gate_scores_batch(&self, layer: usize, x: &Array2<f32>) -> Option<Array2<f32>> {
-        self.gate_scores_batch(layer, x)
-    }
-
-    fn up_layer_matrix(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.up_layer_matrix(layer)
-    }
-
-    fn has_full_mmap_ffn(&self) -> bool {
-        self.has_full_mmap_ffn()
-    }
-
-    fn has_interleaved(&self) -> bool {
-        self.has_interleaved()
-    }
-
-    fn interleaved_gate(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.interleaved_gate(layer)
-    }
-
-    fn interleaved_up(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.interleaved_up(layer)
-    }
-
-    fn interleaved_down(&self, layer: usize) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.interleaved_down(layer)
-    }
-
-    fn prefetch_interleaved_layer(&self, layer: usize) {
-        self.prefetch_interleaved_layer(layer)
-    }
-
-    fn has_interleaved_q4(&self) -> bool {
-        self.has_interleaved_q4()
-    }
-
-    fn interleaved_q4_gate(&self, layer: usize) -> Option<ndarray::Array2<f32>> {
-        self.interleaved_q4_gate(layer)
-    }
-
-    fn interleaved_q4_up(&self, layer: usize) -> Option<ndarray::Array2<f32>> {
-        self.interleaved_q4_up(layer)
-    }
-
-    fn interleaved_q4_down(&self, layer: usize) -> Option<ndarray::Array2<f32>> {
-        self.interleaved_q4_down(layer)
-    }
-
-    fn prefetch_interleaved_q4_layer(&self, layer: usize) {
-        self.prefetch_interleaved_q4_layer(layer)
-    }
-
-    fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> {
-        self.interleaved_q4_mmap.as_ref().map(|m| m.as_ref() as &[u8])
-    }
-
-    fn has_interleaved_q4k_real(&self) -> bool {
-        self.has_interleaved_q4k_real()
-    }
-
-    fn interleaved_q4k_real_mmap_ref(&self) -> Option<&[u8]> {
-        self.interleaved_q4k_real_mmap.as_ref().map(|m| m.as_ref() as &[u8])
-    }
-
-    fn attn_q4k_layer_data(&self, layer: usize) -> Option<[(&[u8], &str); 4]> {
-        self.attn_q4k_layer_data(layer)
     }
 }

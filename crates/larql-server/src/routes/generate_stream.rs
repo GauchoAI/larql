@@ -62,7 +62,8 @@ pub async fn handle_generate_stream(
     let model = Arc::clone(model);
 
     // Validate + prepare off the async task so we can fail fast with HTTP 4xx.
-    if model.infer_disabled {
+    let has_gguf = model.gguf.is_some();
+    if model.infer_disabled && !has_gguf {
         return Err(ServerError::InferenceUnavailable("inference disabled".into()));
     }
 
@@ -73,6 +74,10 @@ pub async fn handle_generate_stream(
 
     let model_cl = Arc::clone(&model);
     tokio::task::spawn_blocking(move || {
+        if model_cl.gguf.is_some() {
+            run_gguf_generate(&model_cl, &req, &stop_ids, &tx);
+            return;
+        }
         let weights = match model_cl.get_or_load_weights() {
             Ok(w) => w,
             Err(e) => {
@@ -183,6 +188,152 @@ pub async fn handle_generate_stream(
     });
     let sse: Sse<_> = Sse::new(stream).keep_alive(KeepAlive::default());
     Ok(sse)
+}
+
+/// SSE generate loop driven by GgufPipeline. Bypasses vindex weights
+/// entirely; consults vindex KNN store for fact overlay only.
+fn run_gguf_generate(
+    model: &Arc<crate::state::LoadedModel>,
+    req: &GenerateRequest,
+    stop_ids: &[u32],
+    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+) {
+    use larql_inference::gguf_pipeline::DecodeSession;
+
+    let gguf = match model.gguf.as_ref() {
+        Some(g) => g,
+        None => {
+            let _ = tx.blocking_send(Ok(sse_err("no GGUF source")));
+            return;
+        }
+    };
+
+    let encoding = match model.tokenizer.encode(req.prompt.as_str(), true) {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = tx.blocking_send(Ok(sse_err(&format!("tokenize: {e}"))));
+            return;
+        }
+    };
+    let mut ids: Vec<u32> = encoding.get_ids().to_vec();
+    if ids.is_empty() {
+        let _ = tx.blocking_send(Ok(sse_err("empty prompt")));
+        return;
+    }
+
+    let backend = model.get_or_init_backend();
+    let _guard = match model.inference_lock.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    backend.reset_kv_cache();
+
+    let patched = model.patched.blocking_read();
+    let knn_store_opt = if patched.knn_store.is_empty() { None } else { Some(&patched.knn_store) };
+    let knn_probe_layer: Option<usize> = knn_store_opt
+        .and_then(|s| s.layers().into_iter().next());
+    const KNN_COSINE_THRESHOLD: f32 = 0.75;
+
+    let mut sampler = larql_inference::sampling::Sampler::new(
+        larql_inference::sampling::SamplingConfig {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            seed: req.seed,
+        },
+    );
+
+    let session = DecodeSession::new(gguf);
+
+    // Prefill: decode each prompt token. Probe KNN at the LAST prompt token.
+    let prefill_start = Instant::now();
+    let last_idx = ids.len() - 1;
+    let mut last_h: Option<Vec<f32>> = None;
+    let mut last_probe: Option<Vec<f32>> = None;
+    for (i, &tid) in ids.iter().enumerate() {
+        let probe_for = if i == last_idx { knn_probe_layer } else { None };
+        let (h, probe) = session.step(tid, probe_for, &**backend);
+        last_h = Some(h);
+        if i == last_idx { last_probe = probe; }
+    }
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+    // KNN override short-circuit.
+    if let (Some(probe), Some(store), Some(pl)) = (last_probe.as_ref(), knn_store_opt, knn_probe_layer) {
+        let normed = gguf_normed_probe(gguf, probe, pl);
+        if let Some((entry, cos)) = store.query_top1(pl, &normed) {
+            if cos > KNN_COSINE_THRESHOLD {
+                let label = format!("{} (KNN override, cos={:.2}, L{})", entry.target_token, cos, pl);
+                let _ = tx.blocking_send(Ok(sse_token(&label, 0, 0)));
+                let _ = tx.blocking_send(Ok(sse_done("knn_override", 0, prefill_ms, 0.0)));
+                return;
+            }
+        }
+    }
+
+    // First sampled token from prefill state.
+    let raw = session.finalize_for_sampler(last_h.as_ref().unwrap(), 64, &**backend);
+    let mut next = match sampler.sample(&raw) {
+        Some(t) => t,
+        None => {
+            let _ = tx.blocking_send(Ok(sse_done("empty_predictions", 0, prefill_ms, 0.0)));
+            return;
+        }
+    };
+    let first_tok = model.tokenizer.decode(&[next], true).unwrap_or_default();
+    if tx.blocking_send(Ok(sse_token(&first_tok, next, 0))).is_err() { return; }
+    ids.push(next);
+
+    // Decode loop: one token per step, emit SSE.
+    let mut per: Vec<f64> = Vec::with_capacity(req.n_tokens);
+    let mut stopped_on = "n_tokens_reached";
+    for step in 1..req.n_tokens {
+        let t = Instant::now();
+        let (h, _) = session.step(next, None, &**backend);
+        let raw = session.finalize_for_sampler(&h, 64, &**backend);
+        per.push(t.elapsed().as_secs_f64() * 1000.0);
+        match sampler.sample(&raw) {
+            Some(tid) if stop_ids.contains(&tid) => { stopped_on = "eos"; break; }
+            Some(tid) => {
+                let tok = model.tokenizer.decode(&[tid], true).unwrap_or_default();
+                if tx.blocking_send(Ok(sse_token(&tok, tid, step))).is_err() { return; }
+                next = tid;
+            }
+            None => { stopped_on = "empty"; break; }
+        }
+    }
+    let avg = if !per.is_empty() { per.iter().sum::<f64>() / per.len() as f64 } else { 0.0 };
+    let _ = tx.blocking_send(Ok(sse_done(stopped_on, per.len() + 1, prefill_ms, avg)));
+}
+
+/// Apply the same per-layer pre-FFN norm a KNN query expects.
+/// Mirrors GgufPipeline::apply_pre_ffn_norm_for_layer (private).
+fn gguf_normed_probe(
+    gguf: &larql_inference::gguf_pipeline::GgufPipeline,
+    residual: &[f32],
+    layer: usize,
+) -> Vec<f32> {
+    // Use predict_top_k_with_knn's path indirectly by going through
+    // capture_residual_at_layer? That re-runs decode. Instead expose enough
+    // via the public capture: we can't reach the private helper, so just
+    // duplicate the formula here. Kept tiny on purpose — same math.
+    let arch = &*gguf.arch;
+    let key = if arch.has_post_norms() {
+        arch.pre_feedforward_layernorm_key(layer)
+    } else {
+        Some(arch.post_attention_layernorm_key(layer))
+    };
+    let weight = key.and_then(|k| gguf.vectors.get(&k));
+    let n = residual.len();
+    let eps = arch.norm_eps();
+    let sum_sq: f32 = residual.iter().map(|v| v * v).sum();
+    let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+    let offset = gguf.norm_offset;
+    match weight {
+        Some(w) if w.len() == n => residual.iter().zip(w.iter())
+            .map(|(&xi, &wi)| xi * inv_rms * (wi + offset)).collect(),
+        _ => residual.iter().map(|&xi| xi * inv_rms).collect(),
+    }
 }
 
 fn sse_token(token: &str, tid: u32, step: usize) -> Event {

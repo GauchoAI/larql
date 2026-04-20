@@ -359,6 +359,87 @@ pub struct PredictResult {
     pub knn_cosine: Option<f32>,
 }
 
+/// Holds per-call decode state across token steps in a streaming generate
+/// loop. Owns the layer-build and dimension caches so we don't rebuild
+/// `FullPipelineLayer` between every token.
+pub struct DecodeSession<'a> {
+    pipeline: &'a GgufPipeline,
+    layers: Vec<FullPipelineLayer<'a>>,
+    max_inter: usize,
+    max_q_dim: usize,
+    max_kv_dim: usize,
+}
+
+impl<'a> DecodeSession<'a> {
+    pub fn new(pipeline: &'a GgufPipeline) -> Self {
+        let cfg = pipeline.arch.config();
+        let max_inter = cfg.intermediate_size;
+        let max_q_dim: usize = (0..cfg.num_layers)
+            .map(|l| pipeline.arch.num_q_heads_for_layer(l) * pipeline.arch.head_dim_for_layer(l))
+            .max().unwrap_or(0);
+        let max_kv_dim: usize = (0..cfg.num_layers)
+            .map(|l| pipeline.arch.num_kv_heads_for_layer(l) * pipeline.arch.head_dim_for_layer(l))
+            .max().unwrap_or(0);
+        Self {
+            layers: pipeline.build_layers(),
+            pipeline,
+            max_inter, max_q_dim, max_kv_dim,
+        }
+    }
+
+    /// Feed one token through all layers, return the final hidden state
+    /// (pre-final-norm) and an optional probe at `probe_layer`.
+    pub fn step(
+        &self,
+        token_id: u32,
+        probe_layer: Option<usize>,
+        backend: &dyn ComputeBackend,
+    ) -> (Vec<f32>, Option<Vec<f32>>) {
+        let cfg = self.pipeline.arch.config();
+        let x = self.pipeline.embed_row(token_id);
+        backend.decode_token_with_probe(
+            &self.layers, &x, self.pipeline.hidden(), self.max_inter,
+            self.max_q_dim, self.max_kv_dim,
+            cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim,
+            self.pipeline.arch.rope_base_for_layer(0) as f32,
+            probe_layer,
+        ).expect("decode_token_with_probe returned None")
+    }
+
+    /// Compute logits (final-norm + lm_head) for the latest hidden state,
+    /// then build a top-N sampler-compatible (token_id, logit, prob) list.
+    /// `n_keep` typically 64 — large enough for top-p, small enough to be
+    /// near-free vs O(vocab log vocab) full sort.
+    pub fn finalize_for_sampler(
+        &self,
+        h_out: &[f32],
+        n_keep: usize,
+        backend: &dyn ComputeBackend,
+    ) -> Vec<(u32, f32, f64)> {
+        let h_normed = self.pipeline.apply_final_norm(h_out);
+        let logits = self.pipeline.compute_logits(&h_normed, backend);
+        // Partial selection: pick top n_keep by logit (O(n)), then sort those.
+        let mut indexed: Vec<(u32, f32)> = logits.iter().enumerate()
+            .map(|(i, &l)| (i as u32, l)).collect();
+        let n_keep = n_keep.min(indexed.len());
+        if n_keep < indexed.len() {
+            indexed.select_nth_unstable_by(n_keep, |a, b|
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            indexed.truncate(n_keep);
+        }
+        indexed.sort_by(|a, b|
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Compute probs over the kept candidates (numeric-stable softmax).
+        let max_l = indexed.first().map(|(_, l)| *l).unwrap_or(0.0);
+        let exps: Vec<f64> = indexed.iter()
+            .map(|(_, l)| ((*l as f64) - max_l as f64).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        indexed.into_iter().zip(exps).map(|((tid, l), e)| {
+            (tid, l, if sum > 0.0 { e / sum } else { 0.0 })
+        }).collect()
+    }
+}
+
 fn lookup_norm_vec<'a>(vectors: &'a HashMap<String, Vec<f32>>, key: &str) -> &'a [f32] {
     vectors.get(key).map(|v| v.as_slice()).unwrap_or(&[])
 }

@@ -113,14 +113,6 @@ pub struct AppState {
     pub sessions: SessionManager,
     /// DESCRIBE result cache.
     pub describe_cache: DescribeCache,
-    /// RAG fact store for conversation-as-knowledge.
-    pub rag_store: crate::routes::rag::RagStore,
-    /// K-vector RAG store — attention-based retrieval.
-    pub kv_rag_store: crate::routes::kv_rag::KvRagStore,
-    /// Vec_inject store — copy-head retrieval + residual injection.
-    pub vec_store: crate::routes::vec_inject::VecStore,
-    /// KV cache store — precomputed conversation context.
-    pub kv_cache_store: crate::routes::kv_cache::KvCacheStore,
 }
 
 impl AppState {

@@ -342,10 +342,6 @@ async fn main() -> Result<(), BoxError> {
         api_key: cli.api_key.clone(),
         sessions: SessionManager::new(3600),
         describe_cache: DescribeCache::new(cli.cache_ttl),
-        rag_store: routes::rag::RagStore::new(),
-        kv_rag_store: routes::kv_rag::KvRagStore::new(),
-        vec_store: routes::vec_inject::VecStore::new(),
-        kv_cache_store: routes::kv_cache::KvCacheStore::new(),
     });
 
     if cli.cache_ttl > 0 {

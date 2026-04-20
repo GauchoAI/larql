@@ -52,6 +52,40 @@ larql lql 'USE "gemma3-4b.vindex"; DESCRIBE "France";'
 larql lql 'USE "hf://chrishayuk/gemma-3-4b-it-vindex"; DESCRIBE "France";'
 ```
 
+## Serving with a GGUF weight source (recommended)
+
+`larql-server` will use a `weights.gguf` file (or symlink) inside the vindex
+directory as the source of truth for attention/FFN weights — the vindex
+continues to provide KNN store, embeddings, tokenizer, and patches.
+
+```bash
+# 1. Get a GGUF (any Q8_0 or Q4_K_M quantization works)
+ln -s /path/to/your-model.gguf gemma3-4b.vindex/weights.gguf
+
+# 2. Start the server (no need to load vindex inference weights)
+larql-server gemma3-4b.vindex --no-infer --port 3001
+```
+
+Three endpoints route through the GGUF pipeline:
+
+- `POST /v1/infer mode=fast` — single-token completion + KNN overlay
+- `POST /v1/insert mode=knn` — captures the prompt's residual + stores it
+- `POST /v1/generate` — SSE-streamed multi-token generation
+
+End-to-end on stock Gemma 3 4B Q8_0 (M4 Pro):
+
+```
+POST /v1/infer  "The capital of Italy is" → "Rome"     174 ms warm
+POST /v1/insert  Italy/capital/Atlantis @ L26          162 ms
+POST /v1/infer  "The capital of Italy is" →
+        "Atlantis (KNN override, cos=1.00, L26)"       160 ms
+POST /v1/generate n_tokens=100 → coherent story        39.2 tok/s
+```
+
+RSS at idle and under load: ~5 GB (vs ~9 GB on the legacy vindex Q4_K
+path). See `findings.md` 2026-04-19/20 for the seven decode bugs that
+had to be fixed before this worked, and the comparison table.
+
 ## What is a Vindex?
 
 A vindex is a directory containing a model's weights reorganised for queryability. Gate vectors become a KNN index. Embeddings become token lookups. Down projections become edge labels. The model IS the database.

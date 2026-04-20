@@ -187,12 +187,6 @@ pub async fn handle_chat_completions(
         let patched = model_cl.patched.blocking_read();
         let knn_opt = if patched.knn_store.is_empty() { None } else { Some(&patched.knn_store) };
 
-        let walk_ffn_opt = if model_cl.walk_only {
-            Some(larql_inference::WalkFfn::new_with_backend(weights, patched.base(), 1024, &**backend))
-        } else { None };
-        let ffn_override: Option<&dyn larql_inference::ffn::FfnBackend> =
-            walk_ffn_opt.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
-
         let mut sampler = larql_inference::sampling::Sampler::new(
             larql_inference::sampling::SamplingConfig {
                 temperature: req.temperature,
@@ -207,7 +201,7 @@ pub async fn handle_chat_completions(
         let prefill = larql_inference::predict_honest_with_knn_ffn(
             weights, &model_cl.tokenizer, &ids, 20,
             patched.base(), &**backend, &cache,
-            0..weights.num_layers, knn_opt, ffn_override,
+            0..weights.num_layers, knn_opt, None,
         );
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
 
@@ -239,7 +233,7 @@ pub async fn handle_chat_completions(
             let r = larql_inference::predict_honest_with_knn_ffn(
                 weights, &model_cl.tokenizer, &input, 20,
                 patched.base(), &**backend, &cache,
-                0..weights.num_layers, knn_opt, ffn_override,
+                0..weights.num_layers, knn_opt, None,
             );
 
             // Multi-token KNN override: when the predict returns a full
@@ -265,7 +259,7 @@ pub async fn handle_chat_completions(
                     let _r = larql_inference::predict_honest_with_knn_ffn(
                         weights, &model_cl.tokenizer, &[forced_tid], 1,
                         patched.base(), &**backend, &cache,
-                        0..weights.num_layers, knn_opt, ffn_override,
+                        0..weights.num_layers, knn_opt, None,
                     );
                     next = forced_tid;
                     token_count += 1;
@@ -318,7 +312,7 @@ pub async fn handle_chat_completions(
                                                     let _r = larql_inference::predict_honest_with_knn_ffn(
                                                         weights, &model_cl.tokenizer, &[itid], 1,
                                                         patched.base(), &**backend, &cache,
-                                                        0..weights.num_layers, knn_opt, ffn_override,
+                                                        0..weights.num_layers, knn_opt, None,
                                                     );
                                                     token_count += 1;
                                                 }

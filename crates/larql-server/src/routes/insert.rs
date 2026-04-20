@@ -253,13 +253,6 @@ fn run_insert_knn(
         } else {
             let weights = weights_opt.unwrap();
             let patched = model.patched.blocking_read();
-            let walk_ffn_cap = if model.walk_only {
-                Some(larql_inference::WalkFfn::new_with_backend(
-                    weights, patched.base(), 1024, &**backend,
-                ))
-            } else { None };
-            let _ffn_ov: Option<&dyn larql_inference::ffn::FfnBackend> =
-                walk_ffn_cap.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
             backend.reset_kv_cache();
             let qk = larql_inference::capture_knn_key_gpu(
                 weights, &token_ids, install_layer, patched.base(), &**backend,

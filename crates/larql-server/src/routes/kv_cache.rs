@@ -77,19 +77,11 @@ pub async fn handle_precompute(
         // Prefill via predict (populates KV cache)
         let patched = model.patched.blocking_read();
         let cache = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
-        let walk_ffn = if model.walk_only {
-            Some(larql_inference::WalkFfn::new_with_backend(
-                weights, patched.base(), 1024, &**backend,
-            ))
-        } else { None };
-        let ffn_override: Option<&dyn larql_inference::ffn::FfnBackend> =
-            walk_ffn.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
-
         backend.reset_kv_cache();
         let _result = larql_inference::predict_honest_with_knn_ffn(
             weights, &model.tokenizer, &token_ids, 1,
             patched.base(), &**backend, &cache,
-            0..weights.num_layers, None, ffn_override,
+            0..weights.num_layers, None, None,
         );
 
         let prefill_s = t0.elapsed().as_secs_f64();
@@ -209,19 +201,11 @@ pub async fn handle_compact(
 
         let patched = model.patched.blocking_read();
         let cache = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
-        let walk_ffn = if model.walk_only {
-            Some(larql_inference::WalkFfn::new_with_backend(
-                weights, patched.base(), 1024, &**backend,
-            ))
-        } else { None };
-        let ffn_override: Option<&dyn larql_inference::ffn::FfnBackend> =
-            walk_ffn.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
-
         backend.reset_kv_cache();
         let _result = larql_inference::predict_honest_with_knn_ffn(
             weights, &model.tokenizer, &token_ids, 1,
             patched.base(), &**backend, &cache,
-            0..weights.num_layers, None, ffn_override,
+            0..weights.num_layers, None, None,
         );
 
         let prefill_s = t0.elapsed().as_secs_f64();

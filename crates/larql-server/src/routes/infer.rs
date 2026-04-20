@@ -137,11 +137,7 @@ fn run_infer(
 
     if use_fast {
         // Fast path: Metal f32 forward + KNN overlay consult. Sub-second
-        // prefill after the server's warmup pass. This is the route "ask"
-        // in bench_interactive routes through. When `walk_only` is set, the
-        // FFN backend swaps from dense WeightFfnGpu to the sparse Q4_0
-        // WalkFfn (uses `interleaved_q4.bin` mmap), trading ~2× decode
-        // speed for ~7 GB less RSS.
+        // prefill after the server's warmup pass.
         let run_fast = |patched: &larql_vindex::PatchedVindex| {
             let backend = model.get_or_init_backend();
             // Empty CachedLayerGraph — we don't actually cache any layers
@@ -153,14 +149,6 @@ fn run_infer(
                 None
             } else { Some(&patched.knn_store) };
 
-            let walk_ffn_opt = if model.walk_only {
-                Some(larql_inference::WalkFfn::new_with_backend(
-                    weights, patched.base(), 1024, &**backend,
-                ))
-            } else { None };
-            let ffn_override: Option<&dyn larql_inference::ffn::FfnBackend> =
-                walk_ffn_opt.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
-
             let _guard = match model.inference_lock.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
@@ -170,7 +158,7 @@ fn run_infer(
             let pred = larql_inference::predict_honest_with_knn_ffn(
                 weights, &model.tokenizer, &token_ids, req.top,
                 patched.base(), &**backend, &cache,
-                0..weights.num_layers, knn_opt, ffn_override,
+                0..weights.num_layers, knn_opt, None,
             );
             let fast_ms = fast_start.elapsed().as_secs_f64() * 1000.0;
             (pred, fast_ms)

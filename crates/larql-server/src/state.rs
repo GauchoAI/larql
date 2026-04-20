@@ -41,10 +41,6 @@ pub struct LoadedModel {
     /// Probe-confirmed feature labels: (layer, feature) → relation name.
     /// Loaded from feature_labels.json if present.
     pub probe_labels: HashMap<(usize, usize), String>,
-    /// Walk-only mode: after loading, FFN weights are dropped (~10.7 GB) and
-    /// the fast-path `/v1/infer mode=fast` routes through `WalkFfn` instead
-    /// of `WeightFfnGpu`. Set at server startup via `--walk-only`.
-    pub walk_only: bool,
     /// Optional GGUF weight source. When `weights.gguf` is present in the
     /// vindex dir, `mode=fast` reads attention/FFN weights from this pipeline
     /// instead of the (possibly stale) Q4_K binaries. The vindex still
@@ -67,7 +63,7 @@ impl LoadedModel {
         let has_q4k_attn = self.path.join("attn_weights_q4k.bin").exists();
         let has_q4_lm = self.path.join("lm_head_q4.bin").exists();
         let mut skip: Vec<&str> = Vec::new();
-        if self.walk_only || has_q4k_ffn {
+        if has_q4k_ffn {
             skip.extend_from_slice(&["gate_proj", "up_proj", "down_proj",
                 "ffn_gate", "ffn_up", "ffn_down", "mlp.experts",
                 "packed_gate_up", "packed_down"]);

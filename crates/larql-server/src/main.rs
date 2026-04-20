@@ -97,17 +97,9 @@ struct Cli {
     /// that cost out of the interactive loop. Default: warmup enabled.
     #[arg(long)]
     no_warmup: bool,
-
-    /// DEPRECATED: prefer dropping a `weights.gguf` into the vindex dir.
-    /// Walk-only drops FFN weights and routes `/v1/infer mode=fast` through
-    /// a sparse Q4_0 walk: ~11 GB RSS, ~2× slower decode. The GGUF path
-    /// achieves ~5 GB RSS at full speed (see findings.md 2026-04-19/20).
-    /// Kept for vindexes that lack a GGUF and still have `interleaved_q4.bin`.
-    #[arg(long)]
-    walk_only: bool,
 }
 
-fn load_single_vindex(path_str: &str, no_infer: bool, walk_only: bool) -> Result<LoadedModel, BoxError> {
+fn load_single_vindex(path_str: &str, no_infer: bool) -> Result<LoadedModel, BoxError> {
     let path = if larql_vindex::is_hf_path(path_str) {
         info!("Resolving HuggingFace path: {}", path_str);
         larql_vindex::resolve_hf_vindex(path_str)?
@@ -192,10 +184,6 @@ fn load_single_vindex(path_str: &str, no_infer: bool, walk_only: bool) -> Result
                 Ok(g) => {
                     info!("  GGUF: loaded weights.gguf ({} layers, vocab={})",
                         g.num_layers(), g.lm_head_vocab);
-                    if walk_only {
-                        info!("  NOTE: --walk-only is redundant when weights.gguf is present \
-                              (GGUF achieves smaller RSS at full decode speed)");
-                    }
                     Some(Arc::new(g))
                 }
                 Err(e) => {
@@ -221,7 +209,6 @@ fn load_single_vindex(path_str: &str, no_infer: bool, walk_only: bool) -> Result
         backend: std::sync::OnceLock::new(),
         inference_lock: std::sync::Mutex::new(()),
         probe_labels,
-        walk_only,
         gguf,
     })
 }
@@ -269,13 +256,13 @@ async fn main() -> Result<(), BoxError> {
         }
         info!("Found {} vindexes in {}", paths.len(), dir.display());
         for p in &paths {
-            match load_single_vindex(&p.to_string_lossy(), cli.no_infer, cli.walk_only) {
+            match load_single_vindex(&p.to_string_lossy(), cli.no_infer) {
                 Ok(m) => models.push(Arc::new(m)),
                 Err(e) => warn!("  Skipping {}: {}", p.display(), e),
             }
         }
     } else if let Some(ref vindex_path) = cli.vindex_path {
-        let m = load_single_vindex(vindex_path, cli.no_infer, cli.walk_only)?;
+        let m = load_single_vindex(vindex_path, cli.no_infer)?;
         models.push(Arc::new(m));
     } else {
         return Err("must provide a vindex path or --dir".into());
@@ -307,28 +294,15 @@ async fn main() -> Result<(), BoxError> {
                     .and_then(|e| e.get_ids().first().copied())
                     .unwrap_or(1);
                 let patched = m_cl.patched.blocking_read();
-                // Match the hot-path FFN at warmup time. When walk_only is set
-                // we must warm the Q4_0 walk kernel, not the dense matmul (the
-                // dense path would panic on dropped FFN weights anyway).
-                let walk_ffn_warmup = if m_cl.walk_only {
-                    Some(larql_inference::WalkFfn::new_with_backend(
-                        weights, patched.base(), 1024, &**backend,
-                    ))
-                } else { None };
-                let ffn_override: Option<&dyn larql_inference::ffn::FfnBackend> =
-                    walk_ffn_warmup.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
                 let mut timings = Vec::new();
                 for &n in &[1usize, 4, 8, 16, 32] {
                     let ids: Vec<u32> = std::iter::repeat(bos).take(n).collect();
-                    // Empty CachedLayerGraph — avoids invoking the FFN (which
-                    // would panic in walk_only mode since FFN tensors were
-                    // dropped after load).
                     let cache = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
                     backend.reset_kv_cache();
                     let t = std::time::Instant::now();
                     let _ = larql_inference::predict_honest_with_knn_ffn(
                         weights, &m_cl.tokenizer, &ids, 1, patched.base(),
-                        &**backend, &cache, 0..weights.num_layers, None, ffn_override,
+                        &**backend, &cache, 0..weights.num_layers, None, None,
                     );
                     let s = t.elapsed().as_secs_f64();
                     tracing::info!("  seq_len={} {:.1}s", n, s);

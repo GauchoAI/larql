@@ -165,7 +165,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(info) = lm_head_info_opt {
         lm_head_bytes = qdata.tensor_bytes(info);
         lm_head_type = info.tensor_type;
-        lm_head_vocab = info.dims[0] as usize;
+        // GGUF stores tensors inner-axis-first: dims=[hidden, vocab] for an
+        // [vocab, hidden] matrix. Each row of `hidden` contiguous elements is
+        // one token's lm_head vector, so vocab is dims[1].
+        assert_eq!(info.dims[0] as usize, hidden, "expected lm_head dims[0]=hidden");
+        lm_head_vocab = info.dims[1] as usize;
         println!("    lm_head dims: {:?} type={}", info.dims, ggml::type_name(info.tensor_type));
     } else {
         lm_head_bytes = embed_bytes;

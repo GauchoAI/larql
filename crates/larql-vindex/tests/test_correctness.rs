@@ -279,7 +279,7 @@ fn q4k_matvec_real_gate_synthetic_x() {
     let inter = 10240usize;
     let q4k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 148;
 
-    let file = std::fs::File::open(dir.join("interleaved_q4k.bin")).unwrap();
+    let file = std::fs::File::open(dir.join("interleaved_q4k_real.bin")).unwrap();
     let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
     let gate_bytes = &mmap[0..q4k_bytes_per_matrix]; // layer 0 gate is first
 
@@ -311,7 +311,7 @@ fn q6k_matvec_real_down_synthetic_x() {
     let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210;
     let down_offset = 2 * q4k_bytes_per_matrix;
 
-    let file = std::fs::File::open(dir.join("interleaved_q4k.bin")).unwrap();
+    let file = std::fs::File::open(dir.join("interleaved_q4k_real.bin")).unwrap();
     let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
     let down_bytes = &mmap[down_offset..down_offset + q6k_bytes_per_matrix];
 
@@ -345,7 +345,7 @@ fn q6k_down_layer0_scale_check() {
     let q6k_bytes_per_matrix = (inter * hidden).div_ceil(256) * 210;
     let down_offset_in_layer0 = 2 * q4k_bytes_per_matrix;
 
-    let file = std::fs::File::open(dir.join("interleaved_q4k.bin")).unwrap();
+    let file = std::fs::File::open(dir.join("interleaved_q4k_real.bin")).unwrap();
     let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
     let down = &mmap[down_offset_in_layer0..down_offset_in_layer0 + q6k_bytes_per_matrix];
 

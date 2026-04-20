@@ -127,36 +127,6 @@ impl WorkflowStore {
         }
     }
 
-    /// Update a specific step in a workflow.
-    pub fn update_step(
-        workflows: &mut [Workflow],
-        workflow_name: &str,
-        step_num: usize,
-        state: StepState,
-        detail: Option<String>,
-    ) {
-        if let Some(wf) = workflows.iter_mut().find(|w| w.name == workflow_name) {
-            if step_num > 0 && step_num <= wf.steps.len() {
-                wf.steps[step_num - 1].state = state;
-                if let Some(d) = detail {
-                    wf.steps[step_num - 1].output = Some(d);
-                }
-            }
-            // Update workflow overall state
-            let all_done = wf.steps.iter().all(|s| s.state == StepState::Done);
-            let any_active = wf.steps.iter().any(|s| s.state == StepState::Active);
-            let any_blocked = wf.steps.iter().any(|s| s.state == StepState::Blocked);
-            wf.state = if all_done {
-                StepState::Done
-            } else if any_blocked {
-                StepState::Blocked
-            } else if any_active {
-                StepState::Active
-            } else {
-                StepState::Pending
-            };
-        }
-    }
 
     /// Update or create a flat workflow (legacy status block without steps).
     pub fn upsert_flat(

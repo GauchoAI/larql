@@ -61,10 +61,11 @@ pub async fn handle_generate_stream(
         .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
     let model = Arc::clone(model);
 
-    // Validate + prepare off the async task so we can fail fast with HTTP 4xx.
-    let has_gguf = model.gguf.is_some();
-    if model.infer_disabled && !has_gguf {
-        return Err(ServerError::InferenceUnavailable("inference disabled".into()));
+    // Require GGUF — the only weight source.
+    if model.gguf.is_none() {
+        return Err(ServerError::InferenceUnavailable(
+            "no weights.gguf in vindex dir — drop one in to enable inference".into(),
+        ));
     }
 
     let stop_ids: Vec<u32> = req.stop_ids.clone().unwrap_or_else(|| vec![1u32, 106]);
@@ -74,106 +75,7 @@ pub async fn handle_generate_stream(
 
     let model_cl = Arc::clone(&model);
     tokio::task::spawn_blocking(move || {
-        if model_cl.gguf.is_some() {
-            run_gguf_generate(&model_cl, &req, &stop_ids, &tx);
-            return;
-        }
-        let weights = match model_cl.get_or_load_weights() {
-            Ok(w) => w,
-            Err(e) => {
-                let _ = tx.blocking_send(Ok(sse_err(&format!("weights load: {e}"))));
-                return;
-            }
-        };
-
-        let encoding = match model_cl.tokenizer.encode(req.prompt.as_str(), true) {
-            Ok(e) => e,
-            Err(e) => {
-                let _ = tx.blocking_send(Ok(sse_err(&format!("tokenize: {e}"))));
-                return;
-            }
-        };
-        let mut ids: Vec<u32> = encoding.get_ids().to_vec();
-        if ids.is_empty() {
-            let _ = tx.blocking_send(Ok(sse_err("empty prompt")));
-            return;
-        }
-
-        let backend = model_cl.get_or_init_backend();
-        let _guard = match model_cl.inference_lock.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        backend.reset_kv_cache();
-
-        let cache = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
-        let patched = model_cl.patched.blocking_read();
-        let knn_opt = if patched.knn_store.is_empty() { None } else { Some(&patched.knn_store) };
-
-        let mut sampler = larql_inference::sampling::Sampler::new(
-            larql_inference::sampling::SamplingConfig {
-                temperature: req.temperature,
-                top_p: req.top_p,
-                top_k: req.top_k,
-                seed: req.seed,
-            },
-        );
-
-        let prefill_start = Instant::now();
-        let prefill = larql_inference::predict_honest_with_knn_ffn(
-            weights, &model_cl.tokenizer, &ids, 20,
-            patched.base(), &**backend, &cache,
-            0..weights.num_layers, knn_opt, None,
-        );
-        let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
-
-        // KNN override short-circuit — emit one token event then done.
-        let first_label = prefill.predictions.first().map(|(s,_)| s.as_str()).unwrap_or("");
-        let knn_hit = first_label.contains("KNN override");
-        if knn_hit {
-            if let Some(&(tid, _, _)) = prefill.raw_predictions.first() {
-                let label = prefill.predictions.first().map(|(s,_)| s.clone()).unwrap_or_default();
-                let _ = tx.blocking_send(Ok(sse_token(&label, tid, 0)));
-            }
-            let _ = tx.blocking_send(Ok(sse_done("knn_override", 0, prefill_ms, 0.0)));
-            return;
-        }
-
-        let mut next = match sampler.sample(&prefill.raw_predictions) {
-            Some(tid) => tid,
-            None => {
-                let _ = tx.blocking_send(Ok(sse_done("empty_predictions", 0, prefill_ms, 0.0)));
-                return;
-            }
-        };
-        let first_tok = model_cl.tokenizer.decode(&[next], true).unwrap_or_default();
-        if tx.blocking_send(Ok(sse_token(&first_tok, next, 0))).is_err() { return; }
-        ids.push(next);
-
-        let mut per: Vec<f64> = Vec::with_capacity(req.n_tokens);
-        let mut stopped_on = "n_tokens_reached";
-        for step in 1..req.n_tokens {
-            let input = vec![next];
-            let t = Instant::now();
-            let r = larql_inference::predict_honest_with_knn_ffn(
-                weights, &model_cl.tokenizer, &input, 20,
-                patched.base(), &**backend, &cache,
-                0..weights.num_layers, knn_opt, None,
-            );
-            per.push(t.elapsed().as_secs_f64() * 1000.0);
-
-            match sampler.sample(&r.raw_predictions) {
-                Some(tid) if stop_ids.contains(&tid) => { stopped_on = "eos"; break; }
-                Some(tid) => {
-                    let tok = model_cl.tokenizer.decode(&[tid], true).unwrap_or_default();
-                    if tx.blocking_send(Ok(sse_token(&tok, tid, step))).is_err() { return; }
-                    next = tid;
-                }
-                None => { stopped_on = "empty"; break; }
-            }
-        }
-        let avg = if !per.is_empty() { per.iter().sum::<f64>() / per.len() as f64 } else { 0.0 };
-        let _ = tx.blocking_send(Ok(sse_done(stopped_on, per.len() + 1, prefill_ms, avg)));
+        run_gguf_generate(&model_cl, &req, &stop_ids, &tx);
     });
 
     // Consume the channel into an SSE stream.

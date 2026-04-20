@@ -260,7 +260,7 @@ fn run_gguf_generate(
 
     // KNN override short-circuit.
     if let (Some(probe), Some(store), Some(pl)) = (last_probe.as_ref(), knn_store_opt, knn_probe_layer) {
-        let normed = gguf_normed_probe(gguf, probe, pl);
+        let normed = gguf.apply_pre_ffn_norm_for_layer(probe, pl);
         if let Some((entry, cos)) = store.query_top1(pl, &normed) {
             if cos > KNN_COSINE_THRESHOLD {
                 let label = format!("{} (KNN override, cos={:.2}, L{})", entry.target_token, cos, pl);
@@ -304,36 +304,6 @@ fn run_gguf_generate(
     }
     let avg = if !per.is_empty() { per.iter().sum::<f64>() / per.len() as f64 } else { 0.0 };
     let _ = tx.blocking_send(Ok(sse_done(stopped_on, per.len() + 1, prefill_ms, avg)));
-}
-
-/// Apply the same per-layer pre-FFN norm a KNN query expects.
-/// Mirrors GgufPipeline::apply_pre_ffn_norm_for_layer (private).
-fn gguf_normed_probe(
-    gguf: &larql_inference::gguf_pipeline::GgufPipeline,
-    residual: &[f32],
-    layer: usize,
-) -> Vec<f32> {
-    // Use predict_top_k_with_knn's path indirectly by going through
-    // capture_residual_at_layer? That re-runs decode. Instead expose enough
-    // via the public capture: we can't reach the private helper, so just
-    // duplicate the formula here. Kept tiny on purpose — same math.
-    let arch = &*gguf.arch;
-    let key = if arch.has_post_norms() {
-        arch.pre_feedforward_layernorm_key(layer)
-    } else {
-        Some(arch.post_attention_layernorm_key(layer))
-    };
-    let weight = key.and_then(|k| gguf.vectors.get(&k));
-    let n = residual.len();
-    let eps = arch.norm_eps();
-    let sum_sq: f32 = residual.iter().map(|v| v * v).sum();
-    let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
-    let offset = gguf.norm_offset;
-    match weight {
-        Some(w) if w.len() == n => residual.iter().zip(w.iter())
-            .map(|(&xi, &wi)| xi * inv_rms * (wi + offset)).collect(),
-        _ => residual.iter().map(|&xi| xi * inv_rms).collect(),
-    }
 }
 
 fn sse_token(token: &str, tid: u32, step: usize) -> Event {

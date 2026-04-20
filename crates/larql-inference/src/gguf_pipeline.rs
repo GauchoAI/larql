@@ -197,7 +197,7 @@ impl GgufPipeline {
 
     /// Apply the per-layer pre-FFN norm to a residual probe vector (for KNN).
     /// Mirrors what the residual goes through between attention and FFN.
-    fn apply_pre_ffn_norm_for_layer(&self, residual: &[f32], layer: usize) -> Vec<f32> {
+    pub fn apply_pre_ffn_norm_for_layer(&self, residual: &[f32], layer: usize) -> Vec<f32> {
         let key = if self.arch.has_post_norms() {
             self.arch.pre_feedforward_layernorm_key(layer)
         } else {

@@ -116,15 +116,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let embed_bytes = qdata.tensor_bytes(embed_info);
     println!("    embed dims: {:?} type={} ({})", embed_info.dims,
         embed_info.tensor_type, ggml::type_name(embed_info.tensor_type));
-    // GGUF embed: dims[0] = vocab, dims[1] = hidden (row-major)
-    // But Gemma uses dims[0]=hidden, dims[1]=vocab when stored transposed
+    // GGUF dims are stored inner-axis-first. dims=[A, B] means a numpy-shape
+    // [B, A] tensor with row-major storage: each "row" is A contiguous elements.
+    // For an embedding of vocab × hidden, the inner axis must be hidden (since
+    // Q-K-quant block sizes only divide hidden, not vocab) — so dims[0]=hidden
+    // and each token's embedding is one row of `hidden` contiguous elements.
+    // The previous transposed=true branch column-extracted from huge "rows"
+    // and produced plausible-looking but wrong values.
     let embed_dim0 = embed_info.dims[0] as usize;
     let embed_dim1 = embed_info.dims[1] as usize;
-    let (embed_vocab, embed_hidden, embed_transposed) = if embed_dim0 == hidden {
-        (embed_dim1, embed_dim0, true)
-    } else {
-        (embed_dim0, embed_dim1, false)
-    };
+    assert_eq!(embed_dim0, hidden, "expected GGUF embed dims[0]=hidden");
+    let (embed_vocab, embed_hidden, embed_transposed) = (embed_dim1, embed_dim0, false);
     assert_eq!(embed_hidden, hidden, "embed hidden dim mismatch");
     // Compute bytes-per-row for on-demand dequantization
     let embed_elements_per_row = if embed_transposed { embed_vocab } else { embed_hidden };
@@ -254,7 +256,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Step 9: Prefill via GPU decode_token (token by token) ──
     let embed_scale = arch.embed_scale();
-    let norm_offset = arch.norm_weight_offset();
+    // GGUF Gemma3 norm weights have +1 baked in (convert_hf_to_gguf adds 1.0
+    // to all "norm.weight" tensors — see Gemma3Model.norm_shift). Offset must
+    // be 0 here to avoid double-applying.
+    let norm_offset = if arch.family() == "gemma3" { 0.0 } else { arch.norm_weight_offset() };
     let final_norm_key = arch.final_norm_key();
 
     println!("[9] Starting prefill + decode ...");
@@ -551,8 +556,9 @@ fn build_gguf_layers<'a>(
             k_norm_weight,
             input_norm_bias: None,
             post_attn_norm_bias: None,
-            norm_offset: arch.norm_weight_offset(),
-            qk_norm_offset: arch.qk_norm_weight_offset(),
+            // GGUF Gemma3 norms are pre-shifted by +1; per-layer offset must be 0.
+            norm_offset: if arch.family() == "gemma3" { 0.0 } else { arch.norm_weight_offset() },
+            qk_norm_offset: if arch.family() == "gemma3" { 0.0 } else { arch.qk_norm_weight_offset() },
             eps: arch.norm_eps(),
             has_post_norms: arch.has_post_norms(),
             norm_type: match arch.norm_type() {

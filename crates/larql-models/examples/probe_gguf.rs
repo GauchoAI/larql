@@ -1,9 +1,26 @@
-use larql_models::GgufFile;
+use larql_models::{GgufFile, GgufQuantizedData};
 use larql_models::quant::ggml;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).expect("usage: probe <gguf>");
     let gguf = GgufFile::open(&std::path::PathBuf::from(&path))?;
+    let qdata = GgufQuantizedData::open(&std::path::PathBuf::from(&path), gguf.data_offset)?;
+    // Norm tensor stats — to check if +1 is baked in
+    let norm_names = ["blk.0.attn_norm.weight", "blk.0.post_attention_norm.weight",
+                      "blk.0.ffn_norm.weight", "blk.0.post_ffw_norm.weight",
+                      "output_norm.weight", "blk.0.attn_q_norm.weight"];
+    for n in norm_names.iter() {
+        if let Some(info) = gguf.find_tensor(n) {
+            if let Some(data) = qdata.tensor_f32(info) {
+                let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mean: f32 = data.iter().sum::<f32>() / data.len() as f32;
+                println!("NORM {:50} dims={:?} min={:.4} max={:.4} mean={:.4} [0..3]={:.4?}",
+                    n, info.dims, min, max, mean, &data[..3.min(data.len())]);
+            }
+        }
+    }
+    println!("---");
     let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     for ti in &gguf.tensor_infos {
         *counts.entry(ti.tensor_type).or_insert(0) += 1;

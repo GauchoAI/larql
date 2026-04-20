@@ -75,21 +75,43 @@ fn run_infer(
     result.insert("prompt".into(), serde_json::json!(req.prompt));
 
     // Fast path with GGUF weight source — bypasses vindex weight loading.
-    // The GGUF pipeline holds attention/FFN weights mmap'd from disk; we
-    // still hold the inference lock to serialize KV cache use.
+    // The GGUF pipeline holds attention/FFN weights mmap'd from disk. We
+    // still consult the vindex KNN store for fact overlay, and hold the
+    // inference lock to serialize KV cache use.
     if use_fast {
         if let Some(gguf) = model.gguf.as_ref() {
             let backend = model.get_or_init_backend();
-            let _guard = match model.inference_lock.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            backend.reset_kv_cache();
-            let fast_start = std::time::Instant::now();
-            let preds = gguf.predict_top_k(&token_ids, req.top, &**backend, &model.tokenizer);
-            let fast_ms = fast_start.elapsed().as_secs_f64() * 1000.0;
 
-            let predictions: Vec<serde_json::Value> = preds.iter().map(|(tok, prob)| {
+            let run = |patched: &larql_vindex::PatchedVindex| {
+                let _guard = match model.inference_lock.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                backend.reset_kv_cache();
+                let knn_opt = if patched.knn_store.is_empty() { None } else { Some(&patched.knn_store) };
+                let fast_start = std::time::Instant::now();
+                let pred = gguf.predict_top_k_with_knn(
+                    &token_ids, req.top, &**backend, &model.tokenizer, knn_opt,
+                );
+                let fast_ms = fast_start.elapsed().as_secs_f64() * 1000.0;
+                (pred, fast_ms)
+            };
+
+            let (pred, fast_ms) = if let Some(sid) = session_id {
+                let sessions = state.sessions.sessions_blocking_write();
+                if let Some(session) = sessions.get(sid) {
+                    run(&session.patched)
+                } else {
+                    drop(sessions);
+                    let patched = model.patched.blocking_read();
+                    run(&patched)
+                }
+            } else {
+                let patched = model.patched.blocking_read();
+                run(&patched)
+            };
+
+            let predictions: Vec<serde_json::Value> = pred.predictions.iter().map(|(tok, prob)| {
                 serde_json::json!({
                     "token": tok,
                     "probability": (*prob * 10000.0).round() / 10000.0,
@@ -99,7 +121,10 @@ fn run_infer(
             result.insert("mode".into(), serde_json::json!("fast"));
             result.insert("source".into(), serde_json::json!("gguf"));
             result.insert("fast_ms".into(), serde_json::json!((fast_ms * 10.0).round() / 10.0));
-            result.insert("knn_override".into(), serde_json::json!(false));
+            result.insert("knn_override".into(), serde_json::json!(pred.knn_override));
+            if let Some(c) = pred.knn_cosine {
+                result.insert("knn_cosine".into(), serde_json::json!((c * 10000.0).round() / 10000.0));
+            }
             let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
             result.insert("latency_ms".into(), serde_json::json!((latency_ms * 10.0).round() / 10.0));
             return Ok(serde_json::Value::Object(result));

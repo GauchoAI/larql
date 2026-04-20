@@ -195,18 +195,38 @@ impl GgufPipeline {
         (0..num_layers).map(|l| build_one_layer(&self.gguf, &self.qdata, &self.vectors, arch, l)).collect()
     }
 
-    /// Run prefill + decode for one token's worth of generation: feed all
-    /// `token_ids` through `decode_token`, return top-k predictions for the
-    /// next token plus the final hidden state at the probe layer (if any).
-    ///
-    /// Caller holds the inference lock and resets the KV cache before calling.
-    pub fn predict_top_k(
+    /// Apply the per-layer pre-FFN norm to a residual probe vector (for KNN).
+    /// Mirrors what the residual goes through between attention and FFN.
+    fn apply_pre_ffn_norm_for_layer(&self, residual: &[f32], layer: usize) -> Vec<f32> {
+        let key = if self.arch.has_post_norms() {
+            self.arch.pre_feedforward_layernorm_key(layer)
+        } else {
+            Some(self.arch.post_attention_layernorm_key(layer))
+        };
+        let weight = key.and_then(|k| self.vectors.get(&k));
+        let n = residual.len();
+        let eps = self.arch.norm_eps();
+        let sum_sq: f32 = residual.iter().map(|v| v * v).sum();
+        let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+        let offset = self.norm_offset;
+        match weight {
+            Some(w) if w.len() == n => residual.iter().zip(w.iter())
+                .map(|(&xi, &wi)| xi * inv_rms * (wi + offset)).collect(),
+            _ => residual.iter().map(|&xi| xi * inv_rms).collect(),
+        }
+    }
+
+    /// Result of `predict_top_k_with_knn`: top-k predictions plus an optional
+    /// KNN override hit (cosine + entry data) when one fires.
+    pub fn predict_top_k_with_knn(
         &self,
         token_ids: &[u32],
         top_k: usize,
         backend: &dyn ComputeBackend,
         tokenizer: &tokenizers::Tokenizer,
-    ) -> Vec<(String, f32)> {
+        knn_store: Option<&larql_vindex::KnnStore>,
+    ) -> PredictResult {
+        const KNN_COSINE_THRESHOLD: f32 = 0.75;
         let layers = self.build_layers();
         let cfg = self.arch.config();
         let max_inter = cfg.intermediate_size;
@@ -217,35 +237,126 @@ impl GgufPipeline {
             .map(|l| self.arch.num_kv_heads_for_layer(l) * self.arch.head_dim_for_layer(l))
             .max().unwrap_or(0);
 
+        // Probe at the first layer that has KNN entries (matches the existing
+        // vindex-path behavior in predict_honest_with_knn_ffn).
+        let knn_probe_layer: Option<usize> = knn_store
+            .and_then(|s| s.layers().into_iter().next());
+
         let mut last_h: Option<Vec<f32>> = None;
-        for &tid in token_ids {
+        let mut last_probe: Option<Vec<f32>> = None;
+        let last_idx = token_ids.len().saturating_sub(1);
+        for (i, &tid) in token_ids.iter().enumerate() {
             let x = self.embed_row(tid);
-            let h = backend.decode_token(
+            // Only probe on the LAST token (we want the residual at the
+            // generation-position layer, not earlier prompt positions).
+            let probe_for_this_token = if i == last_idx { knn_probe_layer } else { None };
+            let (h, probe) = backend.decode_token_with_probe(
                 &layers, &x, self.hidden(), max_inter, max_q_dim, max_kv_dim,
                 cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim,
                 self.arch.rope_base_for_layer(0) as f32,
-            ).expect("decode_token returned None");
+                probe_for_this_token,
+            ).expect("decode_token_with_probe returned None");
             last_h = Some(h);
+            if i == last_idx { last_probe = probe; }
         }
+
+        // KNN overlay check
+        if let (Some(probe), Some(store), Some(pl)) = (last_probe.as_ref(), knn_store, knn_probe_layer) {
+            let normed_probe = self.apply_pre_ffn_norm_for_layer(probe, pl);
+            if let Some((entry, cosine)) = store.query_top1(pl, &normed_probe) {
+                if std::env::var("LARQL_TRACE_KNN").ok().as_deref() == Some("1") {
+                    eprintln!("[knn-gguf L{pl}] top1={} cos={cosine:.4} (threshold={KNN_COSINE_THRESHOLD})",
+                        entry.target_token);
+                }
+                if cosine > KNN_COSINE_THRESHOLD {
+                    let label = format!(
+                        "{} (KNN override, cos={:.2}, L{})",
+                        entry.target_token, cosine, pl
+                    );
+                    return PredictResult {
+                        predictions: vec![(label, 1.0)],
+                        knn_override: true,
+                        knn_cosine: Some(cosine),
+                    };
+                }
+            }
+        }
+
+        // Standard prediction: lm_head + softmax + top-k
         let h_out = last_h.expect("token_ids must be non-empty");
         let h_normed = self.apply_final_norm(&h_out);
         let logits = self.compute_logits(&h_normed, backend);
-
-        // Softmax → probabilities, take top_k. Numeric-stable max-subtract.
         let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut exps: Vec<f32> = logits.iter().map(|v| (v - max_l).exp()).collect();
         let sum: f32 = exps.iter().sum();
         if sum > 0.0 { for e in &mut exps { *e /= sum; } }
-
         let mut indexed: Vec<(usize, f32)> = exps.iter().enumerate()
             .map(|(i, &p)| (i, p)).collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         indexed.truncate(top_k);
-        indexed.into_iter().map(|(tid, p)| {
+        let predictions = indexed.into_iter().map(|(tid, p)| {
             let tok = tokenizer.decode(&[tid as u32], true).unwrap_or_default();
             (tok, p)
-        }).collect()
+        }).collect();
+        PredictResult { predictions, knn_override: false, knn_cosine: None }
     }
+
+    /// Run the prompt through decode and capture the residual at `probe_layer`
+    /// AT THE LAST TOKEN POSITION, with the same pre-FFN normalization that
+    /// KNN queries use. Returns the f32 vector ready for `KnnStore::add`.
+    ///
+    /// Used by `/v1/insert mode=knn` to record the "fact key" for a prompt.
+    pub fn capture_residual_at_layer(
+        &self,
+        token_ids: &[u32],
+        probe_layer: usize,
+        backend: &dyn ComputeBackend,
+    ) -> Option<Vec<f32>> {
+        let layers = self.build_layers();
+        let cfg = self.arch.config();
+        let max_inter = cfg.intermediate_size;
+        let max_q_dim: usize = (0..cfg.num_layers)
+            .map(|l| self.arch.num_q_heads_for_layer(l) * self.arch.head_dim_for_layer(l))
+            .max().unwrap_or(0);
+        let max_kv_dim: usize = (0..cfg.num_layers)
+            .map(|l| self.arch.num_kv_heads_for_layer(l) * self.arch.head_dim_for_layer(l))
+            .max().unwrap_or(0);
+
+        let last_idx = token_ids.len().saturating_sub(1);
+        let mut last_probe: Option<Vec<f32>> = None;
+        for (i, &tid) in token_ids.iter().enumerate() {
+            let x = self.embed_row(tid);
+            let probe_for = if i == last_idx { Some(probe_layer) } else { None };
+            let (_h, probe) = backend.decode_token_with_probe(
+                &layers, &x, self.hidden(), max_inter, max_q_dim, max_kv_dim,
+                cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim,
+                self.arch.rope_base_for_layer(0) as f32,
+                probe_for,
+            )?;
+            if i == last_idx { last_probe = probe; }
+        }
+        last_probe.map(|raw| self.apply_pre_ffn_norm_for_layer(&raw, probe_layer))
+    }
+
+    /// Convenience wrapper: same as `predict_top_k_with_knn` with no KNN store.
+    pub fn predict_top_k(
+        &self,
+        token_ids: &[u32],
+        top_k: usize,
+        backend: &dyn ComputeBackend,
+        tokenizer: &tokenizers::Tokenizer,
+    ) -> Vec<(String, f32)> {
+        self.predict_top_k_with_knn(token_ids, top_k, backend, tokenizer, None).predictions
+    }
+}
+
+/// Output of `predict_top_k_with_knn`: top predictions plus KNN-override
+/// signal so the caller can surface `knn_override:true` in the response.
+#[derive(Debug, Clone)]
+pub struct PredictResult {
+    pub predictions: Vec<(String, f32)>,
+    pub knn_override: bool,
+    pub knn_cosine: Option<f32>,
 }
 
 fn lookup_norm_vec<'a>(vectors: &'a HashMap<String, Vec<f32>>, key: &str) -> &'a [f32] {

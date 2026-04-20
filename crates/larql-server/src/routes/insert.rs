@@ -195,14 +195,18 @@ fn run_insert_knn(
     session_id: Option<&str>,
     start: std::time::Instant,
 ) -> Result<serde_json::Value, ServerError> {
-    if !model.config.has_model_weights {
+    let has_gguf = model.gguf.is_some();
+    if !has_gguf && !model.config.has_model_weights {
         return Err(ServerError::InferenceUnavailable(
-            "KNN insert requires model weights".into(),
+            "KNN insert requires model weights or weights.gguf".into(),
         ));
     }
-    let weights = model
-        .get_or_load_weights()
-        .map_err(ServerError::InferenceUnavailable)?;
+    // Vindex weights only loaded if we'll need them (no GGUF source available).
+    let weights_opt = if has_gguf {
+        None
+    } else {
+        Some(model.get_or_load_weights().map_err(ServerError::InferenceUnavailable)?)
+    };
 
     // Default install layer matches LQL and bench_interactive:
     //   num_layers - 8 (L26 for Gemma 3 4B).
@@ -228,7 +232,8 @@ fn run_insert_knn(
         .map_err(|e| ServerError::Internal(format!("tokenize target: {e}")))?;
     let target_id: u32 = tgt_enc.get_ids().first().copied().unwrap_or(0);
 
-    // Capture residual(s) using the SAME GPU path as chat inference.
+    // Capture residual(s). Use GGUF pipeline when available (matches the
+    // GGUF infer path exactly); fall back to vindex Q4_K GPU capture.
     let (query_key, value_vec) = {
         let backend = model.get_or_init_backend();
         let _guard = match model.inference_lock.lock() {
@@ -236,38 +241,38 @@ fn run_insert_knn(
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        let patched = model.patched.blocking_read();
-
-        // When value_layer is set, use capture_knn_key_perlayer which runs
-        // the EXACT same per-layer path as inference (Q6_K attention + CPU
-        // softmax + GPU FFN). Without value_layer, use the fast GPU path.
-        let _use_perlayer = req.value_layer.is_some();
-
-        let walk_ffn_cap = if model.walk_only {
-            Some(larql_inference::WalkFfn::new_with_backend(
-                weights, patched.base(), 1024, &**backend,
-            ))
-        } else { None };
-        let _ffn_ov: Option<&dyn larql_inference::ffn::FfnBackend> =
-            walk_ffn_cap.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
-
-        // Always use the Q4_K GPU path for key capture. This matches the
-        // inference path exactly (same quantization, same KV cache) and
-        // allows dropping f32 attention weights (-2.1 GB heap).
-        backend.reset_kv_cache();
-        let qk = larql_inference::capture_knn_key_gpu(
-            weights, &token_ids, install_layer, patched.base(), &**backend,
-        );
-
-        let vv = if let Some(vl) = req.value_layer {
+        if let Some(gguf) = model.gguf.as_ref() {
             backend.reset_kv_cache();
-            larql_inference::capture_knn_key_gpu(
-                weights, &token_ids, vl, patched.base(), &**backend,
-            )
-        } else { None };
-
-        backend.reset_kv_cache();
-        (qk, vv)
+            let qk = gguf.capture_residual_at_layer(&token_ids, install_layer, &**backend);
+            let vv = if let Some(vl) = req.value_layer {
+                backend.reset_kv_cache();
+                gguf.capture_residual_at_layer(&token_ids, vl, &**backend)
+            } else { None };
+            backend.reset_kv_cache();
+            (qk, vv)
+        } else {
+            let weights = weights_opt.unwrap();
+            let patched = model.patched.blocking_read();
+            let walk_ffn_cap = if model.walk_only {
+                Some(larql_inference::WalkFfn::new_with_backend(
+                    weights, patched.base(), 1024, &**backend,
+                ))
+            } else { None };
+            let _ffn_ov: Option<&dyn larql_inference::ffn::FfnBackend> =
+                walk_ffn_cap.as_ref().map(|w| w as &dyn larql_inference::ffn::FfnBackend);
+            backend.reset_kv_cache();
+            let qk = larql_inference::capture_knn_key_gpu(
+                weights, &token_ids, install_layer, patched.base(), &**backend,
+            );
+            let vv = if let Some(vl) = req.value_layer {
+                backend.reset_kv_cache();
+                larql_inference::capture_knn_key_gpu(
+                    weights, &token_ids, vl, patched.base(), &**backend,
+                )
+            } else { None };
+            backend.reset_kv_cache();
+            (qk, vv)
+        }
     };
     let query_key = query_key.ok_or_else(|| ServerError::Internal(
         "query residual capture failed".into(),

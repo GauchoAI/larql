@@ -84,9 +84,11 @@ pub struct VectorIndex {
     pub(crate) interleaved_mmap: Option<Arc<memmap2::Mmap>>,
     /// Q4_0 quantized interleaved FFN data (7x smaller, dequant on read).
     pub(crate) interleaved_q4_mmap: Option<Arc<memmap2::Mmap>>,
-    /// Q4_K/Q6_K quantized interleaved FFN data (Ollama-compatible, matches attn format).
-    /// Historical: this file is actually Q6_K data despite the name —
-    /// `build_q4k_weights.rs` uses quantize_q6_k for FFN matrices.
+    /// LEGACY Q6_K interleaved FFN data, mis-named `interleaved_q4k.bin`
+    /// for historical reasons. cos = 0.84/layer accumulates to garbage
+    /// over 34 layers. Prefer `interleaved_q4k_real_mmap` (true Q4_K) or
+    /// — better — drop a `weights.gguf` into the vindex dir and let the
+    /// GGUF pipeline supply FFN weights instead.
     pub(crate) interleaved_q4k_mmap: Option<Arc<memmap2::Mmap>>,
     /// True Q4_K interleaved FFN data (148-byte Ollama Q4_K blocks, matching
     /// the `q4k_matvec` Metal shader). File: `interleaved_q4k_real.bin`.

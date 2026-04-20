@@ -98,11 +98,11 @@ struct Cli {
     #[arg(long)]
     no_warmup: bool,
 
-    /// Walk-only mode: drop FFN weights after load (~10.7 GB reclaimed) and
-    /// route `/v1/infer mode=fast` through the sparse Q4_0 walk over the
-    /// vindex instead of dense Metal matmul. RSS drops from ~18 GB to ~11 GB
-    /// at the cost of ~2× slower decode. Requires `interleaved_q4.bin` in
-    /// the vindex (generate via `build_interleaved_q4` example).
+    /// DEPRECATED: prefer dropping a `weights.gguf` into the vindex dir.
+    /// Walk-only drops FFN weights and routes `/v1/infer mode=fast` through
+    /// a sparse Q4_0 walk: ~11 GB RSS, ~2× slower decode. The GGUF path
+    /// achieves ~5 GB RSS at full speed (see findings.md 2026-04-19/20).
+    /// Kept for vindexes that lack a GGUF and still have `interleaved_q4.bin`.
     #[arg(long)]
     walk_only: bool,
 }
@@ -194,6 +194,10 @@ fn load_single_vindex(path_str: &str, no_infer: bool, walk_only: bool) -> Result
                 Ok(g) => {
                     info!("  GGUF: loaded weights.gguf ({} layers, vocab={})",
                         g.num_layers(), g.lm_head_vocab);
+                    if walk_only {
+                        info!("  NOTE: --walk-only is redundant when weights.gguf is present \
+                              (GGUF achieves smaller RSS at full decode speed)");
+                    }
                     Some(Arc::new(g))
                 }
                 Err(e) => {

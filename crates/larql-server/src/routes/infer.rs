@@ -36,13 +36,16 @@ fn run_infer(
     req: &InferRequest,
     session_id: Option<&str>,
 ) -> Result<serde_json::Value, ServerError> {
-    if model.infer_disabled {
+    let has_gguf = model.gguf.is_some();
+    if model.infer_disabled && !has_gguf {
         return Err(ServerError::InferenceUnavailable(
             "inference disabled (--no-infer)".into(),
         ));
     }
 
-    if !model.config.has_model_weights
+    // GGUF source supplies its own weights — skip the vindex check.
+    if !has_gguf
+        && !model.config.has_model_weights
         && model.config.extract_level != larql_vindex::ExtractLevel::Inference
         && model.config.extract_level != larql_vindex::ExtractLevel::All
     {
@@ -50,10 +53,6 @@ fn run_infer(
             "vindex does not contain model weights. Rebuild with --include-weights".into(),
         ));
     }
-
-    let weights = model
-        .get_or_load_weights()
-        .map_err(ServerError::InferenceUnavailable)?;
 
     let encoding = model
         .tokenizer
@@ -74,6 +73,42 @@ fn run_infer(
 
     let mut result = serde_json::Map::new();
     result.insert("prompt".into(), serde_json::json!(req.prompt));
+
+    // Fast path with GGUF weight source — bypasses vindex weight loading.
+    // The GGUF pipeline holds attention/FFN weights mmap'd from disk; we
+    // still hold the inference lock to serialize KV cache use.
+    if use_fast {
+        if let Some(gguf) = model.gguf.as_ref() {
+            let backend = model.get_or_init_backend();
+            let _guard = match model.inference_lock.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            backend.reset_kv_cache();
+            let fast_start = std::time::Instant::now();
+            let preds = gguf.predict_top_k(&token_ids, req.top, &**backend, &model.tokenizer);
+            let fast_ms = fast_start.elapsed().as_secs_f64() * 1000.0;
+
+            let predictions: Vec<serde_json::Value> = preds.iter().map(|(tok, prob)| {
+                serde_json::json!({
+                    "token": tok,
+                    "probability": (*prob * 10000.0).round() / 10000.0,
+                })
+            }).collect();
+            result.insert("predictions".into(), serde_json::json!(predictions));
+            result.insert("mode".into(), serde_json::json!("fast"));
+            result.insert("source".into(), serde_json::json!("gguf"));
+            result.insert("fast_ms".into(), serde_json::json!((fast_ms * 10.0).round() / 10.0));
+            result.insert("knn_override".into(), serde_json::json!(false));
+            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+            result.insert("latency_ms".into(), serde_json::json!((latency_ms * 10.0).round() / 10.0));
+            return Ok(serde_json::Value::Object(result));
+        }
+    }
+
+    let weights = model
+        .get_or_load_weights()
+        .map_err(ServerError::InferenceUnavailable)?;
 
     if use_fast {
         // Fast path: Metal f32 forward + KNN overlay consult. Sub-second

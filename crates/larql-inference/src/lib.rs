@@ -5,6 +5,7 @@ pub mod capture;
 pub mod error;
 pub mod ffn;
 pub mod forward;
+pub mod gguf_pipeline;
 pub mod graph_ffn;
 pub mod layer_graph;
 pub mod model;

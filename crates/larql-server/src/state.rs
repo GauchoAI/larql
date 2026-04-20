@@ -45,6 +45,11 @@ pub struct LoadedModel {
     /// the fast-path `/v1/infer mode=fast` routes through `WalkFfn` instead
     /// of `WeightFfnGpu`. Set at server startup via `--walk-only`.
     pub walk_only: bool,
+    /// Optional GGUF weight source. When `weights.gguf` is present in the
+    /// vindex dir, `mode=fast` reads attention/FFN weights from this pipeline
+    /// instead of the (possibly stale) Q4_K binaries. The vindex still
+    /// supplies KNN store, embeddings (for KNN), tokenizer, and patches.
+    pub gguf: Option<Arc<larql_inference::gguf_pipeline::GgufPipeline>>,
 }
 
 impl LoadedModel {

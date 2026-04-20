@@ -185,6 +185,27 @@ fn load_single_vindex(path_str: &str, no_infer: bool, walk_only: bool) -> Result
         info!("  Infer: not available (no model weights in vindex)");
     }
 
+    // Detect optional GGUF weight source. If present, fast-path inference
+    // reads weights from it instead of the (possibly stale) Q4_K binaries.
+    let gguf = {
+        let p = path.join("weights.gguf");
+        if p.exists() {
+            match larql_inference::gguf_pipeline::GgufPipeline::open(&p) {
+                Ok(g) => {
+                    info!("  GGUF: loaded weights.gguf ({} layers, vocab={})",
+                        g.num_layers(), g.lm_head_vocab);
+                    Some(Arc::new(g))
+                }
+                Err(e) => {
+                    info!("  GGUF: failed to load weights.gguf: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     Ok(LoadedModel {
         id,
         path,
@@ -199,6 +220,7 @@ fn load_single_vindex(path_str: &str, no_infer: bool, walk_only: bool) -> Result
         inference_lock: std::sync::Mutex::new(()),
         probe_labels,
         walk_only,
+        gguf,
     })
 }
 

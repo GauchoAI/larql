@@ -270,12 +270,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for &tid in token_ids.iter() {
         let x = embed_row(embed_bytes, tid, hidden, embed_transposed, embed_type,
             embed_bytes_per_row, embed_vocab, embed_scale);
+        let x_nan = x.iter().filter(|v| v.is_nan()).count();
+        let x_max = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        eprintln!("[embed tok={tid}] nan={x_nan} max={x_max:.4} [0..3]={:.4?}",
+            &x[..3.min(x.len())]);
 
         let h = backend.decode_token(
             &layers, &x, hidden, max_inter, max_q_dim, max_kv_dim,
             cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim,
             arch.rope_base_for_layer(0) as f32,
         ).expect("decode_token failed");
+        let h_nan = h.iter().filter(|v| v.is_nan()).count();
+        let h_max = h.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        eprintln!("[decode tok={tid}] nan={h_nan} max={h_max:.4} [0..3]={:.4?}",
+            &h[..3.min(h.len())]);
         last_h = Some(h);
     }
     let prefill_ms = t_prefill2.elapsed().as_secs_f64() * 1000.0;

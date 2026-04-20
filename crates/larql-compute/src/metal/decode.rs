@@ -253,7 +253,7 @@ impl MetalBackend {
                 }
 
                 let all_same_format = layer.wq.format == layer.wk.format && layer.wk.format == layer.wv.format;
-                if all_same_format && layer.wq.format != crate::QuantFormat::Q6_K {
+                if all_same_format && layer.wq.format != crate::QuantFormat::Q6_K && layer.wq.format != crate::QuantFormat::Q8_0Gguf {
                     let total_rows = (q_dim + kv_dim + kv_dim) as u32;
                     let q_rows_val = q_dim as u32;
                     let k_rows_val = kv_dim as u32;
@@ -596,7 +596,8 @@ impl MetalBackend {
             // ── Step 5: Residual + norm (format-aware: Q4_K skips Q8 quantize) ──
             let ffn_uses_q4k = layer.gate.format == crate::QuantFormat::Q4_K
                 || layer.gate.format == crate::QuantFormat::Q4_KF
-                || layer.gate.format == crate::QuantFormat::Q6_K;
+                || layer.gate.format == crate::QuantFormat::Q6_K
+                || layer.gate.format == crate::QuantFormat::Q8_0Gguf;
             // ffn_norm_out pre-allocated above
 
             let has_post_norms = layer.has_post_norms;
@@ -710,8 +711,80 @@ impl MetalBackend {
             // ── Step 6: FFN (format-aware: Q4_KF uses llama.cpp kernel, Q4_K uses our kernel, Q4_0 uses Q8) ──
             {
                 let ffn_is_q4kf = layer.gate.format == crate::QuantFormat::Q4_KF;
+                let ffn_is_q8_gguf = layer.gate.format == crate::QuantFormat::Q8_0Gguf;
 
-                if ffn_is_q4kf {
+                if ffn_is_q8_gguf {
+                    // Q8_0Gguf FFN: f32 input → q8_0_gguf matvec for gate/up/down.
+                    use crate::metal::shaders::q8_0_gguf_matvec as q8gm;
+                    let n_tgs_inter = (inter as u64).div_ceil(q8gm::ROWS_PER_TG);
+                    let n_tgs_hidden = (hidden as u64).div_ceil(q8gm::ROWS_PER_TG);
+
+                    if layer.is_gated() {
+                        let gate_out = &gate_out_scratch;
+                        // Gate
+                        enc.set_compute_pipeline_state(&self.q8_0_gguf_matvec_pipeline);
+                        enc.set_buffer(0, Some(&gate_bufs[l]), 0);
+                        enc.set_buffer(1, Some(&ffn_norm_out), 0);
+                        enc.set_buffer(2, Some(&gate_out), 0);
+                        enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                        enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_inter, 1, 1), MTLSize::new(q8gm::THREADS_PER_TG, 1, 1));
+                        // Up
+                        enc.set_compute_pipeline_state(&self.q8_0_gguf_matvec_pipeline);
+                        enc.set_buffer(0, Some(&up_bufs[l]), 0);
+                        enc.set_buffer(1, Some(&ffn_norm_out), 0);
+                        enc.set_buffer(2, Some(&up_out), 0);
+                        enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                        enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_inter, 1, 1), MTLSize::new(q8gm::THREADS_PER_TG, 1, 1));
+                        // GEGLU
+                        let geglu = match layer.activation {
+                            crate::Activation::GeluTanh => &self.geglu_gelu_tanh_pipeline,
+                            _ => &self.geglu_pipeline,
+                        };
+                        enc.set_compute_pipeline_state(geglu);
+                        enc.set_buffer(0, Some(&gate_out), 0);
+                        enc.set_buffer(1, Some(&up_out), 0);
+                        enc.set_buffer(2, Some(&act_buf), 0);
+                        enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                        enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
+                        // Down
+                        enc.set_compute_pipeline_state(&self.q8_0_gguf_matvec_pipeline);
+                        enc.set_buffer(0, Some(&down_bufs[l]), 0);
+                        enc.set_buffer(1, Some(&act_buf), 0);
+                        enc.set_buffer(2, Some(&down_out), 0);
+                        enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                        enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_hidden, 1, 1), MTLSize::new(q8gm::THREADS_PER_TG, 1, 1));
+                    } else {
+                        // Up
+                        enc.set_compute_pipeline_state(&self.q8_0_gguf_matvec_pipeline);
+                        enc.set_buffer(0, Some(&up_bufs[l]), 0);
+                        enc.set_buffer(1, Some(&ffn_norm_out), 0);
+                        enc.set_buffer(2, Some(&up_out), 0);
+                        enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                        enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_inter, 1, 1), MTLSize::new(q8gm::THREADS_PER_TG, 1, 1));
+                        // Activation
+                        let activation_pipeline = match layer.activation {
+                            crate::Activation::GeluTanh => &self.gelu_tanh_pipeline,
+                            _ => &self.silu_pipeline,
+                        };
+                        enc.set_compute_pipeline_state(activation_pipeline);
+                        enc.set_buffer(0, Some(&up_out), 0);
+                        enc.set_buffer(1, Some(&act_buf), 0);
+                        enc.set_bytes(2, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                        enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
+                        // Down
+                        enc.set_compute_pipeline_state(&self.q8_0_gguf_matvec_pipeline);
+                        enc.set_buffer(0, Some(&down_bufs[l]), 0);
+                        enc.set_buffer(1, Some(&act_buf), 0);
+                        enc.set_buffer(2, Some(&down_out), 0);
+                        enc.set_bytes(3, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                        enc.set_bytes(4, 4, &inter_val as *const u32 as *const std::ffi::c_void);
+                        enc.dispatch_thread_groups(MTLSize::new(n_tgs_hidden, 1, 1), MTLSize::new(q8gm::THREADS_PER_TG, 1, 1));
+                    }
+                } else if ffn_is_q4kf {
                     // Q4_KF (GGUF) FFN path: llama.cpp-exact kernel
                     use crate::metal::shaders::q4kf_qkv_proj as q4kf;
                     use crate::metal::shaders::q4kf_ffn_gate_up as q4kf_gu;
@@ -1302,7 +1375,7 @@ impl MetalBackend {
                     }
 
                     let all_same_format_inner = layer.wq.format == layer.wk.format && layer.wk.format == layer.wv.format;
-                    if all_same_format_inner && layer.wq.format != crate::QuantFormat::Q6_K {
+                    if all_same_format_inner && layer.wq.format != crate::QuantFormat::Q6_K && layer.wq.format != crate::QuantFormat::Q8_0Gguf {
                         let total_rows = (q_dim + kv_dim + kv_dim) as u32;
                         let q_rows_val = q_dim as u32;
                         let k_rows_val = kv_dim as u32;

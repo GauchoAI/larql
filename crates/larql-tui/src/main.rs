@@ -853,6 +853,57 @@ fn next_pending_step(state: &AppState) -> Option<String> {
     None
 }
 
+/// True when the last assistant message, after stripping meta
+/// blocks, has nothing the user can see.  Used by the fallback
+/// summariser as the "rescue" trigger.
+fn last_assistant_is_hidden(state: &AppState) -> bool {
+    let last = state.messages.iter().rev().find_map(|m| {
+        if let Message::Assistant(t) = m { (!t.is_empty()).then_some(t.as_str()) } else { None }
+    });
+    match last {
+        Some(t) => strip_meta_blocks(t).trim().is_empty(),
+        None => false,
+    }
+}
+
+/// Collect the latest tool invocations + their one-line outcomes so
+/// the auto-continue wrap-up prompt has concrete material to
+/// summarise, and the fallback synthesiser has something to show.
+/// Walks backward until it hits a User message (current turn only).
+fn tool_results_recap(state: &AppState) -> String {
+    let mut pairs: Vec<(String, String)> = Vec::new(); // (tool, first-line of result)
+    let mut pending_tool: Option<String> = None;
+    for m in state.messages.iter().rev() {
+        match m {
+            Message::User(_) => break,
+            Message::ToolResult { summary } => {
+                // First non-empty, non-italic line is the concrete output.
+                let head = summary
+                    .lines()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty() && !l.starts_with('*'))
+                    .unwrap_or("")
+                    .to_string();
+                pending_tool = Some(head);
+            }
+            Message::ToolUse { tool, detail } => {
+                let outcome = pending_tool.take().unwrap_or_else(|| "(no output)".into());
+                pairs.push((format!("{tool} {detail}").trim().to_string(), outcome));
+            }
+            _ => {}
+        }
+    }
+    pairs.reverse();
+    if pairs.is_empty() {
+        return String::new();
+    }
+    pairs
+        .into_iter()
+        .map(|(cmd, out)| format!("- `{cmd}` → {out}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn ingest_facts_to_knn(
     server_url: &str,
     prompt_for_capture: &str,
@@ -2521,11 +2572,20 @@ async fn main() -> io::Result<()> {
                                     )
                                 }
                                 ContinueReason::NoVisibleResponse => {
-                                    "auto-continue: your last reply was only \
-                                     meta-blocks (```fact```/```status```) which \
-                                     are hidden from the user.  Now write a \
-                                     short prose message summarising what you \
-                                     accomplished and the result the user wanted.".to_string()
+                                    // Include the concrete tool results so the
+                                    // model has something to summarise.  Then
+                                    // forbid any meta-block so the reply can't
+                                    // come back hidden again.
+                                    let recap = tool_results_recap(&state);
+                                    format!(
+                                        "auto-continue: the task is done.  Final results:\n\
+                                         {recap}\n\n\
+                                         Now write ONE or TWO sentences in plain English \
+                                         for the user, describing what you did and the \
+                                         result.  DO NOT emit any ```fact```, ```status```, \
+                                         ```plan```, or ```tool``` blocks — they are \
+                                         hidden from the user.  Plain prose only."
+                                    )
                                 }
                             };
                             state.messages.push(Message::HiddenSystem(prompt));
@@ -2533,6 +2593,27 @@ async fn main() -> io::Result<()> {
                             let chat_msgs = build_chat_messages_with_system(&state);
                             spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone(), state.session_id.clone());
                         } else {
+                            // No more auto-continues allowed AND the last
+                            // reply may still be all-meta (user saw
+                            // nothing).  Synthesise a minimal summary
+                            // from tool results as a last-resort so the
+                            // turn doesn't end in silence.
+                            if last_assistant_is_hidden(&state) {
+                                let recap = tool_results_recap(&state);
+                                if !recap.trim().is_empty() {
+                                    // Replace the empty/meta-only reply
+                                    // with a visible synthesized summary.
+                                    if let Some(Message::Assistant(t)) = state.messages.last_mut() {
+                                        *t = format!(
+                                            "Done. Here's what happened:\n\n{recap}"
+                                        );
+                                    } else {
+                                        state.messages.push(Message::Assistant(format!(
+                                            "Done. Here's what happened:\n\n{recap}"
+                                        )));
+                                    }
+                                }
+                            }
                             state.is_generating = false;
                             tool_depth = 0;
                             continue_depth = 0;

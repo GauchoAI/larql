@@ -791,53 +791,6 @@ struct ExtractedFact {
     value: String,
 }
 
-/// Filter out "facts" that are really operational notes about a tool
-/// run, plan progress, or task instructions.  Those are useful for
-/// the human reading the chat but they MUST NOT be inserted into
-/// the L26 KNN store — once there they will fire as overrides on
-/// any vague follow-up prompt ("did it work?", "lets try again")
-/// because L26 residual structure for instructional text is too
-/// generic.  Real facts ("user's name is Miguel", "server runs on
-/// port 3000") are short, declarative, and free of operational
-/// vocabulary; those still get stored.
-fn is_storeable_fact(key: &str, value: &str) -> bool {
-    let combined = format!("{} {}", key, value).to_lowercase();
-    // Operational / tool-result vocabulary that should not become
-    // a recallable factoid.
-    const BLOCKLIST: &[&str] = &[
-        "to run it",
-        "to execute",
-        "you need to run",
-        "you need to execute",
-        "successfully created",
-        "successfully executed",
-        "successfully ran",
-        "the script",
-        "the command",
-        "the file was created",
-        "the file has been",
-        "tool result",
-        "exit code",
-        "syntaxerror",
-        "filenotfounderror",
-        "demo failure",
-        "demo success",
-        "demo result",
-    ];
-    for needle in BLOCKLIST {
-        if combined.contains(needle) {
-            return false;
-        }
-    }
-    // Long values are usually narrative ("the script created…
-    // calculates… you need to run…"), not facts.  Real facts are
-    // short and lookup-shaped.
-    if value.len() > 240 {
-        return false;
-    }
-    true
-}
-
 fn extract_facts(text: &str) -> Vec<ExtractedFact> {
     let mut out = Vec::new();
     let mut cursor = 0;
@@ -858,7 +811,7 @@ fn extract_facts(text: &str) -> Vec<ExtractedFact> {
                 value = v.trim().to_string();
             }
         }
-        if !key.is_empty() && !value.is_empty() && is_storeable_fact(&key, &value) {
+        if !key.is_empty() && !value.is_empty() {
             out.push(ExtractedFact { key, value });
         }
         cursor = body_start + close + 3;
@@ -2622,41 +2575,6 @@ mod layout_tests {
         assert_eq!(compute_layout(&s, rect(67)), LayoutMode::Tabs);
         // At 100 we should be side-by-side.
         assert!(matches!(compute_layout(&s, rect(100)), LayoutMode::SideBySide { .. }));
-    }
-}
-
-#[cfg(test)]
-mod fact_filter_tests {
-    use super::is_storeable_fact;
-
-    #[test]
-    fn keeps_real_facts() {
-        assert!(is_storeable_fact("preferred language", "User prefers Python for scripting"));
-        assert!(is_storeable_fact("server port", "The server runs on port 3000"));
-        assert!(is_storeable_fact("user name", "Miguel"));
-    }
-
-    #[test]
-    fn rejects_tool_run_narratives() {
-        // The exact pattern that polluted KNN this session.
-        assert!(!is_storeable_fact(
-            "sieve of eratosthenes demo final result",
-            "The script successfully created a Python file on your Desktop that calculates and prints a list of prime numbers up to 20. To execute the script and see the output, you need to run the command run python3 /path/to/file.py."
-        ));
-        assert!(!is_storeable_fact(
-            "fibonacci demo failure",
-            "The script creation and execution failed due to a FileNotFoundError."
-        ));
-        assert!(!is_storeable_fact(
-            "fibonacci demo success",
-            "The 10th Fibonacci number is 55."
-        ));
-    }
-
-    #[test]
-    fn rejects_overly_long_narratives() {
-        let long = "x".repeat(500);
-        assert!(!is_storeable_fact("note", &long));
     }
 }
 

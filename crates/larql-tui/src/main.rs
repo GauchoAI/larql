@@ -945,12 +945,49 @@ fn strip_meta_blocks(text: &str) -> String {
     cleaned.trim_end_matches('\n').to_string()
 }
 
+/// Find the body of a fenced code block tagged ```<lang>.  Walks
+/// line by line and tracks fence depth so a NESTED ``` inside the
+/// block (e.g. a ```terminal subblock inside a ```summary) doesn't
+/// silently close the outer fence — that bug previously truncated
+/// the run-skill summary at "(no output)" and the model never
+/// received the hint about how to actually run the file.
 fn extract_block(text: &str, lang: &str) -> Option<String> {
-    let open = format!("```{lang}");
-    let start = text.find(&open)?;
-    let after = &text[start + open.len()..];
-    let close = after.find("```")?;
-    Some(after[..close].trim().to_string())
+    let open_tag = format!("```{lang}");
+    let start = text.find(&open_tag)?;
+    // Skip past the opening fence header line.
+    let after_tag = &text[start + open_tag.len()..];
+    let nl = after_tag.find('\n')?;
+    let body_start = start + open_tag.len() + nl + 1;
+    // Walk line by line; ``` opens or closes a level.  Start at
+    // depth 1 (we're inside the outer block).  When depth returns
+    // to 0 the matching close is found.
+    let mut depth: usize = 1;
+    let mut idx = body_start;
+    let bytes = text.as_bytes();
+    while idx < bytes.len() {
+        let line_end = text[idx..]
+            .find('\n')
+            .map(|p| idx + p)
+            .unwrap_or(bytes.len());
+        let line = text[idx..line_end].trim_start();
+        if line.starts_with("```") {
+            // Pure ``` (possibly trailing whitespace) closes; ```<tag>
+            // opens a sub-block.
+            let after = &line[3..].trim();
+            if after.is_empty() {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[body_start..idx].trim_end().to_string());
+                }
+            } else {
+                depth += 1;
+            }
+        }
+        idx = line_end + 1;
+    }
+    // Unclosed — return whatever we have rather than None so the
+    // caller still surfaces something to the user.
+    Some(text[body_start..].trim_end().to_string())
 }
 
 // ── Drawing ──────────────────────────────────────────────────────────────
@@ -2538,6 +2575,42 @@ mod layout_tests {
         assert_eq!(compute_layout(&s, rect(67)), LayoutMode::Tabs);
         // At 100 we should be side-by-side.
         assert!(matches!(compute_layout(&s, rect(100)), LayoutMode::SideBySide { .. }));
+    }
+}
+
+#[cfg(test)]
+mod extract_block_tests {
+    use super::extract_block;
+
+    #[test]
+    fn extracts_simple() {
+        let s = "```summary\nhello world\n```";
+        assert_eq!(extract_block(s, "summary").as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn handles_nested_fence_without_truncating() {
+        // The bug we're regression-testing: a ```terminal block nested
+        // inside ```summary used to close the outer fence at the inner
+        // opener, dropping everything after.
+        let s = "```summary\nhello\n\n```terminal\nfoo\nbar\n```\n```";
+        let body = extract_block(s, "summary").expect("extracted");
+        assert!(body.contains("hello"));
+        assert!(body.contains("foo"));
+        assert!(body.contains("bar"));
+    }
+
+    #[test]
+    fn returns_none_when_tag_missing() {
+        assert!(extract_block("no fence here", "summary").is_none());
+    }
+
+    #[test]
+    fn handles_unclosed_block_gracefully() {
+        // Should not panic; should return whatever body we have.
+        let s = "```summary\nstreaming…";
+        let body = extract_block(s, "summary").expect("partial body");
+        assert!(body.contains("streaming"));
     }
 }
 

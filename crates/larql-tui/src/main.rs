@@ -2266,6 +2266,18 @@ fn build_chat_messages_with_system(state: &AppState) -> Vec<ChatMsg> {
 
     let mut system_msgs: Vec<ChatMsg> = Vec::new();
 
+    // Language-mirror instruction up front — without it, a 5-char
+    // "Hola!" gets outvoted by the rest of the English system
+    // context and Gemma replies in English anyway.  Putting this
+    // FIRST gives it top priority.
+    system_msgs.push(ChatMsg {
+        role: "system".into(),
+        content: "Respond in the same natural language the user wrote in for their \
+                  most recent message.  If they wrote in Spanish, reply in Spanish.  \
+                  If in Portuguese, reply in Portuguese.  Do not let these English \
+                  instructions bias the language of your reply.".into(),
+    });
+
     // Inject the cached session summary (if any) BEFORE the skill
     // primer so the model sees long-conversation context that has
     // since aged out of the byte-budget tail.

@@ -82,6 +82,11 @@ struct AppState {
     sidebar_visible: bool,
     /// In tabbed layout (narrow terminal), which view is foregrounded.
     active_tab: ActiveTab,
+    /// Whether the terminal is currently capturing mouse events (for
+    /// our scroll-wheel scroll).  When true, native text selection is
+    /// disabled — Ctrl-T toggles it off so the user can drag to copy,
+    /// then back on.
+    mouse_captured: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,6 +129,7 @@ impl AppState {
             workflows: WorkflowStore::load(&workflows_path()),
             sidebar_visible: true,
             active_tab: ActiveTab::Chat,
+            mouse_captured: true,
         }
     }
 
@@ -1549,14 +1555,19 @@ fn draw_input(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_status(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
-    let toggle = if state.workflows.workflows.is_empty() {
+    let plans_hint = if state.workflows.workflows.is_empty() {
         ""
     } else if state.sidebar_visible {
         "  ·  Ctrl-B: hide plans"
     } else {
         "  ·  Ctrl-B: show plans"
     };
-    let status = format!(" {}{}  ", state.status, toggle);
+    let mouse_hint = if state.mouse_captured {
+        "  ·  Ctrl-T: copy mode"
+    } else {
+        "  ·  Ctrl-T: scroll mode"
+    };
+    let status = format!(" {}{}{}  ", state.status, plans_hint, mouse_hint);
     let para = Paragraph::new(Line::from(Span::styled(
         status, Style::default().fg(Color::White).bg(Color::DarkGray),
     )));
@@ -2399,6 +2410,21 @@ async fn main() -> io::Result<()> {
                 match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Toggle mouse capture so the user can drop
+                        // out of "scroll-wheel" mode and natively
+                        // select text to copy.  When captured, the
+                        // app eats every mouse event including drags.
+                        state.mouse_captured = !state.mouse_captured;
+                        if state.mouse_captured {
+                            let _ = execute!(io::stdout(), EnableMouseCapture);
+                            state.status = "mouse capture ON (scroll wheel works)".into();
+                        } else {
+                            let _ = execute!(io::stdout(), DisableMouseCapture);
+                            state.status = "mouse capture OFF — drag to select text".into();
+                        }
+                        draw(&mut terminal, &state);
+                    }
                     KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         state.sidebar_visible = !state.sidebar_visible;
                         // If the user re-shows the sidebar in narrow

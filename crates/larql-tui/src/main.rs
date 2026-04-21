@@ -2255,8 +2255,15 @@ async fn main() -> io::Result<()> {
                         maybe_spawn_summarizer(&state.server_url, sid, turn_count);
                     }
 
-                    // Only execute tools on first response, not follow-ups
-                    if tool_depth == 0 {
+                    // Allow a small chain of tool calls per user turn:
+                    // model emits tool → result → follow-up → maybe
+                    // another tool → result → ... up to MAX_TOOL_DEPTH.
+                    // Without this the agent would emit the hint's
+                    // suggested follow-up tool but we'd refuse to run
+                    // it, leaving the user with no output.  Headless
+                    // already does this; bring interactive in line.
+                    const INTERACTIVE_MAX_TOOL_DEPTH: usize = 4;
+                    if tool_depth < INTERACTIVE_MAX_TOOL_DEPTH {
                         let sid = state.session_id.clone();
                         let server_url_cl = state.server_url.clone();
                         // Pre-render the "⚡ tool" marker BEFORE

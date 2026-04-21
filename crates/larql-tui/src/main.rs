@@ -2130,27 +2130,39 @@ async fn main() -> io::Result<()> {
         .unwrap_or_else(|_| "http://localhost:3000".into());
 
     // Session selection rules:
-    //   * default              → derive id from cwd; resume if it exists.
-    //   * --new-session        → derive id from cwd, but wipe any prior
-    //                            log so this run starts fresh.
-    //   * --session <id>       → use the explicit id, resume if exists.
-    //   * --session <id> --new-session → use explicit id but wipe first.
+    //   * default                  → derive id from cwd; resume if it exists.
+    //   * --new (alias --new-session) → derive id from cwd, but wipe any
+    //                                prior log AND clear the live KNN
+    //                                override store so this run starts
+    //                                with no inherited overrides.
+    //   * --session <id>           → use the explicit id, resume if exists.
+    //   * --session <id> --new     → use explicit id but wipe first.
     let args: Vec<String> = std::env::args().collect();
     let explicit_session = args
         .iter()
         .position(|a| a == "--session")
         .and_then(|i| args.get(i + 1))
         .cloned();
-    let new_session = args.iter().any(|a| a == "--new-session");
+    let new_session = args.iter().any(|a| a == "--new" || a == "--new-session");
     let headless = args.iter().any(|a| a == "--headless");
 
     let session_id = explicit_session.unwrap_or_else(default_session_id_from_cwd);
 
     if new_session {
-        // Best-effort wipe of the existing log so this conversation
-        // starts clean.  Non-fatal if it doesn't exist.
-        let _ = reqwest::Client::new()
+        // Best-effort wipe of the existing session log so this
+        // conversation starts clean.  Non-fatal if it doesn't exist.
+        let client = reqwest::Client::new();
+        let _ = client
             .delete(format!("{server_url}/v1/sessions/{session_id}"))
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await;
+        // Also clear the in-memory KNN override store so polluted
+        // entries from prior sessions don't intercept new prompts.
+        // This is server-wide (all sessions), which matches user
+        // intent for --new: a clean slate end-to-end.
+        let _ = client
+            .post(format!("{server_url}/v1/reset"))
             .timeout(std::time::Duration::from_secs(3))
             .send()
             .await;

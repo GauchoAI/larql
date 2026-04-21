@@ -22,7 +22,11 @@ fn trace(msg: &str) {
 }
 
 pub fn render_markdown(text: &str, theme: Theme) -> Vec<Line<'static>> {
-    trace(&format!("[render_markdown] input len={}, first 100 chars: {:?}", text.len(), &text[..text.len().min(100)]));
+    // Take first ~100 CHARACTERS (not bytes!) for the log — slicing
+    // by byte index panics when the cut lands inside a multi-byte
+    // UTF-8 sequence (e.g. the `·` separator in our tool summaries).
+    let preview: String = text.chars().take(100).collect();
+    trace(&format!("[render_markdown] input len={}, first 100 chars: {:?}", text.len(), preview));
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut i = 0;
     let raw_lines: Vec<&str> = text.lines().collect();

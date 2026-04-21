@@ -512,6 +512,137 @@ fn execute_skill_tool(
     }
 }
 
+/// Path of the on-disk session-summary cache for `session_id`.  The
+/// summary is generated in the background once the live session has
+/// drifted past a threshold and is read by build_chat_messages_with_system
+/// so long sessions don't develop amnesia when older turns are dropped
+/// to fit the context budget.
+fn session_summary_path(session_id: &str) -> std::path::PathBuf {
+    let safe: String = session_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+        .collect();
+    home_dir().join(".larql/sessions").join(format!("{safe}.summary"))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct SessionSummary {
+    /// Number of turns covered (so we know when it's stale).
+    pub turns_covered: usize,
+    /// Last turn ts covered (defines the boundary — newer turns aren't
+    /// part of the summary).
+    pub up_to_ts: u64,
+    /// 3-5 line natural-language summary of what was discussed.
+    pub text: String,
+}
+
+/// Read the cached summary for this session if any.
+fn load_session_summary(session_id: &str) -> Option<SessionSummary> {
+    let path = session_summary_path(session_id);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Spawn a background task that:
+///   1. Reads the full session JSONL via /v1/sessions/<id>.
+///   2. Asks /v1/chat/completions to summarise it in 3-5 bullets.
+///   3. Writes the result to ~/.larql/sessions/<id>.summary so the
+///      *next* chat call can use it as a synthetic system message.
+///
+/// Cheap to call repeatedly — short-circuits if the on-disk summary
+/// already covers a turns-count close to the live one.
+fn maybe_spawn_summarizer(server_url: &str, session_id: &str, current_turn_count: usize) {
+    const RESUMMARIZE_EVERY: usize = 8;  // re-summarise every 8 new turns
+    const MIN_TURNS: usize = 12;         // don't bother on short sessions
+    if current_turn_count < MIN_TURNS {
+        return;
+    }
+    let existing = load_session_summary(session_id);
+    if let Some(s) = &existing {
+        if current_turn_count.saturating_sub(s.turns_covered) < RESUMMARIZE_EVERY {
+            return;
+        }
+    }
+    let url_chat = format!("{server_url}/v1/chat/completions");
+    let url_sess = format!("{server_url}/v1/sessions/{session_id}");
+    let path = session_summary_path(session_id);
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));
+    let session_id_owned = session_id.to_string();
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_default();
+        let resp = match client.get(&url_sess).send().await {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let turns = match body["turns"].as_array() {
+            Some(t) => t,
+            None => return,
+        };
+        let mut transcript = String::new();
+        let mut max_ts = 0u64;
+        for t in turns {
+            let role = t["role"].as_str().unwrap_or("");
+            let content = t["content"].as_str().unwrap_or("");
+            if matches!(role, "user" | "assistant") && !content.is_empty() {
+                transcript.push_str(role);
+                transcript.push_str(": ");
+                transcript.push_str(&content.chars().take(800).collect::<String>());
+                transcript.push_str("\n\n");
+            }
+            if let Some(ts) = t["ts"].as_u64() { max_ts = max_ts.max(ts); }
+        }
+        if transcript.trim().is_empty() {
+            return;
+        }
+        let prompt = format!(
+            "Summarise the following chat history in 3-5 short bullet points capturing the key \
+             facts established (user identity, preferences, recurring topics, decisions, names, \
+             numbers).  Be terse — one bullet per fact.  Do not invent.  Reply with the bullets \
+             only, no preamble.\n\n{transcript}"
+        );
+        let body = serde_json::json!({
+            "messages": [{"role":"user", "content": prompt}],
+            "stream": true,
+            "max_tokens": 400,
+            "temperature": 0.0,
+        });
+        let resp = match client.post(&url_chat)
+            .header("content-type", "application/json")
+            .body(body.to_string()).send().await
+        { Ok(r) => r, Err(_) => return };
+        let bytes = match resp.bytes().await { Ok(b) => b, Err(_) => return };
+        let raw = String::from_utf8_lossy(&bytes).into_owned();
+        let mut text = String::new();
+        for line in raw.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" { break; }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+                        text.push_str(c);
+                    }
+                }
+            }
+        }
+        if text.trim().is_empty() { return; }
+        let summary = SessionSummary {
+            turns_covered: turns.len(),
+            up_to_ts: max_ts,
+            text: text.trim().to_string(),
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&summary) {
+            let _ = std::fs::write(&path, json);
+        }
+        let _ = session_id_owned;
+    });
+}
+
 /// Peek at an assistant response for a ```tool``` block without
 /// running anything.  Returns (name, detail) if found.  Used to
 /// render an immediate "⚡ tool (running…)" marker before
@@ -1226,6 +1357,19 @@ fn run_one_turn<'a>(
             .unwrap_or_default();
         ingest_facts_to_knn(server_url, &latest_user_for_facts, &response_text).await;
 
+        // Long-session summarisation: kick off in the background
+        // every few turns so the next chat can use a cached summary
+        // instead of letting older turns silently fall off the
+        // byte-budget cliff.
+        if let Some(sid) = state.session_id.as_deref() {
+            let turn_count = state
+                .messages
+                .iter()
+                .filter(|m| matches!(m, Message::User(_) | Message::Assistant(_)))
+                .count();
+            maybe_spawn_summarizer(server_url, sid, turn_count);
+        }
+
         let sid = state.session_id.clone();
         if let Some(summary) = execute_skill_tool(&response_text, &mut state.messages, server_url, sid.as_deref(), &state.skills) {
             // Surface tool flow on stdout so it's visible when scripted.
@@ -1307,6 +1451,25 @@ fn build_chat_messages_with_system(state: &AppState) -> Vec<ChatMsg> {
     };
 
     let mut system_msgs: Vec<ChatMsg> = Vec::new();
+
+    // Inject the cached session summary (if any) BEFORE the skill
+    // primer so the model sees long-conversation context that has
+    // since aged out of the byte-budget tail.
+    if let Some(sid) = state.session_id.as_deref() {
+        if let Some(summary) = load_session_summary(sid) {
+            if !summary.text.trim().is_empty() {
+                system_msgs.push(ChatMsg {
+                    role: "system".into(),
+                    content: format!(
+                        "Earlier conversation summary (the {} oldest turns have been summarised \
+                         to keep context small):\n\n{}",
+                        summary.turns_covered, summary.text
+                    ),
+                });
+            }
+        }
+    }
+
     if let Some((primer, route_decision)) = routed_primer(&live_skills, latest_user) {
         system_msgs.push(ChatMsg {
             role: "system".into(),
@@ -1571,14 +1734,19 @@ async fn main() -> io::Result<()> {
                         let url = state.server_url.clone();
                         let prompt = latest_user.clone();
                         let resp = response_text.clone();
-                        // Interactive loop is sync; spawn an async
-                        // task that we DO await before continuing
-                        // (use a small runtime block_on equivalent
-                        // via the existing tokio handle).
                         let h = tokio::runtime::Handle::current();
                         let _ = h.block_on(async {
                             ingest_facts_to_knn(&url, &prompt, &resp).await;
                         });
+                    }
+                    // Long-session summariser tick.
+                    if let Some(sid) = state.session_id.as_deref() {
+                        let turn_count = state
+                            .messages
+                            .iter()
+                            .filter(|m| matches!(m, Message::User(_) | Message::Assistant(_)))
+                            .count();
+                        maybe_spawn_summarizer(&state.server_url, sid, turn_count);
                     }
 
                     // Only execute tools on first response, not follow-ups

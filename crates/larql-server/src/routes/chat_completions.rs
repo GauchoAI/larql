@@ -168,11 +168,14 @@ fn run_chat(
     // Snapshot KNN entries at the install layer for one-shot override.
     let install_layer = model.config.num_layers.saturating_sub(8);
     let tensor = format!("attn_post_norm-{install_layer}");
-    // Higher threshold than /v1/infer because chat sessions tend to
-    // accumulate many fact-derived KNN entries and 0.75 starts firing
-    // false-positive overrides on unrelated prompts.  0.90 gives us
-    // crisp recall on real matches without the spam.
-    const THRESHOLD: f32 = 0.90;
+    // Higher threshold than /v1/infer because chat sessions accumulate
+    // many fact-derived KNN entries and lower thresholds (0.75 → 0.90)
+    // were both still firing false-positive overrides on vague
+    // conversational prompts ("lets try again", "did it work?") that
+    // happened to share L26 residual structure with stored facts.
+    // 0.93 keeps real factual recall (your-name-is-Miguel cos≈0.97)
+    // while rejecting prosaic chit-chat (cos≈0.91).
+    const THRESHOLD: f32 = 0.93;
 
     let patched = model.patched.blocking_read();
     let entries = snapshot_layer(&patched.knn_store, install_layer);

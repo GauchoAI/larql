@@ -512,6 +512,22 @@ fn execute_skill_tool(
     }
 }
 
+/// Peek at an assistant response for a ```tool``` block without
+/// running anything.  Returns (name, detail) if found.  Used to
+/// render an immediate "⚡ tool (running…)" marker before
+/// `execute_skill_tool` blocks the event loop on the bash subprocess.
+fn preview_tool_call(text: &str) -> Option<(String, String)> {
+    let open = "```tool";
+    let start = text.find(open)?;
+    let after = &text[start + open.len()..];
+    let close = after.find("```")?;
+    let body = after[..close].trim();
+    let mut parts = body.splitn(2, char::is_whitespace);
+    let name = parts.next()?.to_string();
+    let detail: String = parts.next().unwrap_or("").chars().take(70).collect();
+    Some((name, detail))
+}
+
 /// Scan an assistant turn for ```fact``` blocks and POST each to
 /// /v1/insert so the captured residual gets stored in the KnnStore at
 /// L26.  This closes the LARQL loop: future prompts whose residual
@@ -1569,6 +1585,24 @@ async fn main() -> io::Result<()> {
                     if tool_depth == 0 {
                         let sid = state.session_id.clone();
                         let server_url_cl = state.server_url.clone();
+                        // Pre-render the "⚡ tool" marker BEFORE
+                        // execute_skill_tool blocks on bash.  Without
+                        // this, slow tools (8s `stats`, 7s
+                        // `find_large`) freeze the screen with no
+                        // feedback.  We push a placeholder ToolUse
+                        // here, draw, then let execute_skill_tool
+                        // overwrite it (its own ToolUse push is a
+                        // duplicate but the dedupe in append_turn
+                        // catches it).
+                        if let Some((preview_name, preview_detail)) =
+                            preview_tool_call(&response_text)
+                        {
+                            state.messages.push(Message::ToolUse {
+                                tool: format!("{preview_name} (running…)"),
+                                detail: preview_detail,
+                            });
+                            draw(&mut terminal, &state);
+                        }
                         if let Some(_summary) = execute_skill_tool(&response_text, &mut state.messages, &server_url_cl, sid.as_deref(), &state.skills) {
                             tool_depth += 1;
                             state.messages.push(Message::Assistant(String::new()));

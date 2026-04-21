@@ -795,18 +795,21 @@ enum ContinueReason {
 
 /// Decide whether the agent loop should re-spawn chat after a model
 /// turn that didn't emit a tool.  We continue when:
-///  * we're already inside an agent loop (tool_depth > 0),
 ///  * we haven't exhausted the chain budget,
 ///  * AND either:
-///     - there's an active workflow with non-done steps, OR
-///     - the model's last response had nothing visible to the user
-///       (only meta-blocks), so they need a closing summary.
+///     - there's an active workflow with non-done steps (fires even
+///       at tool_depth == 0 — catches the common "model emits plan
+///       then says 'let's do step 1' without emitting the tool"
+///       stall that used to need a manual nudge), OR
+///     - we're inside an active agent loop AND the model's last
+///       response had nothing visible to the user (only meta-blocks),
+///       so they need a closing summary.
 fn should_auto_continue(
     state: &AppState,
     tool_depth: usize,
     max_depth: usize,
 ) -> Option<ContinueReason> {
-    if tool_depth == 0 || tool_depth >= max_depth {
+    if tool_depth >= max_depth {
         return None;
     }
     let has_pending = state.workflows.workflows.iter().any(|w| {
@@ -818,15 +821,17 @@ fn should_auto_continue(
     if has_pending {
         return Some(ContinueReason::PendingSteps);
     }
-    // Look at the most recent assistant message: if its prose-only
-    // form is empty, the user got nothing visible — push for a
-    // wrap-up.
-    let last_assistant: Option<&str> = state.messages.iter().rev().find_map(|m| {
-        if let Message::Assistant(t) = m { (!t.is_empty()).then_some(t.as_str()) } else { None }
-    });
-    if let Some(text) = last_assistant {
-        if strip_meta_blocks(text).trim().is_empty() {
-            return Some(ContinueReason::NoVisibleResponse);
+    // NoVisibleResponse: only while mid-loop.  Otherwise a plain
+    // chat turn ("hi there") would loop forever asking for a
+    // summary of nothing.
+    if tool_depth > 0 {
+        let last_assistant: Option<&str> = state.messages.iter().rev().find_map(|m| {
+            if let Message::Assistant(t) = m { (!t.is_empty()).then_some(t.as_str()) } else { None }
+        });
+        if let Some(text) = last_assistant {
+            if strip_meta_blocks(text).trim().is_empty() {
+                return Some(ContinueReason::NoVisibleResponse);
+            }
         }
     }
     None
@@ -2543,9 +2548,22 @@ async fn main() -> io::Result<()> {
                                 }
                             }
                         }
-                        if let Some(_summary) = exec_result {
+                        if let Some(summary) = exec_result {
                             tool_depth += 1;
                             continue_depth = 0; // real tool ran, reset nudge counter
+                            // Auto-advance the workflow cursor on
+                            // every successful tool so the sidebar
+                            // reflects progress even when the model
+                            // skips explicit status blocks for
+                            // intermediate steps.  Heuristic: tool
+                            // "succeeded" when the summary contains
+                            // no failure marker.
+                            let tool_failed = summary.contains("⚠ failed")
+                                || summary.contains("FileNotFoundError")
+                                || summary.contains("SyntaxError");
+                            if !tool_failed && state.workflows.advance_cursor() {
+                                let _ = state.workflows.save(&workflows_path(state.session_id.as_deref()));
+                            }
                             state.messages.push(Message::Assistant(String::new()));
                             let chat_msgs = build_chat_messages_with_system(&state);
                             spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone(), state.session_id.clone());

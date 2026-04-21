@@ -2270,10 +2270,12 @@ async fn main() -> io::Result<()> {
             .timeout(std::time::Duration::from_secs(3))
             .send()
             .await;
-        // Workflow store doesn't need wiping — it's namespaced by
-        // session_id, so a brand new session naturally has an empty
-        // sidebar.  Resuming an existing session brings its plans
-        // back.
+        // `--new` on the cwd-derived session still resolves to the
+        // SAME session_id as prior runs (cwd is unchanged), so the
+        // per-session workflows file needs to be wiped to match the
+        // user's "fresh slate" intent.  Other sessions' workflow
+        // files are untouched — namespacing still applies.
+        let _ = std::fs::remove_file(workflows_path(Some(&session_id)));
     }
 
     if headless {

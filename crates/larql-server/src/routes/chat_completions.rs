@@ -168,7 +168,11 @@ fn run_chat(
     // Snapshot KNN entries at the install layer for one-shot override.
     let install_layer = model.config.num_layers.saturating_sub(8);
     let tensor = format!("attn_post_norm-{install_layer}");
-    const THRESHOLD: f32 = 0.75;
+    // Higher threshold than /v1/infer because chat sessions tend to
+    // accumulate many fact-derived KNN entries and 0.75 starts firing
+    // false-positive overrides on unrelated prompts.  0.90 gives us
+    // crisp recall on real matches without the spam.
+    const THRESHOLD: f32 = 0.90;
 
     let patched = model.patched.blocking_read();
     let entries = snapshot_layer(&patched.knn_store, install_layer);

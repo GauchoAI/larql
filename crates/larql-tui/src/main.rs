@@ -1661,12 +1661,13 @@ fn draw_status(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     } else {
         "  ·  Ctrl-B: show plans"
     };
+    let copy_hint = "  ·  Ctrl-Y: copy mode";
     let mouse_hint = if state.mouse_captured {
-        "  ·  Ctrl-T: copy mode"
+        "  ·  Ctrl-T: scroll OFF"
     } else {
-        "  ·  Ctrl-T: scroll mode"
+        ""
     };
-    let status = format!(" {}{}{}  ", state.status, plans_hint, mouse_hint);
+    let status = format!(" {}{}{}{}  ", state.status, plans_hint, copy_hint, mouse_hint);
     let para = Paragraph::new(Line::from(Span::styled(
         status, Style::default().fg(Color::White).bg(Color::DarkGray),
     )));
@@ -2288,9 +2289,12 @@ async fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Mouse capture starts disabled so click-to-copy works.  Ctrl-T
-    // toggles it on for users who want scroll-wheel scroll.
-    execute!(stdout, EnterAlternateScreen)?;
+    // Mouse capture starts disabled so native click-and-drag text
+    // selection works.  Belt-and-suspenders: explicitly send a
+    // DisableMouseCapture FIRST in case a prior crash left the
+    // terminal stuck in mouse-reporting mode (no-op when already
+    // disabled).  Ctrl-T toggles capture on for scroll-wheel users.
+    execute!(stdout, EnterAlternateScreen, DisableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -2572,6 +2576,57 @@ async fn main() -> io::Result<()> {
                             let _ = execute!(io::stdout(), DisableMouseCapture);
                             state.status = "mouse capture OFF — drag to select text".into();
                         }
+                        draw(&mut terminal, &state);
+                    }
+                    KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Copy mode: drop the alt screen entirely so
+                        // the chat transcript ends up in normal
+                        // terminal scrollback where click-and-drag +
+                        // ⌘C just works.  Returns to the chat on
+                        // Enter.  Some terminals stubbornly block
+                        // selection inside the alt-screen even
+                        // without app-side mouse capture; this is
+                        // the universal escape hatch.
+                        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+                        let _ = disable_raw_mode();
+                        // Print transcript to scrollback in plain
+                        // text (no ratatui styling — copy-friendly).
+                        println!();
+                        println!("─── COPY MODE ─── select with mouse + ⌘C, then press Enter to return ───");
+                        println!();
+                        for m in &state.messages {
+                            match m {
+                                Message::User(t) => println!("> {t}\n"),
+                                Message::Assistant(t) => {
+                                    let cleaned = strip_meta_blocks(t);
+                                    if !cleaned.trim().is_empty() {
+                                        println!("{cleaned}\n");
+                                    }
+                                }
+                                Message::ToolUse { tool, detail } => {
+                                    println!("⚡ {tool} {detail}");
+                                }
+                                Message::ToolResult { summary } => {
+                                    println!("{summary}\n");
+                                }
+                                Message::ToolRender { content } => {
+                                    println!("{content}\n");
+                                }
+                                Message::System(t) => println!("({t})"),
+                            }
+                        }
+                        println!();
+                        println!("─── press Enter to return to chat ───");
+                        let mut _line = String::new();
+                        let _ = std::io::stdin().read_line(&mut _line);
+                        // Restore TUI state.
+                        let _ = enable_raw_mode();
+                        let mut so = io::stdout();
+                        let _ = execute!(so, EnterAlternateScreen);
+                        if state.mouse_captured {
+                            let _ = execute!(so, EnableMouseCapture);
+                        }
+                        let _ = terminal.clear();
                         draw(&mut terminal, &state);
                     }
                     KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {

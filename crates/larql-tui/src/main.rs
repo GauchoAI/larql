@@ -1799,6 +1799,18 @@ async fn main() -> io::Result<()> {
         return run_headless(&server_url, Some(&session_id)).await;
     }
 
+    // Install a panic hook that restores the terminal BEFORE the
+    // panic message is printed.  Without this, an unexpected panic
+    // (e.g. tokio block_on misuse) leaves the terminal in raw mode
+    // with mouse-tracking enabled — the parent shell then prints raw
+    // SGR mouse reports ("35;63;13M…") on every mouse move.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        original_hook(info);
+    }));
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -1905,11 +1917,16 @@ async fn main() -> io::Result<()> {
                         .find_map(|m| if let Message::User(t) = m { Some(t.clone()) } else { None })
                         .unwrap_or_default();
                     {
+                        // Interactive loop runs inside the tokio runtime,
+                        // so calling Handle::current().block_on() here
+                        // panics ("Cannot start a runtime from within a
+                        // runtime").  Just spawn — the insert is
+                        // fire-and-forget and the runtime stays alive
+                        // for the whole chat session.
                         let url = state.server_url.clone();
                         let prompt = latest_user.clone();
                         let resp = response_text.clone();
-                        let h = tokio::runtime::Handle::current();
-                        let _ = h.block_on(async {
+                        tokio::spawn(async move {
                             ingest_facts_to_knn(&url, &prompt, &resp).await;
                         });
                     }

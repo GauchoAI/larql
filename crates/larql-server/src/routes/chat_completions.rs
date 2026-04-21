@@ -48,7 +48,12 @@ pub struct ChatCompletionRequest {
 }
 
 fn default_max_tokens() -> usize {
-    256
+    // Effectively "no cap" — n_ctx=8192 means the model will stop
+    // via EOS well before this limit fires in practice.  256 and
+    // 768 both truncated multi-step agentic responses mid-tool-block
+    // in real sessions.  Leaving it high so the model is only ever
+    // stopped by its own end-of-sequence token.
+    10_000
 }
 
 pub async fn handle_chat_completions(

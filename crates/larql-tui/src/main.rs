@@ -2421,6 +2421,7 @@ async fn main() -> io::Result<()> {
 
         let history = fetch_session_history(&server_url, sid).await;
         if history.is_empty() {
+            state.status = format!("connected · {server_url} · new session {sid}");
             state.messages.push(Message::System(
                 format!("Session '{sid}' — starting fresh.")
             ));

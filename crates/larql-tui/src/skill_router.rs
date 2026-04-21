@@ -282,7 +282,12 @@ pub fn route(prompt: &str, idx: &Index) -> Option<(usize, f32)> {
     };
     let confidence =
         ((best_score / 3.0) * (separation / 1.5).min(1.0)).min(1.0);
-    if confidence >= 0.15 {
+    // 0.15 was too trigger-happy: "lets MAKE a fibonacci.py" scored
+    // 0.17 against `make_skill` purely on the word "make", pulling
+    // the wizard primer into context when the user really wanted
+    // `run`.  0.22 keeps intentional matches (usually 0.3+) while
+    // rejecting one-keyword coincidences.
+    if confidence >= 0.22 {
         Some((best_i, confidence))
     } else {
         None

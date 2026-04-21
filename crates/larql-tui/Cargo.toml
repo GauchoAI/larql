@@ -1,0 +1,20 @@
+[package]
+name = "larql-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive TUI for larql — LLM as a Database"
+
+[[bin]]
+name = "larql"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["stream", "json"] }
+futures = "0.3"
+gc-markdown = { path = "../gc-markdown" }
+unicode-width = "0.2"

@@ -1,10 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/gc-markdown",
     "crates/larql-models",
     "crates/larql-vindex",
     "crates/larql-llamacpp",
     "crates/larql-server",
+    "crates/larql-tui",
     "crates/spike",
 ]
 

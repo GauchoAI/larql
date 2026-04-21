@@ -126,7 +126,10 @@ impl AppState {
             scroll_offset: 0,
             skills: Vec::new(),
             last_route: None,
-            workflows: WorkflowStore::load(&workflows_path()),
+            // Workflows load after session_id is set in main; start
+            // empty so the sidebar doesn't briefly show stale plans
+            // from another session before we know which file to read.
+            workflows: WorkflowStore::default(),
             sidebar_visible: true,
             active_tab: ActiveTab::Chat,
             // Default OFF so click-to-copy works out of the box.
@@ -738,15 +741,34 @@ fn preview_tool_call(text: &str) -> Option<(String, String)> {
 /// Synchronous (not tokio::spawn) so headless `/quit` can't drop the
 /// task on the floor before it actually fires.  Each fact costs
 /// ~70 ms; usually we have 1-3 per turn, so total <300 ms.
-/// Path of the on-disk workflow store.  Mirrors session storage
-/// conventions: lives next to facts/sessions under `~/.larql/`.
-fn workflows_path() -> std::path::PathBuf {
-    home_dir().join(".larql/workflows.json")
+/// Path of the on-disk workflow store, namespaced by session.  Each
+/// session has its own plans — starting a fresh conversation gets
+/// you an empty sidebar without affecting any other session, and
+/// resuming a session brings back its plans.
+fn workflows_path(session_id: Option<&str>) -> std::path::PathBuf {
+    match session_id {
+        Some(sid) => {
+            let safe: String = sid
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+                .collect();
+            home_dir()
+                .join(".larql/sessions")
+                .join(format!("{safe}.workflows.json"))
+        }
+        // Default (no session set yet) falls back to a global file
+        // so the field is never empty in tests / pre-init draws.
+        None => home_dir().join(".larql/workflows.json"),
+    }
 }
 
 /// Pull plan/status blocks from `response`, apply to `store`, persist
-/// if anything changed.  Returns true when the sidebar needs a redraw.
-fn apply_workflow_annotations(store: &mut WorkflowStore, response: &str) -> bool {
+/// to the per-session path.  Returns true when the sidebar needs a redraw.
+fn apply_workflow_annotations(
+    store: &mut WorkflowStore,
+    response: &str,
+    session_id: Option<&str>,
+) -> bool {
     let mut changed = false;
     for wf in extract_plan_blocks(response) {
         store.upsert(wf);
@@ -758,28 +780,61 @@ fn apply_workflow_annotations(store: &mut WorkflowStore, response: &str) -> bool
         }
     }
     if changed {
-        let _ = store.save(&workflows_path());
+        let _ = store.save(&workflows_path(session_id));
     }
     changed
 }
 
-/// True when:
-///  * there's an active workflow with at least one non-done step,
+/// Why we want to auto-continue.  Drives the prompt the loop
+/// injects so the model knows what's expected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContinueReason {
+    /// Workflow has pending/active steps — push the model to
+    /// emit the next ```tool``` block.
+    PendingSteps,
+    /// Last response was meta-blocks only (```fact```, ```status```,
+    /// ```plan``` — all hidden from the user).  User saw nothing;
+    /// ask the model to wrap up with a real prose summary.
+    NoVisibleResponse,
+}
+
+/// Decide whether the agent loop should re-spawn chat after a model
+/// turn that didn't emit a tool.  We continue when:
 ///  * we're already inside an agent loop (tool_depth > 0),
-///  * we haven't exhausted the chain budget.
-/// In that case the agent loop will inject a continuation prompt and
-/// re-spawn chat instead of letting the model stall after a single
-/// "let me try X" message.
-fn should_auto_continue(state: &AppState, tool_depth: usize, max_depth: usize) -> bool {
+///  * we haven't exhausted the chain budget,
+///  * AND either:
+///     - there's an active workflow with non-done steps, OR
+///     - the model's last response had nothing visible to the user
+///       (only meta-blocks), so they need a closing summary.
+fn should_auto_continue(
+    state: &AppState,
+    tool_depth: usize,
+    max_depth: usize,
+) -> Option<ContinueReason> {
     if tool_depth == 0 || tool_depth >= max_depth {
-        return false;
+        return None;
     }
-    state.workflows.workflows.iter().any(|w| {
+    let has_pending = state.workflows.workflows.iter().any(|w| {
         w.state == WorkflowState::Active
             && w.steps
                 .iter()
                 .any(|s| matches!(s.state, StepState::Pending | StepState::Active))
-    })
+    });
+    if has_pending {
+        return Some(ContinueReason::PendingSteps);
+    }
+    // Look at the most recent assistant message: if its prose-only
+    // form is empty, the user got nothing visible — push for a
+    // wrap-up.
+    let last_assistant: Option<&str> = state.messages.iter().rev().find_map(|m| {
+        if let Message::Assistant(t) = m { (!t.is_empty()).then_some(t.as_str()) } else { None }
+    });
+    if let Some(text) = last_assistant {
+        if strip_meta_blocks(text).trim().is_empty() {
+            return Some(ContinueReason::NoVisibleResponse);
+        }
+    }
+    None
 }
 
 /// Description of the next non-done step in the most recently
@@ -1934,7 +1989,7 @@ fn run_one_turn<'a>(
 
         // Plan/status blocks: update the live workflow store so the
         // sidebar reflects the model's planning + per-step progress.
-        apply_workflow_annotations(&mut state.workflows, &response_text);
+        apply_workflow_annotations(&mut state.workflows, &response_text, state.session_id.as_deref());
 
         // Long-session summarisation: kick off in the background
         // every few turns so the next chat can use a cached summary
@@ -2203,13 +2258,16 @@ async fn main() -> io::Result<()> {
             .await;
         // Also clear the in-memory KNN override store so polluted
         // entries from prior sessions don't intercept new prompts.
-        // This is server-wide (all sessions), which matches user
-        // intent for --new: a clean slate end-to-end.
+        // Server-wide, which matches user intent for --new.
         let _ = client
             .post(format!("{server_url}/v1/reset"))
             .timeout(std::time::Duration::from_secs(3))
             .send()
             .await;
+        // Workflow store doesn't need wiping — it's namespaced by
+        // session_id, so a brand new session naturally has an empty
+        // sidebar.  Resuming an existing session brings its plans
+        // back.
     }
 
     if headless {
@@ -2230,12 +2288,17 @@ async fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Mouse capture starts disabled so click-to-copy works.  Ctrl-T
+    // toggles it on for users who want scroll-wheel scroll.
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut state = AppState::new(&server_url);
     state.session_id = Some(session_id.clone());
+    // Now that we know the session, load its per-session workflow
+    // store.  New session id → file doesn't exist → empty sidebar.
+    state.workflows = WorkflowStore::load(&workflows_path(Some(&session_id)));
     // Skills are loaded once; per-turn the chat builder picks ONE
     // (TF-IDF router) plus all `always: true` skills (annotate) so the
     // prefill stays small regardless of how many skills exist.
@@ -2348,7 +2411,7 @@ async fn main() -> io::Result<()> {
                         });
                     }
                     // Plan/status: same sweep, sidebar reflects new state.
-                    apply_workflow_annotations(&mut state.workflows, &response_text);
+                    apply_workflow_annotations(&mut state.workflows, &response_text, state.session_id.as_deref());
                     // Long-session summariser tick.
                     if let Some(sid) = state.session_id.as_deref() {
                         let turn_count = state
@@ -2414,21 +2477,33 @@ async fn main() -> io::Result<()> {
                             state.messages.push(Message::Assistant(String::new()));
                             let chat_msgs = build_chat_messages_with_system(&state);
                             spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone(), state.session_id.clone());
-                        } else if should_auto_continue(&state, tool_depth, INTERACTIVE_MAX_TOOL_DEPTH) {
-                            // Model finished WITHOUT emitting a tool but
-                            // there are pending workflow steps — Gemma 3
-                            // 4B often says "let me try X" without
-                            // actually emitting the tool block.  Nudge
-                            // it to continue with a brief system hint
-                            // and let it try again.
+                        } else if let Some(reason) = should_auto_continue(&state, tool_depth, INTERACTIVE_MAX_TOOL_DEPTH) {
+                            // Model finished without emitting a tool.
+                            // Either it stalled mid-plan ("let me try X"
+                            // with no tool block) — push to continue —
+                            // or its whole response was meta-blocks
+                            // (fact/status hidden from the user) — push
+                            // for a real prose summary.
                             tool_depth += 1;
-                            let next = next_pending_step(&state)
-                                .unwrap_or_else(|| "the next step".to_string());
-                            state.messages.push(Message::System(format!(
-                                "auto-continue: previous tool succeeded. \
-                                 Continue your active plan — emit the \
-                                 next ```tool``` block now (next step: {next})."
-                            )));
+                            let prompt = match reason {
+                                ContinueReason::PendingSteps => {
+                                    let next = next_pending_step(&state)
+                                        .unwrap_or_else(|| "the next step".to_string());
+                                    format!(
+                                        "auto-continue: previous tool succeeded. \
+                                         Continue your active plan — emit the \
+                                         next ```tool``` block now (next step: {next})."
+                                    )
+                                }
+                                ContinueReason::NoVisibleResponse => {
+                                    "auto-continue: your last reply was only \
+                                     meta-blocks (```fact```/```status```) which \
+                                     are hidden from the user.  Now write a \
+                                     short prose message summarising what you \
+                                     accomplished and the result the user wanted.".to_string()
+                                }
+                            };
+                            state.messages.push(Message::System(prompt));
                             state.messages.push(Message::Assistant(String::new()));
                             let chat_msgs = build_chat_messages_with_system(&state);
                             spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone(), state.session_id.clone());

@@ -9,6 +9,7 @@ mod llama_probe;
 mod ratelimit;
 mod routes;
 mod session;
+mod skill_registry;
 mod state;
 
 use std::path::PathBuf;
@@ -234,6 +235,20 @@ async fn main() -> Result<(), BoxError> {
         }
     });
 
+    let registry_path = skill_registry::Registry::default_path();
+    let skill_registry = match skill_registry::Registry::open(&registry_path) {
+        Ok(r) => {
+            info!("Skill registry: {}", registry_path.display());
+            r
+        }
+        Err(e) => {
+            warn!("Skill registry unavailable ({e}); continuing without persistence");
+            // Fall back to an in-memory DB so callers don't need to special-case absence.
+            skill_registry::Registry::open(std::path::Path::new(":memory:"))
+                .expect("in-memory sqlite must succeed")
+        }
+    };
+
     let state = Arc::new(AppState {
         models: models.clone(),
         started_at: std::time::Instant::now(),
@@ -241,6 +256,7 @@ async fn main() -> Result<(), BoxError> {
         api_key: cli.api_key.clone(),
         sessions: SessionManager::new(3600),
         describe_cache: DescribeCache::new(cli.cache_ttl),
+        skill_registry,
     });
 
     if cli.cache_ttl > 0 {

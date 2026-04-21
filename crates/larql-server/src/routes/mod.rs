@@ -17,6 +17,7 @@ pub mod probe;
 pub mod relations;
 pub mod reset;
 pub mod sessions;
+pub mod skills;
 pub mod select;
 pub mod stats;
 
@@ -54,6 +55,11 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/sessions/{id}", get(sessions::handle_get_session))
         .route("/v1/sessions/{id}", delete(sessions::handle_delete_session))
         .route("/v1/sessions/{id}/log", post(sessions::handle_append_turn))
+        // Skill registry (catalog on top of the on-disk skills/ tree)
+        .route("/v1/skills", get(skills::handle_list))
+        .route("/v1/skills/register", post(skills::handle_register))
+        .route("/v1/skills/{name}/used", post(skills::handle_used))
+        .route("/v1/skills/{name}", delete(skills::handle_delete))
         .with_state(state)
 }
 

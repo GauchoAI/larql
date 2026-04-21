@@ -13,6 +13,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 larql-vindex = { path = "../larql-vindex" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 ureq = { version = "2", features = ["json"] }
 

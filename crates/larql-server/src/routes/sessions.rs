@@ -60,6 +60,9 @@ pub async fn handle_delete_session(Path(id): Path<String>) -> impl IntoResponse 
 pub struct AppendTurnRequest {
     pub role: String,
     pub content: String,
+    /// Optional structured metadata (e.g. `{"tool_ms": 82310}`).
+    #[serde(default)]
+    pub meta: Option<serde_json::Value>,
 }
 
 /// POST /v1/sessions/:id/log — append an arbitrary turn (used by the
@@ -69,6 +72,10 @@ pub async fn handle_append_turn(
     Path(id): Path<String>,
     Json(req): Json<AppendTurnRequest>,
 ) -> Json<serde_json::Value> {
-    chat_log::append_turn(&id, &req.role, &req.content);
+    if let Some(meta) = req.meta {
+        chat_log::append_turn_with_meta(&id, &req.role, &req.content, meta);
+    } else {
+        chat_log::append_turn(&id, &req.role, &req.content);
+    }
     Json(serde_json::json!({"id": id, "appended": true, "role": req.role}))
 }

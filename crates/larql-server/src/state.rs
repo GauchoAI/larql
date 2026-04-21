@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 use crate::cache::DescribeCache;
 use crate::llama_probe::ServerProbeState;
 use crate::session::SessionManager;
+use crate::skill_registry::Registry;
 
 /// A single loaded model.
 ///
@@ -54,6 +55,8 @@ pub struct AppState {
     pub sessions: SessionManager,
     /// DESCRIBE result cache.
     pub describe_cache: DescribeCache,
+    /// SQLite catalog of skills (next to session logs).
+    pub skill_registry: Registry,
 }
 
 impl AppState {

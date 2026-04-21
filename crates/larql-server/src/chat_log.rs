@@ -23,6 +23,10 @@ pub struct LoggedTurn {
     pub ts: u64,
     pub role: String,
     pub content: String,
+    /// Optional, free-form metadata: timings, token counts, tool ids.
+    /// Read by view_session to surface profiling info next to each turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,6 +106,7 @@ pub fn append_turn(session_id: &str, role: &str, content: &str) {
         ts: now_unix(),
         role: role.to_string(),
         content: content.to_string(),
+        meta: None,
     };
     let line = match serde_json::to_string(&entry) {
         Ok(s) => s,
@@ -117,6 +122,38 @@ pub fn append_turn(session_id: &str, role: &str, content: &str) {
             }
         }
         Err(e) => tracing::warn!("chat_log: open {} failed: {e}", path.display()),
+    }
+}
+
+/// Append a turn with optional structured metadata (timings etc).
+/// No dedupe — caller controls what gets stored.
+pub fn append_turn_with_meta(
+    session_id: &str,
+    role: &str,
+    content: &str,
+    meta: serde_json::Value,
+) {
+    if session_id.is_empty() {
+        return;
+    }
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = root_dir();
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = path_for(session_id);
+    let entry = LoggedTurn {
+        ts: now_unix(),
+        role: role.to_string(),
+        content: content.to_string(),
+        meta: Some(meta),
+    };
+    let line = match serde_json::to_string(&entry) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{line}");
     }
 }
 

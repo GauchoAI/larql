@@ -73,6 +73,23 @@ pub async fn handle_chat_completions(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // Diagnostic: log the size + role sequence of every chat request
+    // so we can see what the TUI actually sends.
+    let role_summary: String = req
+        .messages
+        .iter()
+        .map(|m| format!("{}({})", &m.role[..3.min(m.role.len())], m.content.len()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let total_bytes: usize = req.messages.iter().map(|m| m.content.len()).sum();
+    tracing::info!(
+        "chat: session={} msgs={} bytes={} roles=[{}]",
+        session_id.as_deref().unwrap_or("-"),
+        req.messages.len(),
+        total_bytes,
+        role_summary,
+    );
+
     // Persist the user's latest turn before we start generating, so the
     // session is still partially captured if the client disconnects
     // mid-stream.  Only the last `user` turn is logged — system primers
@@ -103,14 +120,24 @@ fn run_chat(
     tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
     session_id: Option<&str>,
 ) {
+    let req_start = Instant::now();
+    let prompt_msgs = req.messages.len();
+    let prompt_bytes: usize = req.messages.iter().map(|m| m.content.len()).sum();
+
     // Accumulator for what we eventually persist as the assistant turn.
     let mut assistant_buf = String::new();
-    let log_assistant = |text: &str, session_id: Option<&str>| {
-        if let Some(sid) = session_id {
-            if !text.is_empty() {
-                chat_log::append_turn(sid, "assistant", text);
-            }
-        }
+    // Per-turn timing the handler updates as it progresses.  Logged
+    // alongside the assistant turn so view_session can display
+    // "[prefill 412ms · first 178ms · decode 1.2s · 87 tok @ 72 t/s]".
+    #[allow(unused_assignments)]
+    let mut timing = ChatTiming {
+        prompt_msgs,
+        prompt_bytes,
+        prefill_ms: 0.0,
+        first_token_ms: 0.0,
+        decode_ms: 0.0,
+        decoded_tokens: 0,
+        knn_override: false,
     };
     let pipe_mu = model.llama.as_ref().expect("llama present");
 
@@ -178,7 +205,7 @@ fn run_chat(
     };
     pipe.reset_kv();
 
-    let _prefill_start = Instant::now();
+    let prefill_start = Instant::now();
     let n_prefill = match pipe.prefill(&prompt) {
         Ok(n) => n,
         Err(e) => {
@@ -186,6 +213,7 @@ fn run_chat(
             return;
         }
     };
+    timing.prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
     if n_prefill == 0 {
         let _ = tx.blocking_send(Ok(sse_err("empty prompt")));
         return;
@@ -209,7 +237,9 @@ fn run_chat(
         );
         let _ = tx.blocking_send(Ok(sse_delta(&label)));
         let _ = tx.blocking_send(Ok(sse_done_openai()));
-        log_assistant(&label, session_id);
+        timing.knn_override = true;
+        timing.first_token_ms = req_start.elapsed().as_secs_f64() * 1000.0;
+        log_assistant_with_timing(&label, session_id, &timing);
         return;
     }
 
@@ -225,11 +255,15 @@ fn run_chat(
     // Stop tokens: EOS plus Gemma's <end_of_turn> (id 106 on the Gemma vocab).
     let stop_ids: [i32; 2] = [1, 106];
 
+    timing.first_token_ms = req_start.elapsed().as_secs_f64() * 1000.0;
+    let decode_start = Instant::now();
     let first_tok = pipe.decode_token(next);
     if !first_tok.is_empty() {
         assistant_buf.push_str(&first_tok);
+        timing.decoded_tokens += 1;
         if tx.blocking_send(Ok(sse_delta(&first_tok))).is_err() {
-            log_assistant(&assistant_buf, session_id);
+            timing.decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+            log_assistant_with_timing(&assistant_buf, session_id, &timing);
             return;
         }
     }
@@ -253,14 +287,61 @@ fn run_chat(
             continue;
         }
         assistant_buf.push_str(&tok);
+        timing.decoded_tokens += 1;
         if tx.blocking_send(Ok(sse_delta(&tok))).is_err() {
-            log_assistant(&assistant_buf, session_id);
+            timing.decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+            log_assistant_with_timing(&assistant_buf, session_id, &timing);
             return;
         }
     }
 
     let _ = tx.blocking_send(Ok(sse_done_openai()));
-    log_assistant(&assistant_buf, session_id);
+    timing.decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+    log_assistant_with_timing(&assistant_buf, session_id, &timing);
+}
+
+#[derive(Clone, Debug)]
+struct ChatTiming {
+    prompt_msgs: usize,
+    prompt_bytes: usize,
+    prefill_ms: f64,
+    first_token_ms: f64,
+    decode_ms: f64,
+    decoded_tokens: usize,
+    knn_override: bool,
+}
+
+fn log_assistant_with_timing(text: &str, session_id: Option<&str>, t: &ChatTiming) {
+    let sid = match session_id {
+        Some(s) => s,
+        None => return,
+    };
+    if text.is_empty() {
+        return;
+    }
+    let tps = if t.decode_ms > 0.0 {
+        (t.decoded_tokens as f64) * 1000.0 / t.decode_ms
+    } else {
+        0.0
+    };
+    let meta = serde_json::json!({
+        "kind": "chat",
+        "prompt_msgs": t.prompt_msgs,
+        "prompt_bytes": t.prompt_bytes,
+        "prefill_ms": (t.prefill_ms * 10.0).round() / 10.0,
+        "first_token_ms": (t.first_token_ms * 10.0).round() / 10.0,
+        "decode_ms": (t.decode_ms * 10.0).round() / 10.0,
+        "decoded_tokens": t.decoded_tokens,
+        "tok_per_sec": (tps * 10.0).round() / 10.0,
+        "knn_override": t.knn_override,
+    });
+    chat_log::append_turn_with_meta(sid, "assistant", text, meta);
+    tracing::info!(
+        "chat_done: prompt_msgs={} prompt_bytes={} prefill={:.0}ms first_token={:.0}ms decode={:.0}ms tokens={} {:.1}tok/s knn={}",
+        t.prompt_msgs, t.prompt_bytes,
+        t.prefill_ms, t.first_token_ms, t.decode_ms,
+        t.decoded_tokens, tps, t.knn_override
+    );
 }
 
 /// Build an OpenAI-compatible delta SSE chunk for a single token.

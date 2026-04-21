@@ -7,7 +7,12 @@
 use std::io;
 
 mod skill_router;
+mod workflows;
 use skill_router::{build_index, load_skills, route, Skill};
+use workflows::{
+    extract_plan_blocks, extract_status_updates, StepState, Workflow, WorkflowState,
+    WorkflowStore,
+};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEventKind,
@@ -67,6 +72,13 @@ struct AppState {
     /// Diagnostic: the routing decision for the most recent prompt.
     /// Surfaced to view_session via the chat metadata.
     last_route: Option<(String, f32)>,
+    /// Live planner/worker workflow state.  Loaded on startup from
+    /// `~/.larql/workflows.json`, mutated by `plan` + `status` blocks
+    /// extracted from each model response, rendered in the sidebar.
+    workflows: WorkflowStore,
+    /// Whether the right-hand sidebar (workflows graph) is shown.
+    /// Toggled with Ctrl+B.  Auto-hidden in narrow terminals.
+    sidebar_visible: bool,
 }
 
 impl AppState {
@@ -84,6 +96,8 @@ impl AppState {
             scroll_offset: 0,
             skills: Vec::new(),
             last_route: None,
+            workflows: WorkflowStore::load(&workflows_path()),
+            sidebar_visible: true,
         }
     }
 
@@ -680,6 +694,31 @@ fn preview_tool_call(text: &str) -> Option<(String, String)> {
 /// Synchronous (not tokio::spawn) so headless `/quit` can't drop the
 /// task on the floor before it actually fires.  Each fact costs
 /// ~70 ms; usually we have 1-3 per turn, so total <300 ms.
+/// Path of the on-disk workflow store.  Mirrors session storage
+/// conventions: lives next to facts/sessions under `~/.larql/`.
+fn workflows_path() -> std::path::PathBuf {
+    home_dir().join(".larql/workflows.json")
+}
+
+/// Pull plan/status blocks from `response`, apply to `store`, persist
+/// if anything changed.  Returns true when the sidebar needs a redraw.
+fn apply_workflow_annotations(store: &mut WorkflowStore, response: &str) -> bool {
+    let mut changed = false;
+    for wf in extract_plan_blocks(response) {
+        store.upsert(wf);
+        changed = true;
+    }
+    for upd in extract_status_updates(response) {
+        if store.apply_status(&upd) {
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = store.save(&workflows_path());
+    }
+    changed
+}
+
 async fn ingest_facts_to_knn(
     server_url: &str,
     prompt_for_capture: &str,
@@ -818,6 +857,24 @@ fn extract_block(text: &str, lang: &str) -> Option<String> {
 
 fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &AppState) {
     terminal.draw(|f| {
+        // Sidebar shows the live workflow graph.  Auto-hide on narrow
+        // terminals so the chat panel always has at least 60 cols.
+        let area = f.area();
+        let sidebar_w: u16 = 34;
+        let show_sidebar = state.sidebar_visible
+            && area.width >= 60 + sidebar_w
+            && !state.workflows.workflows.is_empty();
+
+        let (chat_area, sidebar_area) = if show_sidebar {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(40), Constraint::Length(sidebar_w)])
+                .split(area);
+            (cols[0], Some(cols[1]))
+        } else {
+            (area, None)
+        };
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -825,12 +882,124 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &AppState)
                 Constraint::Length(3),
                 Constraint::Length(1),
             ])
-            .split(f.area());
+            .split(chat_area);
 
         draw_messages(f, state, chunks[0]);
         draw_input(f, state, chunks[1]);
         draw_status(f, state, chunks[2]);
+
+        if let Some(side) = sidebar_area {
+            draw_sidebar(f, state, side);
+        }
     }).ok();
+}
+
+/// Render the workflow store as a gitk-style branch graph: each
+/// workflow is its own column of dots-on-a-pipe (`*` nodes connected
+/// by `│` segments), workflows stack vertically.  Step state
+/// determines the dot colour + the trailing icon (✓ ⚡ ⏳ ✗).
+fn draw_sidebar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(Color::Gray);
+
+    if state.workflows.workflows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no plans yet — emit ```plan``` to start",
+            dim,
+        )));
+    }
+
+    // Newest workflows on top so the active stuff is always visible.
+    let mut wfs: Vec<&Workflow> = state.workflows.workflows.iter().collect();
+    wfs.sort_by_key(|w| std::cmp::Reverse(w.ts));
+
+    for (idx, wf) in wfs.iter().enumerate() {
+        if idx > 0 {
+            // Gap between workflows.  Render a tiny "diverge" hint to
+            // suggest a new branch — gitk would show `|/` here when
+            // branches converge; we just show a styled separator.
+            lines.push(Line::from(Span::styled("│", dim)));
+            lines.push(Line::from(Span::styled("◇", dim)));
+            lines.push(Line::from(Span::styled("│", dim)));
+        }
+
+        // Workflow head: bold dot + name + state tag.
+        let (head_dot, head_state_str, head_state_style) = match wf.state {
+            WorkflowState::Active => ("●", "active", Style::default().fg(Color::Yellow)),
+            WorkflowState::Done => ("●", "done", Style::default().fg(Color::Green)),
+            WorkflowState::Cancelled => ("●", "cancelled", Style::default().fg(Color::Red)),
+        };
+        let done_count = wf.steps.iter().filter(|s| s.state == StepState::Done).count();
+        let total = wf.steps.len();
+        lines.push(Line::from(vec![
+            Span::styled(format!("{head_dot} "), head_state_style),
+            Span::styled(wf.name.clone(), head),
+            Span::raw("  "),
+            Span::styled(format!("[{done_count}/{total}]"), muted),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("│ "),
+            Span::styled(head_state_str, head_state_style),
+        ].into_iter().map(|s| {
+            // The leading "│ " should be dim; the state tag keeps its colour.
+            if s.content == "│ " { Span::styled(s.content, dim) } else { s }
+        }).collect::<Vec<_>>()));
+
+        // Each step: a dot on the workflow's pipe + numbered label.
+        for (i, step) in wf.steps.iter().enumerate() {
+            let (icon, dot_style) = match step.state {
+                StepState::Done => ("✓", Style::default().fg(Color::Green)),
+                StepState::Active => ("⚡", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                StepState::Pending => ("⏳", Style::default().fg(Color::DarkGray)),
+                StepState::Failed => ("✗", Style::default().fg(Color::Red)),
+            };
+            let n = i + 1;
+            // Pipe coming down from the head, dot for this step.
+            lines.push(Line::from(vec![
+                Span::styled("├─", dim),
+                Span::styled(format!("● {icon} "), dot_style),
+                Span::styled(format!("{n}. "), muted),
+                Span::styled(truncate_for_sidebar(&step.description), Style::default().fg(Color::White)),
+            ]));
+            if let Some(out) = &step.output {
+                lines.push(Line::from(vec![
+                    Span::styled("│   ", dim),
+                    Span::styled("↪ ", muted),
+                    Span::styled(truncate_for_sidebar(out), dim),
+                ]));
+            }
+        }
+    }
+
+    // Pre-wrap to area width so long names don't blow out the column.
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let wrapped: Vec<Line<'static>> = lines
+        .into_iter()
+        .flat_map(|l| wrap_line_to_rows(l, inner_w))
+        .collect();
+
+    let title_text = format!(" plans · {} active ", state.workflows.workflows.iter()
+        .filter(|w| w.state == WorkflowState::Active).count());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(title_text, head));
+
+    let para = Paragraph::new(wrapped).block(block);
+    f.render_widget(para, area);
+}
+
+fn truncate_for_sidebar(s: &str) -> String {
+    let s = s.trim();
+    if s.chars().count() > 28 {
+        let cut: String = s.chars().take(27).collect();
+        format!("{cut}…")
+    } else {
+        s.to_string()
+    }
 }
 
 fn draw_messages(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
@@ -1036,7 +1205,8 @@ fn draw_input(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_status(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
-    let status = format!(" {} ", state.status);
+    let toggle = if state.sidebar_visible { "Ctrl-B: hide plans" } else { "Ctrl-B: show plans" };
+    let status = format!(" {}   ·   {}  ", state.status, toggle);
     let para = Paragraph::new(Line::from(Span::styled(
         status, Style::default().fg(Color::White).bg(Color::DarkGray),
     )));
@@ -1356,6 +1526,10 @@ fn run_one_turn<'a>(
             .find_map(|m| if let Message::User(t) = m { Some(t.clone()) } else { None })
             .unwrap_or_default();
         ingest_facts_to_knn(server_url, &latest_user_for_facts, &response_text).await;
+
+        // Plan/status blocks: update the live workflow store so the
+        // sidebar reflects the model's planning + per-step progress.
+        apply_workflow_annotations(&mut state.workflows, &response_text);
 
         // Long-session summarisation: kick off in the background
         // every few turns so the next chat can use a cached summary
@@ -1739,6 +1913,8 @@ async fn main() -> io::Result<()> {
                             ingest_facts_to_knn(&url, &prompt, &resp).await;
                         });
                     }
+                    // Plan/status: same sweep, sidebar reflects new state.
+                    apply_workflow_annotations(&mut state.workflows, &response_text);
                     // Long-session summariser tick.
                     if let Some(sid) = state.session_id.as_deref() {
                         let turn_count = state
@@ -1822,6 +1998,10 @@ async fn main() -> io::Result<()> {
                 match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.sidebar_visible = !state.sidebar_visible;
+                        draw(&mut terminal, &state);
+                    }
                     KeyCode::Enter if !state.is_generating => {
                         let input = state.input.trim().to_string();
                         if input.is_empty() { continue; }

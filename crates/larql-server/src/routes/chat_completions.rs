@@ -321,6 +321,28 @@ fn run_chat(
             }
             break;
         }
+        // Stop right after the model closes its FIRST ```tool block.
+        // Without this, Gemma happily continues the turn fabricating
+        // the tool's output + follow-up prose ("The script printed
+        // 832040") before the tool has actually run — hallucinated
+        // transcripts that pollute context on the next turn.  We
+        // force a strict "emit one tool, wait for the real result"
+        // cadence by breaking at the closing fence.
+        if let Some(open) = assistant_buf.find("```tool") {
+            let after_open = &assistant_buf[open + "```tool".len()..];
+            if let Some(nl) = after_open.find('\n') {
+                let body_start = open + "```tool".len() + nl + 1;
+                if body_start <= assistant_buf.len() {
+                    if let Some(_close_rel) = assistant_buf[body_start..].find("\n```") {
+                        // Preserve everything up to and including the
+                        // closing fence; drop whatever came after (if
+                        // we were mid-token).  The newline after ```
+                        // isn't required.
+                        break;
+                    }
+                }
+            }
+        }
         if tx.blocking_send(Ok(sse_delta(&tok))).is_err() {
             timing.decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
             log_assistant_with_timing(&assistant_buf, session_id, &timing);

@@ -129,7 +129,11 @@ impl AppState {
             workflows: WorkflowStore::load(&workflows_path()),
             sidebar_visible: true,
             active_tab: ActiveTab::Chat,
-            mouse_captured: true,
+            // Default OFF so click-to-copy works out of the box.
+            // Ctrl-T re-enables for scroll-wheel users.  Click-to-
+            // copy is the more common need; scroll wheel has
+            // keyboard fallbacks (Up/Down/PageUp/PageDown/Home/End).
+            mouse_captured: false,
         }
     }
 
@@ -757,6 +761,46 @@ fn apply_workflow_annotations(store: &mut WorkflowStore, response: &str) -> bool
         let _ = store.save(&workflows_path());
     }
     changed
+}
+
+/// True when:
+///  * there's an active workflow with at least one non-done step,
+///  * we're already inside an agent loop (tool_depth > 0),
+///  * we haven't exhausted the chain budget.
+/// In that case the agent loop will inject a continuation prompt and
+/// re-spawn chat instead of letting the model stall after a single
+/// "let me try X" message.
+fn should_auto_continue(state: &AppState, tool_depth: usize, max_depth: usize) -> bool {
+    if tool_depth == 0 || tool_depth >= max_depth {
+        return false;
+    }
+    state.workflows.workflows.iter().any(|w| {
+        w.state == WorkflowState::Active
+            && w.steps
+                .iter()
+                .any(|s| matches!(s.state, StepState::Pending | StepState::Active))
+    })
+}
+
+/// Description of the next non-done step in the most recently
+/// updated active workflow.  Used in the auto-continue prompt so
+/// the model knows what to do next.
+fn next_pending_step(state: &AppState) -> Option<String> {
+    let mut active: Vec<&Workflow> = state
+        .workflows
+        .workflows
+        .iter()
+        .filter(|w| w.state == WorkflowState::Active)
+        .collect();
+    active.sort_by_key(|w| std::cmp::Reverse(w.ts));
+    for w in active {
+        for s in &w.steps {
+            if !matches!(s.state, StepState::Done | StepState::Failed) {
+                return Some(s.description.clone());
+            }
+        }
+    }
+    None
 }
 
 async fn ingest_facts_to_knn(
@@ -2367,6 +2411,24 @@ async fn main() -> io::Result<()> {
                         }
                         if let Some(_summary) = exec_result {
                             tool_depth += 1;
+                            state.messages.push(Message::Assistant(String::new()));
+                            let chat_msgs = build_chat_messages_with_system(&state);
+                            spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone(), state.session_id.clone());
+                        } else if should_auto_continue(&state, tool_depth, INTERACTIVE_MAX_TOOL_DEPTH) {
+                            // Model finished WITHOUT emitting a tool but
+                            // there are pending workflow steps — Gemma 3
+                            // 4B often says "let me try X" without
+                            // actually emitting the tool block.  Nudge
+                            // it to continue with a brief system hint
+                            // and let it try again.
+                            tool_depth += 1;
+                            let next = next_pending_step(&state)
+                                .unwrap_or_else(|| "the next step".to_string());
+                            state.messages.push(Message::System(format!(
+                                "auto-continue: previous tool succeeded. \
+                                 Continue your active plan — emit the \
+                                 next ```tool``` block now (next step: {next})."
+                            )));
                             state.messages.push(Message::Assistant(String::new()));
                             let chat_msgs = build_chat_messages_with_system(&state);
                             spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone(), state.session_id.clone());

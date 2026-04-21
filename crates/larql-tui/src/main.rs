@@ -7,7 +7,10 @@
 use std::io;
 
 mod skill_router;
+mod theme;
 mod workflows;
+
+use theme::{palette, Palette, Theme};
 use skill_router::{build_index, load_skills, route, Skill};
 use workflows::{
     extract_plan_blocks, extract_status_updates, StepState, Workflow, WorkflowState,
@@ -87,6 +90,9 @@ struct AppState {
     sidebar_visible: bool,
     /// In tabbed layout (narrow terminal), which view is foregrounded.
     active_tab: ActiveTab,
+    /// Current colour theme (Dark | Light).  Toggle with Ctrl-L;
+    /// persisted to ~/.larql/theme across sessions.
+    theme: Theme,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -132,6 +138,7 @@ impl AppState {
             workflows: WorkflowStore::default(),
             sidebar_visible: true,
             active_tab: ActiveTab::Chat,
+            theme: theme::load_theme(),
         }
     }
 
@@ -1340,13 +1347,14 @@ fn draw_plans_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 /// Render the bottom tab bar shown only in Tabs (narrow) layout.
 /// Number keys 1/2 switch tabs.  The active tab is highlighted.
 fn draw_tab_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    let p = palette(state.theme);
     let active = state.active_tab;
     let make = |label: &str, this: ActiveTab| {
         let is_active = this == active;
         let style = if is_active {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default().fg(p.tab_selected_fg).bg(p.tab_selected_bg).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White).bg(Color::DarkGray)
+            Style::default().fg(p.tab_idle_fg).bg(p.tab_idle_bg)
         };
         Span::styled(format!(" {label} "), style)
     };
@@ -1361,7 +1369,7 @@ fn draw_tab_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         Span::raw(" "),
         make(&plans_label, ActiveTab::Plans),
         Span::styled("  ·  press 1 / 2 to switch  ·  Ctrl-C to quit",
-            Style::default().fg(Color::DarkGray)),
+            Style::default().fg(p.fg_dim)),
     ]);
     let para = Paragraph::new(line).style(Style::default().bg(Color::Reset));
     f.render_widget(para, area);
@@ -1414,11 +1422,12 @@ fn sidebar_target_width(state: &AppState, terminal_width: u16) -> u16 {
 /// visually connected.
 fn draw_sidebar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let p = palette(state.theme);
 
-    let dim = Style::default().fg(Color::DarkGray);
-    let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(Color::Gray);
-    let white = Style::default().fg(Color::White);
+    let dim = Style::default().fg(p.fg_dim);
+    let head = Style::default().fg(p.accent).add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(p.fg_muted);
+    let white = Style::default().fg(p.fg);
 
     let inner_w = area.width.saturating_sub(2) as usize;
     if inner_w == 0 {
@@ -1441,9 +1450,9 @@ fn draw_sidebar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         // name itself if it's too long, with continuation rows
         // indented under the name.
         let (head_dot_style, head_state_label, head_state_style) = match wf.state {
-            WorkflowState::Active => ("●", "active", Style::default().fg(Color::Yellow)),
-            WorkflowState::Done => ("●", "done", Style::default().fg(Color::Green)),
-            WorkflowState::Cancelled => ("●", "cancelled", Style::default().fg(Color::Red)),
+            WorkflowState::Active => ("●", "active", Style::default().fg(p.active)),
+            WorkflowState::Done => ("●", "done", Style::default().fg(p.ok)),
+            WorkflowState::Cancelled => ("●", "cancelled", Style::default().fg(p.error)),
         };
         let done_count = wf.steps.iter().filter(|s| s.state == StepState::Done).count();
         let total = wf.steps.len();
@@ -1474,10 +1483,10 @@ fn draw_sidebar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         // word-wrapped onto continuation rows under the description.
         for (i, step) in wf.steps.iter().enumerate() {
             let (icon, dot_style) = match step.state {
-                StepState::Done => ("✓", Style::default().fg(Color::Green)),
-                StepState::Active => ("⚡", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                StepState::Pending => ("⏳", Style::default().fg(Color::DarkGray)),
-                StepState::Failed => ("✗", Style::default().fg(Color::Red)),
+                StepState::Done => ("✓", Style::default().fg(p.ok)),
+                StepState::Active => ("⚡", Style::default().fg(p.active).add_modifier(Modifier::BOLD)),
+                StepState::Pending => ("⏳", Style::default().fg(p.fg_dim)),
+                StepState::Failed => ("✗", Style::default().fg(p.error)),
             };
             let n = i + 1;
             // Prefix layout: "├─● <icon> N. <text>"
@@ -1526,7 +1535,7 @@ fn draw_sidebar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         .filter(|w| w.state == WorkflowState::Active).count());
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(p.border))
         .title(Span::styled(title_text, head));
 
     let para = Paragraph::new(lines).block(block);
@@ -1604,54 +1613,44 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 
 fn draw_messages(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
+    let p: Palette = palette(state.theme);
+    let gcm = state.theme.gcm();
 
     for msg in &state.messages {
         match msg {
             Message::User(text) => {
                 lines.push(Line::from(vec![
-                    Span::styled("❯ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::styled(text.as_str(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled("❯ ", Style::default().fg(p.user).add_modifier(Modifier::BOLD)),
+                    Span::styled(text.as_str(), Style::default().fg(p.fg_bold).add_modifier(Modifier::BOLD)),
                 ]));
                 lines.push(Line::from(""));
             }
             Message::Assistant(text) => {
-                // The annotate skill teaches the model to emit
-                // ```fact```, ```status```, ```plan``` and ```tool```
-                // blocks for downstream processing; those are NOT for
-                // human reading.  Strip them before rendering so the
-                // chat bubble shows only prose.  Tool execution surfaces
-                // separately as Message::ToolUse + Message::ToolResult.
                 let cleaned = strip_meta_blocks(text);
-                lines.extend(gc_markdown::render_markdown(&cleaned, gc_markdown::Theme::Dark));
+                lines.extend(gc_markdown::render_markdown(&cleaned, gcm));
                 lines.push(Line::from(""));
             }
             Message::System(text) => {
-                // Bright enough to be readable, dimmed enough to
-                // distinguish from actual chat turns.
                 lines.push(Line::from(Span::styled(
-                    format!("  {text}"), Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
+                    format!("  {text}"), Style::default().fg(p.fg_muted).add_modifier(Modifier::ITALIC),
                 )));
                 lines.push(Line::from(""));
             }
             Message::ToolUse { tool, detail } => {
                 lines.push(Line::from(vec![
-                    Span::styled("  ⚡ ", Style::default().fg(Color::Magenta)),
-                    Span::styled(tool.as_str(), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!(" {detail}"), Style::default().fg(Color::Gray)),
+                    Span::styled("  ⚡ ", Style::default().fg(p.tool)),
+                    Span::styled(tool.as_str(), Style::default().fg(p.tool).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!(" {detail}"), Style::default().fg(p.fg_muted)),
                 ]));
             }
             Message::ToolResult { summary } => {
-                lines.extend(gc_markdown::render_markdown(summary, gc_markdown::Theme::Dark));
+                lines.extend(gc_markdown::render_markdown(summary, gcm));
                 lines.push(Line::from(""));
             }
             Message::ToolRender { content } => {
-                lines.extend(gc_markdown::render_markdown(content, gc_markdown::Theme::Dark));
+                lines.extend(gc_markdown::render_markdown(content, gcm));
                 lines.push(Line::from(""));
             }
-            // Hidden system messages are control-channel only — they
-            // go to the model when building the next chat request,
-            // but the user shouldn't see prompts like
-            // "auto-continue: previous tool succeeded…".
             Message::HiddenSystem(_) => {}
         }
     }
@@ -1682,8 +1681,8 @@ fn draw_messages(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(title_text, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        .border_style(Style::default().fg(p.border))
+        .title(Span::styled(title_text, Style::default().fg(p.accent).add_modifier(Modifier::BOLD)));
 
     // No wrap: each entry already fits.  Trim=false preserves indents.
     let para = Paragraph::new(view).block(block);
@@ -1800,17 +1799,18 @@ fn message_estimated_rows(msg: &Message) -> Vec<usize> {
 }
 
 fn draw_input(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    let p = palette(state.theme);
     let (style, text) = if state.is_generating {
-        (Style::default().fg(Color::Gray), "  generating...".to_string())
+        (Style::default().fg(p.fg_muted), "  generating...".to_string())
     } else if state.input.is_empty() {
-        (Style::default().fg(Color::Gray), "  Type a question...".to_string())
+        (Style::default().fg(p.fg_muted), "  Type a question...".to_string())
     } else {
-        (Style::default().fg(Color::White).add_modifier(Modifier::BOLD), format!("  {}", state.input))
+        (Style::default().fg(p.fg_bold).add_modifier(Modifier::BOLD), format!("  {}", state.input))
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if state.is_generating { Color::DarkGray } else { Color::Cyan }));
+        .border_style(Style::default().fg(if state.is_generating { p.fg_dim } else { p.accent }));
     let para = Paragraph::new(Line::from(Span::styled(text, style))).block(block);
     f.render_widget(para, area);
 
@@ -1820,6 +1820,7 @@ fn draw_input(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_status(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    let p = palette(state.theme);
     let plans_hint = if state.workflows.workflows.is_empty() {
         ""
     } else if state.sidebar_visible {
@@ -1827,10 +1828,11 @@ fn draw_status(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     } else {
         "  ·  Ctrl-B: show plans"
     };
+    let theme_hint = format!("  ·  Ctrl-L: {} theme", state.theme.toggle().name());
     let copy_hint = "  ·  Ctrl-Y: copy mode";
-    let status = format!(" {}{}{}  ", state.status, plans_hint, copy_hint);
+    let status = format!(" {}{}{}{}  ", state.status, plans_hint, copy_hint, theme_hint);
     let para = Paragraph::new(Line::from(Span::styled(
-        status, Style::default().fg(Color::White).bg(Color::DarkGray),
+        status, Style::default().fg(p.status_fg).bg(p.status_bg),
     )));
     f.render_widget(para, area);
 }
@@ -2837,6 +2839,14 @@ async fn main() -> io::Result<()> {
                         let _ = enable_raw_mode();
                         let mut so = io::stdout();
                         let _ = execute!(so, EnterAlternateScreen);
+                        let _ = terminal.clear();
+                        draw(&mut terminal, &state);
+                    }
+                    KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Cycle theme + persist.
+                        state.theme = state.theme.toggle();
+                        theme::save_theme(state.theme);
+                        state.status = format!("theme: {}", state.theme.name());
                         let _ = terminal.clear();
                         draw(&mut terminal, &state);
                     }

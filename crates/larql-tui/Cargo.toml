@@ -18,3 +18,4 @@ reqwest = { version = "0.12", features = ["stream", "json"] }
 futures = "0.3"
 gc-markdown = { path = "../gc-markdown" }
 unicode-width = "0.2"
+shell-words = "1"

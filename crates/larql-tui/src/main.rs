@@ -473,17 +473,25 @@ fn execute_skill_tool(
         .unwrap_or_else(|| "host".into());
 
     use std::io::Write as _;
+    // Tokenise skill_args with full shell-word semantics so quoted
+    // strings, heredoc-ish payloads, and embedded whitespace survive
+    // intact.  `split_whitespace` would tear `python3 -c "x  y"` into
+    // 4 tokens, destroying every multi-space indent inside the
+    // quoted source.  shell_words fails only on truly malformed
+    // input (unclosed quote) — fall back to whitespace split there.
+    let argv = shell_words::split(&skill_args)
+        .unwrap_or_else(|_| skill_args.split_whitespace().map(str::to_string).collect());
     let mut command = if runtime == "container" {
         let _ = ensure_runtime_container();
         let mut c = std::process::Command::new("docker");
         c.args(["exec", "-i", "larql-skill-runtime", "bash"]);
         c.arg(&path);
-        c.args(skill_args.split_whitespace());
+        c.args(&argv);
         c
     } else {
         let mut c = std::process::Command::new("bash");
         c.arg(&path);
-        c.args(skill_args.split_whitespace());
+        c.args(&argv);
         c
     };
     let mut child = match command
@@ -2523,6 +2531,45 @@ mod layout_tests {
         assert_eq!(compute_layout(&s, rect(67)), LayoutMode::Tabs);
         // At 100 we should be side-by-side.
         assert!(matches!(compute_layout(&s, rect(100)), LayoutMode::SideBySide { .. }));
+    }
+}
+
+#[cfg(test)]
+mod tokenize_tests {
+    /// The legacy `split_whitespace` path destroyed every multi-space
+    /// run inside a quoted argument; shell_words preserves them.
+    /// These tests pin the new behaviour so we don't regress.
+    #[test]
+    fn shell_words_preserves_quoted_indentation() {
+        let input = "python3 -c \"def f():\n    return 1\nprint(f())\"";
+        let argv = shell_words::split(input).expect("tokenise");
+        assert_eq!(argv.len(), 3);
+        assert_eq!(argv[0], "python3");
+        assert_eq!(argv[1], "-c");
+        // The 4-space indent before `return` MUST survive.
+        assert!(argv[2].contains("    return 1"));
+        assert!(argv[2].contains("\n"));
+    }
+
+    #[test]
+    fn shell_words_split_whitespace_diverge_on_quotes() {
+        let input = "ls \"path with spaces\"";
+        let argv = shell_words::split(input).unwrap();
+        assert_eq!(argv, vec!["ls", "path with spaces"]);
+        // For comparison, the legacy path would mistokenise:
+        let legacy: Vec<String> = input.split_whitespace().map(str::to_string).collect();
+        assert_eq!(legacy, vec!["ls", "\"path", "with", "spaces\""]);
+    }
+
+    #[test]
+    fn shell_words_falls_back_on_unclosed_quote() {
+        // We choose to fall back to whitespace split rather than fail
+        // the tool call — the user gets *something* even from a half
+        // emitted command.  This test pins the unwrap_or_else branch.
+        let bad = "ls \"unclosed";
+        assert!(shell_words::split(bad).is_err());
+        let fallback: Vec<String> = bad.split_whitespace().map(str::to_string).collect();
+        assert_eq!(fallback, vec!["ls", "\"unclosed"]);
     }
 }
 

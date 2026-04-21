@@ -857,13 +857,19 @@ fn extract_block(text: &str, lang: &str) -> Option<String> {
 
 fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &AppState) {
     terminal.draw(|f| {
-        // Sidebar shows the live workflow graph.  Auto-hide on narrow
-        // terminals so the chat panel always has at least 60 cols.
+        // Sidebar shows the live workflow graph.  Width is responsive:
+        // grow to fit the longest label (so steps render on one line
+        // whenever possible), clamped between 28 and 45% of the
+        // terminal so the chat panel always has at least 40 cols.
         let area = f.area();
-        let sidebar_w: u16 = 34;
+        let sidebar_w = if state.workflows.workflows.is_empty() {
+            0
+        } else {
+            sidebar_target_width(state, area.width)
+        };
         let show_sidebar = state.sidebar_visible
-            && area.width >= 60 + sidebar_w
-            && !state.workflows.workflows.is_empty();
+            && sidebar_w > 0
+            && area.width.saturating_sub(sidebar_w) >= 40;
 
         let (chat_area, sidebar_area) = if show_sidebar {
             let cols = Layout::default()
@@ -894,22 +900,62 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &AppState)
     }).ok();
 }
 
+/// Pick a sidebar width that fits the longest label without wrapping
+/// when the terminal is wide enough.  Clamps to [28, 45% of terminal
+/// width] so the chat panel always has room.  Returns 0 when we
+/// shouldn't render the sidebar at all (no workflows or terminal too
+/// narrow).
+fn sidebar_target_width(state: &AppState, terminal_width: u16) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+    if state.workflows.workflows.is_empty() {
+        return 0;
+    }
+    // Step prefix: "├─● ⚡ N. " — 9 cells.  Borders add 2.  Output
+    // continuation prefix is "│   ↪ " — 6 cells.  Use the bigger.
+    const PREFIX: usize = 11;
+    let longest_label = state
+        .workflows
+        .workflows
+        .iter()
+        .flat_map(|w| {
+            let head = w.name.as_str();
+            let head_width = UnicodeWidthStr::width(head)
+                + format!("  [{}/{}]", w.steps.len(), w.steps.len()).len();
+            std::iter::once(head_width)
+                .chain(w.steps.iter().map(|s| UnicodeWidthStr::width(s.description.as_str()) + 4))
+                .chain(
+                    w.steps
+                        .iter()
+                        .filter_map(|s| s.output.as_deref())
+                        .map(|o| UnicodeWidthStr::width(o) + 6),
+                )
+        })
+        .max()
+        .unwrap_or(20);
+    let cap = (terminal_width as usize * 45 / 100).max(28);
+    let target = (longest_label + PREFIX).clamp(28, cap);
+    target as u16
+}
+
 /// Render the workflow store as a gitk-style branch graph: each
-/// workflow is its own column of dots-on-a-pipe (`*` nodes connected
+/// workflow is its own column of dots-on-a-pipe (`●` nodes connected
 /// by `│` segments), workflows stack vertically.  Step state
 /// determines the dot colour + the trailing icon (✓ ⚡ ⏳ ✗).
+///
+/// Long labels are word-wrapped (no mid-word breaks, no ellipsis);
+/// continuation rows render the workflow's pipe so the column stays
+/// visually connected.
 fn draw_sidebar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
     let dim = Style::default().fg(Color::DarkGray);
     let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(Color::Gray);
+    let white = Style::default().fg(Color::White);
 
-    if state.workflows.workflows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no plans yet — emit ```plan``` to start",
-            dim,
-        )));
+    let inner_w = area.width.saturating_sub(2) as usize;
+    if inner_w == 0 {
+        return;
     }
 
     // Newest workflows on top so the active stuff is always visible.
@@ -918,37 +964,47 @@ fn draw_sidebar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     for (idx, wf) in wfs.iter().enumerate() {
         if idx > 0 {
-            // Gap between workflows.  Render a tiny "diverge" hint to
-            // suggest a new branch — gitk would show `|/` here when
-            // branches converge; we just show a styled separator.
+            // Gap between workflows — gitk-ish divergence marker.
             lines.push(Line::from(Span::styled("│", dim)));
             lines.push(Line::from(Span::styled("◇", dim)));
             lines.push(Line::from(Span::styled("│", dim)));
         }
 
-        // Workflow head: bold dot + name + state tag.
-        let (head_dot, head_state_str, head_state_style) = match wf.state {
+        // Workflow head row: bold dot + name + [done/total].  Wrap the
+        // name itself if it's too long, with continuation rows
+        // indented under the name.
+        let (head_dot_style, head_state_label, head_state_style) = match wf.state {
             WorkflowState::Active => ("●", "active", Style::default().fg(Color::Yellow)),
             WorkflowState::Done => ("●", "done", Style::default().fg(Color::Green)),
             WorkflowState::Cancelled => ("●", "cancelled", Style::default().fg(Color::Red)),
         };
         let done_count = wf.steps.iter().filter(|s| s.state == StepState::Done).count();
         let total = wf.steps.len();
+        let count_str = format!("  [{done_count}/{total}]");
+        let head_prefix_w = 2; // "● "
+        let count_w = unicode_width::UnicodeWidthStr::width(count_str.as_str());
+        let name_budget = inner_w.saturating_sub(head_prefix_w + count_w).max(1);
+        let name_rows = wrap_words(&wf.name, name_budget);
+        for (i, row) in name_rows.iter().enumerate() {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if i == 0 {
+                spans.push(Span::styled(format!("{head_dot_style} "), head_state_style));
+            } else {
+                spans.push(Span::styled("  ".to_string(), dim));
+            }
+            spans.push(Span::styled(row.clone(), head));
+            if i + 1 == name_rows.len() {
+                spans.push(Span::styled(count_str.clone(), muted));
+            }
+            lines.push(Line::from(spans));
+        }
         lines.push(Line::from(vec![
-            Span::styled(format!("{head_dot} "), head_state_style),
-            Span::styled(wf.name.clone(), head),
-            Span::raw("  "),
-            Span::styled(format!("[{done_count}/{total}]"), muted),
+            Span::styled("│ ".to_string(), dim),
+            Span::styled(head_state_label.to_string(), head_state_style),
         ]));
-        lines.push(Line::from(vec![
-            Span::raw("│ "),
-            Span::styled(head_state_str, head_state_style),
-        ].into_iter().map(|s| {
-            // The leading "│ " should be dim; the state tag keeps its colour.
-            if s.content == "│ " { Span::styled(s.content, dim) } else { s }
-        }).collect::<Vec<_>>()));
 
-        // Each step: a dot on the workflow's pipe + numbered label.
+        // Each step: a dot on the workflow's pipe + numbered label,
+        // word-wrapped onto continuation rows under the description.
         for (i, step) in wf.steps.iter().enumerate() {
             let (icon, dot_style) = match step.state {
                 StepState::Done => ("✓", Style::default().fg(Color::Green)),
@@ -957,29 +1013,47 @@ fn draw_sidebar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 StepState::Failed => ("✗", Style::default().fg(Color::Red)),
             };
             let n = i + 1;
-            // Pipe coming down from the head, dot for this step.
-            lines.push(Line::from(vec![
-                Span::styled("├─", dim),
-                Span::styled(format!("● {icon} "), dot_style),
-                Span::styled(format!("{n}. "), muted),
-                Span::styled(truncate_for_sidebar(&step.description), Style::default().fg(Color::White)),
-            ]));
+            // Prefix layout: "├─● <icon> N. <text>"
+            //                 ^^   ^^^^^ ^^^
+            //                  2     4    3-4 (depending on N digits)
+            let n_str = format!("{n}. ");
+            let prefix_w = 2 + 4 + unicode_width::UnicodeWidthStr::width(n_str.as_str());
+            let cont_indent = " ".repeat(prefix_w.saturating_sub(2));
+            let text_budget = inner_w.saturating_sub(prefix_w).max(1);
+            let rows = wrap_words(&step.description, text_budget);
+            for (j, row) in rows.iter().enumerate() {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                if j == 0 {
+                    spans.push(Span::styled("├─".to_string(), dim));
+                    spans.push(Span::styled(format!("● {icon} "), dot_style));
+                    spans.push(Span::styled(n_str.clone(), muted));
+                } else {
+                    spans.push(Span::styled("│ ".to_string(), dim));
+                    spans.push(Span::styled(cont_indent.clone(), dim));
+                }
+                spans.push(Span::styled(row.clone(), white));
+                lines.push(Line::from(spans));
+            }
             if let Some(out) = &step.output {
-                lines.push(Line::from(vec![
-                    Span::styled("│   ", dim),
-                    Span::styled("↪ ", muted),
-                    Span::styled(truncate_for_sidebar(out), dim),
-                ]));
+                let out_prefix_w: usize = 6; // "│   ↪ "
+                let out_cont_indent = " ".repeat(out_prefix_w.saturating_sub(2));
+                let out_budget = inner_w.saturating_sub(out_prefix_w).max(1);
+                let out_rows = wrap_words(out, out_budget);
+                for (j, row) in out_rows.iter().enumerate() {
+                    let mut spans: Vec<Span<'static>> = Vec::new();
+                    if j == 0 {
+                        spans.push(Span::styled("│   ".to_string(), dim));
+                        spans.push(Span::styled("↪ ".to_string(), muted));
+                    } else {
+                        spans.push(Span::styled("│ ".to_string(), dim));
+                        spans.push(Span::styled(out_cont_indent.clone(), dim));
+                    }
+                    spans.push(Span::styled(row.clone(), dim));
+                    lines.push(Line::from(spans));
+                }
             }
         }
     }
-
-    // Pre-wrap to area width so long names don't blow out the column.
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let wrapped: Vec<Line<'static>> = lines
-        .into_iter()
-        .flat_map(|l| wrap_line_to_rows(l, inner_w))
-        .collect();
 
     let title_text = format!(" plans · {} active ", state.workflows.workflows.iter()
         .filter(|w| w.state == WorkflowState::Active).count());
@@ -988,18 +1062,77 @@ fn draw_sidebar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(title_text, head));
 
-    let para = Paragraph::new(wrapped).block(block);
+    let para = Paragraph::new(lines).block(block);
     f.render_widget(para, area);
 }
 
-fn truncate_for_sidebar(s: &str) -> String {
-    let s = s.trim();
-    if s.chars().count() > 28 {
-        let cut: String = s.chars().take(27).collect();
-        format!("{cut}…")
-    } else {
-        s.to_string()
+/// Greedy word-wrap: split `text` into rows of at most `width`
+/// terminal cells, breaking only on whitespace.  Words that exceed
+/// `width` on their own (rare) fall back to a hard char split.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if width == 0 {
+        return vec![text.to_string()];
     }
+    let mut rows: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in text.split_whitespace() {
+        let w_w = UnicodeWidthStr::width(word);
+        if cur.is_empty() {
+            if w_w <= width {
+                cur.push_str(word);
+                cur_w = w_w;
+            } else {
+                // Hard-split a too-long word into multiple rows.
+                let mut chunk = String::new();
+                let mut chunk_w = 0usize;
+                for ch in word.chars() {
+                    let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if chunk_w + cw > width && !chunk.is_empty() {
+                        rows.push(std::mem::take(&mut chunk));
+                        chunk_w = 0;
+                    }
+                    chunk.push(ch);
+                    chunk_w += cw;
+                }
+                cur = chunk;
+                cur_w = chunk_w;
+            }
+        } else if cur_w + 1 + w_w <= width {
+            cur.push(' ');
+            cur.push_str(word);
+            cur_w += 1 + w_w;
+        } else {
+            rows.push(std::mem::take(&mut cur));
+            cur_w = 0;
+            if w_w <= width {
+                cur.push_str(word);
+                cur_w = w_w;
+            } else {
+                let mut chunk = String::new();
+                let mut chunk_w = 0usize;
+                for ch in word.chars() {
+                    let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if chunk_w + cw > width && !chunk.is_empty() {
+                        rows.push(std::mem::take(&mut chunk));
+                        chunk_w = 0;
+                    }
+                    chunk.push(ch);
+                    chunk_w += cw;
+                }
+                cur = chunk;
+                cur_w = chunk_w;
+            }
+        }
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
 }
 
 fn draw_messages(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
@@ -2093,4 +2226,46 @@ async fn main() -> io::Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod sidebar_tests {
+    use super::wrap_words;
+
+    #[test]
+    fn fits_when_short() {
+        assert_eq!(wrap_words("hello world", 20), vec!["hello world"]);
+    }
+
+    #[test]
+    fn breaks_only_on_whitespace() {
+        let rows = wrap_words("implement Redis client with consistent hashing", 18);
+        // No row should end mid-word.
+        for row in &rows {
+            for ch in row.chars().rev() {
+                if ch == ' ' { panic!("trailing space in row {row:?}"); }
+                break;
+            }
+            assert!(row.len() <= 18 + 1, "row too wide: {row:?}");
+        }
+        let joined = rows.join(" ");
+        assert_eq!(joined, "implement Redis client with consistent hashing");
+    }
+
+    #[test]
+    fn no_ellipsis_in_long_word() {
+        // A pathological identifier longer than width gets hard-split,
+        // but still no ellipsis character.
+        let rows = wrap_words("supercalifragilisticexpialidocious", 10);
+        for row in &rows {
+            assert!(!row.contains('…'));
+        }
+        assert_eq!(rows.join(""), "supercalifragilisticexpialidocious");
+    }
+
+    #[test]
+    fn empty_text_yields_one_empty_row() {
+        let rows = wrap_words("", 10);
+        assert_eq!(rows, vec![String::new()]);
+    }
 }

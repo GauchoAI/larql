@@ -141,7 +141,7 @@ fn merge_entries(entries: &[(String, f64)], target: usize) -> Vec<(String, f64)>
 fn render_chartjs(content: &str, theme: Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let (fg, label_color) = match theme {
-        Theme::Dark => (Color::White, Color::Rgb(180, 180, 180)),
+        Theme::Dark => (Color::White, Color::Rgb(210, 210, 210)),
         Theme::Light => (Color::Black, Color::Rgb(80, 80, 80)),
     };
 
@@ -331,7 +331,7 @@ fn render_diff(content: &str, _theme: Theme) -> Vec<Line<'static>> {
 
 fn render_terminal(content: &str, theme: Theme) -> Vec<Line<'static>> {
     let (cmd_color, output_color) = match theme {
-        Theme::Dark => (Color::Rgb(100, 200, 100), Color::Rgb(160, 160, 160)),
+        Theme::Dark => (Color::Rgb(120, 220, 120), Color::Rgb(210, 210, 210)),
         Theme::Light => (Color::Rgb(40, 120, 40), Color::Rgb(100, 100, 100)),
     };
 
@@ -456,8 +456,8 @@ fn render_boxed(content: &str, label: &str, theme: Theme) -> Vec<Line<'static>> 
 fn render_pipe_table(rows: &[&str], theme: Theme) -> Vec<Line<'static>> {
     let (fg, bold_color, dim_color, link_color) = match theme {
         Theme::Dark => (
-            Color::Rgb(220, 220, 220), Color::Rgb(255, 255, 255),
-            Color::Rgb(140, 140, 140), Color::Rgb(100, 180, 255),
+            Color::Rgb(245, 245, 245), Color::Rgb(255, 255, 255),
+            Color::Rgb(185, 185, 185), Color::Rgb(120, 190, 255),
         ),
         Theme::Light => (
             Color::Rgb(40, 40, 50), Color::Rgb(0, 0, 0),
@@ -536,11 +536,11 @@ fn render_pipe_table(rows: &[&str], theme: Theme) -> Vec<Line<'static>> {
 fn render_markdown_line(line: &str, theme: Theme) -> Line<'static> {
     let (fg, bold_color, dim_color, heading_color, link_color) = match theme {
         Theme::Dark => (
-            Color::Rgb(220, 220, 220),
-            Color::Rgb(255, 255, 255),
-            Color::Rgb(140, 140, 140),
-            Color::Rgb(100, 200, 255),
-            Color::Rgb(100, 180, 255),
+            Color::Rgb(245, 245, 245),   // primary text — near-white for max contrast
+            Color::Rgb(255, 255, 255),   // bold — pure white
+            Color::Rgb(185, 185, 185),   // "dim" — still very readable, not low-contrast
+            Color::Rgb(120, 210, 255),   // headings — bright cyan
+            Color::Rgb(120, 190, 255),   // links
         ),
         Theme::Light => (
             Color::Rgb(40, 40, 50),

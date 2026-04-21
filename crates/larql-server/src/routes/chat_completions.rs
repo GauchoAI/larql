@@ -266,11 +266,17 @@ fn run_chat(
 
     // Stop tokens: EOS plus Gemma's <end_of_turn> (id 106 on the Gemma vocab).
     let stop_ids: [i32; 2] = [1, 106];
+    // Also stop on literal-string forms the model sometimes emits as
+    // plain characters (happens in the middle of a response when the
+    // model "hallucinates" its own turn terminator).  This MUST catch
+    // all prefixes of the stop tag so we strip them before they
+    // reach the TUI.
+    const STOP_STRS: &[&str] = &["<end_of_turn>", "<start_of_turn>"];
 
     timing.first_token_ms = req_start.elapsed().as_secs_f64() * 1000.0;
     let decode_start = Instant::now();
     let first_tok = pipe.decode_token(next);
-    if !first_tok.is_empty() {
+    if !first_tok.is_empty() && !stop_ids.contains(&next) {
         assistant_buf.push_str(&first_tok);
         timing.decoded_tokens += 1;
         if tx.blocking_send(Ok(sse_delta(&first_tok))).is_err() {
@@ -300,6 +306,21 @@ fn run_chat(
         }
         assistant_buf.push_str(&tok);
         timing.decoded_tokens += 1;
+        // Stop if the model generated a stop-tag as plain characters
+        // (id 106 is the "correct" terminator but sometimes Gemma
+        // predicts the literal string token by token — e.g. after a
+        // `clock` tool result it starts a new synthetic turn).  When
+        // we detect a prefix growing, trim it from the buffer and
+        // break before forwarding to the client.
+        if STOP_STRS.iter().any(|s| assistant_buf.ends_with(s)) {
+            // Strip the tag from what we've already got and break.
+            for s in STOP_STRS {
+                if let Some(pos) = assistant_buf.rfind(s) {
+                    assistant_buf.truncate(pos);
+                }
+            }
+            break;
+        }
         if tx.blocking_send(Ok(sse_delta(&tok))).is_err() {
             timing.decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
             log_assistant_with_timing(&assistant_buf, session_id, &timing);

@@ -812,6 +812,13 @@ fn should_auto_continue(
     if tool_depth >= max_depth {
         return None;
     }
+    // Loop-detection: if the last two assistant responses are
+    // essentially the same, the model is stuck echoing itself (e.g.
+    // "Okay, let's add a clock command…" → clock → same prose →
+    // clock → …).  Don't auto-continue — it won't break the loop.
+    if model_is_echoing_itself(state) {
+        return None;
+    }
     let has_pending = state.workflows.workflows.iter().any(|w| {
         w.state == WorkflowState::Active
             && w.steps
@@ -877,6 +884,73 @@ fn next_pending_step(state: &AppState) -> Option<String> {
         }
     }
     None
+}
+
+/// True when the two most recent non-empty assistant messages are
+/// essentially the same (Gemma repetition loop: same prose + same
+/// tool block, often triggered by tool-result recursion).  We
+/// compare the meta-stripped + tool-stripped prose prefix after
+/// normalising whitespace.
+fn model_is_echoing_itself(state: &AppState) -> bool {
+    let mut prev: Option<String> = None;
+    let mut prev_prev: Option<String> = None;
+    for m in state.messages.iter().rev() {
+        if let Message::Assistant(t) = m {
+            if t.is_empty() {
+                continue;
+            }
+            let cleaned: String = strip_meta_blocks(t)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if cleaned.is_empty() {
+                // Pure meta: tool blocks.  Use the raw tool name as
+                // the fingerprint so "same tool twice" counts.
+                let tool_sig = extract_tool_sig(t);
+                if prev.is_none() {
+                    prev = Some(tool_sig);
+                } else {
+                    prev_prev = Some(tool_sig);
+                    break;
+                }
+            } else {
+                let snippet: String = cleaned.chars().take(120).collect();
+                if prev.is_none() {
+                    prev = Some(snippet);
+                } else {
+                    prev_prev = Some(snippet);
+                    break;
+                }
+            }
+        }
+    }
+    match (prev, prev_prev) {
+        (Some(a), Some(b)) => !a.is_empty() && a == b,
+        _ => false,
+    }
+}
+
+/// Extract a short fingerprint for a tool-only assistant message —
+/// the first `run <cmd>` / skill name so repeated identical tool
+/// calls get detected as echoes.
+fn extract_tool_sig(text: &str) -> String {
+    if let Some(open) = text.find("```tool") {
+        let after = &text[open + "```tool".len()..];
+        if let Some(nl) = after.find('\n') {
+            let body = &after[nl + 1..];
+            if let Some(close) = body.find("```") {
+                let first_line: String = body[..close]
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect();
+                return first_line.trim().to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 /// True when the last assistant message, after stripping meta
@@ -1061,8 +1135,20 @@ fn mark_skill_used(server_url: &str, name: &str, success: bool) {
 /// pipelines respectively, and shouldn't render as raw code in the
 /// chat bubble.  Partial blocks (still streaming, no close fence
 /// yet) are also hidden so we don't flicker raw markdown while
-/// generating.
+/// generating.  Also strip Gemma's special turn tokens that
+/// sometimes leak through when the model hallucinates them as
+/// plain characters.
 fn strip_meta_blocks(text: &str) -> String {
+    // Cheap first-pass: drop special turn tokens anywhere they
+    // appear.  Everything AFTER <end_of_turn> is almost certainly
+    // model-generated garbage continuing into a synthetic new turn.
+    let text = if let Some(pos) = text.find("<end_of_turn>") {
+        &text[..pos]
+    } else {
+        text
+    };
+    let text = text.replace("<start_of_turn>", "").replace("<end_of_turn>", "");
+    let text = text.as_str();
     const HIDDEN: &[&str] = &["fact", "status", "plan", "tool"];
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0usize;
@@ -1540,8 +1626,10 @@ fn draw_messages(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 lines.push(Line::from(""));
             }
             Message::System(text) => {
+                // Bright enough to be readable, dimmed enough to
+                // distinguish from actual chat turns.
                 lines.push(Line::from(Span::styled(
-                    format!("  {text}"), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    format!("  {text}"), Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
                 )));
                 lines.push(Line::from(""));
             }
@@ -1549,7 +1637,7 @@ fn draw_messages(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 lines.push(Line::from(vec![
                     Span::styled("  ⚡ ", Style::default().fg(Color::Magenta)),
                     Span::styled(tool.as_str(), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!(" {detail}"), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!(" {detail}"), Style::default().fg(Color::Gray)),
                 ]));
             }
             Message::ToolResult { summary } => {
@@ -1713,11 +1801,11 @@ fn message_estimated_rows(msg: &Message) -> Vec<usize> {
 
 fn draw_input(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let (style, text) = if state.is_generating {
-        (Style::default().fg(Color::DarkGray), "  generating...".to_string())
+        (Style::default().fg(Color::Gray), "  generating...".to_string())
     } else if state.input.is_empty() {
-        (Style::default().fg(Color::DarkGray), "  Type a question...".to_string())
+        (Style::default().fg(Color::Gray), "  Type a question...".to_string())
     } else {
-        (Style::default().fg(Color::White), format!("  {}", state.input))
+        (Style::default().fg(Color::White).add_modifier(Modifier::BOLD), format!("  {}", state.input))
     };
 
     let block = Block::default()

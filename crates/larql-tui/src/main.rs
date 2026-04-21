@@ -15,7 +15,7 @@ use workflows::{
 };
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEventKind,
+    self, DisableMouseCapture, Event as CEvent, KeyCode, KeyEventKind,
     KeyModifiers, MouseEventKind,
 };
 use crossterm::terminal::{
@@ -45,6 +45,11 @@ enum Message {
     /// Render-only payload (charts, etc).  NOT sent back to the model
     /// — it lives only for the human reading the TUI.
     ToolRender { content: String },
+    /// Inverse of ToolRender: goes to the model (as a system role)
+    /// but is NOT rendered in the chat bubble.  Used for internal
+    /// control prompts like the auto-continue nudge — the user
+    /// shouldn't see "auto-continue: previous tool succeeded…".
+    HiddenSystem(String),
 }
 
 enum StreamEvent {
@@ -82,11 +87,6 @@ struct AppState {
     sidebar_visible: bool,
     /// In tabbed layout (narrow terminal), which view is foregrounded.
     active_tab: ActiveTab,
-    /// Whether the terminal is currently capturing mouse events (for
-    /// our scroll-wheel scroll).  When true, native text selection is
-    /// disabled — Ctrl-T toggles it off so the user can drag to copy,
-    /// then back on.
-    mouse_captured: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -132,11 +132,6 @@ impl AppState {
             workflows: WorkflowStore::default(),
             sidebar_visible: true,
             active_tab: ActiveTab::Chat,
-            // Default OFF so click-to-copy works out of the box.
-            // Ctrl-T re-enables for scroll-wheel users.  Click-to-
-            // copy is the more common need; scroll wheel has
-            // keyboard fallbacks (Up/Down/PageUp/PageDown/Home/End).
-            mouse_captured: false,
         }
     }
 
@@ -1488,6 +1483,11 @@ fn draw_messages(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 lines.extend(gc_markdown::render_markdown(content, gc_markdown::Theme::Dark));
                 lines.push(Line::from(""));
             }
+            // Hidden system messages are control-channel only — they
+            // go to the model when building the next chat request,
+            // but the user shouldn't see prompts like
+            // "auto-continue: previous tool succeeded…".
+            Message::HiddenSystem(_) => {}
         }
     }
 
@@ -1630,6 +1630,7 @@ fn message_estimated_rows(msg: &Message) -> Vec<usize> {
         Message::ToolUse { tool, detail } => {
             vec![tool.chars().count() + detail.chars().count() + 4]
         }
+        Message::HiddenSystem(_) => Vec::new(),
     }
 }
 
@@ -1662,12 +1663,7 @@ fn draw_status(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         "  ·  Ctrl-B: show plans"
     };
     let copy_hint = "  ·  Ctrl-Y: copy mode";
-    let mouse_hint = if state.mouse_captured {
-        "  ·  Ctrl-T: scroll OFF"
-    } else {
-        ""
-    };
-    let status = format!(" {}{}{}{}  ", state.status, plans_hint, copy_hint, mouse_hint);
+    let status = format!(" {}{}{}  ", state.status, plans_hint, copy_hint);
     let para = Paragraph::new(Line::from(Span::styled(
         status, Style::default().fg(Color::White).bg(Color::DarkGray),
     )));
@@ -2155,6 +2151,15 @@ fn build_chat_messages_with_system(state: &AppState) -> Vec<ChatMsg> {
                     content: text.clone(),
                 });
             }
+            Message::HiddenSystem(text) if !text.is_empty() => {
+                // Internal control prompts (auto-continue nudges) —
+                // hidden from the user but sent to the model as a
+                // system role so they actually steer behaviour.
+                system_msgs.push(ChatMsg {
+                    role: "system".into(),
+                    content: text.clone(),
+                });
+            }
             Message::User(text) if !text.is_empty() => {
                 all.push(ChatMsg {
                     role: "user".into(),
@@ -2507,7 +2512,7 @@ async fn main() -> io::Result<()> {
                                      accomplished and the result the user wanted.".to_string()
                                 }
                             };
-                            state.messages.push(Message::System(prompt));
+                            state.messages.push(Message::HiddenSystem(prompt));
                             state.messages.push(Message::Assistant(String::new()));
                             let chat_msgs = build_chat_messages_with_system(&state);
                             spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone(), state.session_id.clone());
@@ -2563,21 +2568,6 @@ async fn main() -> io::Result<()> {
                 match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Toggle mouse capture so the user can drop
-                        // out of "scroll-wheel" mode and natively
-                        // select text to copy.  When captured, the
-                        // app eats every mouse event including drags.
-                        state.mouse_captured = !state.mouse_captured;
-                        if state.mouse_captured {
-                            let _ = execute!(io::stdout(), EnableMouseCapture);
-                            state.status = "mouse capture ON (scroll wheel works)".into();
-                        } else {
-                            let _ = execute!(io::stdout(), DisableMouseCapture);
-                            state.status = "mouse capture OFF — drag to select text".into();
-                        }
-                        draw(&mut terminal, &state);
-                    }
                     KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         // Copy mode: drop the alt screen entirely so
                         // the chat transcript ends up in normal
@@ -2613,6 +2603,7 @@ async fn main() -> io::Result<()> {
                                     println!("{content}\n");
                                 }
                                 Message::System(t) => println!("({t})"),
+                                Message::HiddenSystem(_) => {}
                             }
                         }
                         println!();
@@ -2623,9 +2614,6 @@ async fn main() -> io::Result<()> {
                         let _ = enable_raw_mode();
                         let mut so = io::stdout();
                         let _ = execute!(so, EnterAlternateScreen);
-                        if state.mouse_captured {
-                            let _ = execute!(so, EnableMouseCapture);
-                        }
                         let _ = terminal.clear();
                         draw(&mut terminal, &state);
                     }

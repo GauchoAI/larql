@@ -108,8 +108,11 @@ impl WorkflowStore {
     }
 
     /// Apply a status update.  Matches the workflow by name (case
-    /// insensitive, trimmed) and the step by description (substring,
-    /// case insensitive).  Returns true if anything changed.
+    /// insensitive, trimmed).  Step is matched primarily by 1-based
+    /// index (parsed from `step: N/M -- ...`) because the model
+    /// frequently paraphrases the description in status blocks; falls
+    /// back to substring matching if the index is missing.
+    /// Returns true if anything changed.
     pub fn apply_status(&mut self, upd: &StatusUpdate) -> bool {
         let wf = match self
             .workflows
@@ -119,14 +122,26 @@ impl WorkflowStore {
             Some(w) => w,
             None => return false,
         };
-        let needle = upd.step.trim().to_lowercase();
-        let step = match wf
-            .steps
-            .iter_mut()
-            .find(|s| s.description.to_lowercase().contains(&needle))
-        {
-            Some(s) => s,
-            None => return false,
+        let step = if let Some(idx1) = upd.step_index {
+            // 1-based index → 0-based slice position.
+            let pos = idx1.saturating_sub(1);
+            match wf.steps.get_mut(pos) {
+                Some(s) => s,
+                None => return false,
+            }
+        } else {
+            let needle = upd.step.trim().to_lowercase();
+            if needle.is_empty() {
+                return false;
+            }
+            match wf
+                .steps
+                .iter_mut()
+                .find(|s| s.description.to_lowercase().contains(&needle))
+            {
+                Some(s) => s,
+                None => return false,
+            }
         };
         let mut changed = false;
         if let Some(state) = upd.state {
@@ -158,6 +173,13 @@ pub struct StatusUpdate {
     pub step: String,
     pub state: Option<StepState>,
     pub output: Option<String>,
+    /// Optional 1-based step index, parsed from `N/M` prefix in the
+    /// step field (e.g. `step: 2/3 -- run the script`).  Used as
+    /// the primary matcher because the model often paraphrases the
+    /// step description in status updates ("File created" vs the
+    /// plan's "Create a Python file with…"), which makes substring
+    /// matching unreliable.
+    pub step_index: Option<usize>,
 }
 
 fn now_unix() -> u64 {
@@ -276,6 +298,7 @@ fn strip_list_marker(line: &str) -> Option<&str> {
 fn parse_status_body(body: &str) -> Option<StatusUpdate> {
     let mut wf = String::new();
     let mut step = String::new();
+    let mut step_index: Option<usize> = None;
     let mut state: Option<StepState> = None;
     let mut output: Option<String> = None;
     let mut task_name: Option<String> = None;
@@ -284,14 +307,15 @@ fn parse_status_body(body: &str) -> Option<StatusUpdate> {
         if let Some(v) = strip_field(line, "workflow") {
             wf = v.to_string();
         } else if let Some(v) = strip_field(line, "task") {
-            // Older skill format used `task:` for the workflow name when
-            // it wasn't part of a multi-step plan.  Treat it as a
-            // workflow-of-one — useful for the sidebar.
             task_name = Some(v.to_string());
         } else if let Some(v) = strip_field(line, "step") {
-            // Strip a leading `N/M --` prefix if present so the parser
-            // matches the step description rather than the index.
-            step = strip_step_index(v).to_string();
+            // The model often writes `step: N/M -- description` where
+            // the description is a paraphrase, not the original plan
+            // text.  Pull both pieces out so apply_status can match by
+            // index (reliable) and fall back to substring (fuzzy).
+            let (idx, desc) = split_step_field(v);
+            step_index = idx;
+            step = desc.to_string();
         } else if let Some(v) = strip_field(line, "state") {
             state = parse_step_state(v.trim());
         } else if let Some(v) = strip_field(line, "detail").or_else(|| strip_field(line, "output")) {
@@ -299,18 +323,18 @@ fn parse_status_body(body: &str) -> Option<StatusUpdate> {
         }
     }
     if wf.trim().is_empty() {
-        // Fall back to `task:` alone — synthesise a workflow-of-one.
         if let Some(t) = task_name {
             return Some(StatusUpdate {
                 workflow: t.clone(),
                 step: t,
                 state,
                 output,
+                step_index: None,
             });
         }
         return None;
     }
-    if step.trim().is_empty() {
+    if step.trim().is_empty() && step_index.is_none() {
         return None;
     }
     Some(StatusUpdate {
@@ -318,20 +342,29 @@ fn parse_status_body(body: &str) -> Option<StatusUpdate> {
         step,
         state,
         output,
+        step_index,
     })
 }
 
-fn strip_step_index(s: &str) -> &str {
-    // Matches `1/3 -- something` or `2 -- something`.
-    let s = s.trim();
-    if let Some(idx) = s.find("--") {
-        let (head, tail) = s.split_at(idx);
-        let head_ok = head.trim().chars().all(|c| c.is_ascii_digit() || c == '/');
-        if head_ok && !head.trim().is_empty() {
-            return tail.trim_start_matches('-').trim();
+/// Parse a step field of the form `N/M -- description`, `N -- desc`,
+/// or just `description` into `(Some(N), description)` or
+/// `(None, description)`.  Index is 1-based to match the user-visible
+/// numbering shown in the sidebar.
+fn split_step_field(s: &str) -> (Option<usize>, &str) {
+    let trimmed = s.trim();
+    if let Some(idx) = trimmed.find("--") {
+        let (head, tail) = trimmed.split_at(idx);
+        let head_t = head.trim();
+        // head should be N or N/M — digits and at most one slash.
+        let n_str = head_t.split('/').next().unwrap_or("");
+        if !n_str.is_empty() && n_str.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(n) = n_str.parse::<usize>() {
+                let desc = tail.trim_start_matches('-').trim();
+                return (Some(n), desc);
+            }
         }
     }
-    s
+    (None, trimmed)
 }
 
 fn strip_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -439,6 +472,31 @@ mod tests {
         assert!(store.apply_status(&upds[0]));
         assert_eq!(store.workflows[0].steps[1].state, StepState::Active);
         assert_eq!(store.workflows[0].steps[1].output.as_deref(), Some("writing CacheBackend trait"));
+    }
+
+    #[test]
+    fn step_index_matches_when_description_is_paraphrased() {
+        // Real bug from the field: model emits `step: 2/2 -- Script
+        // executed`, but the workflow's actual step description was
+        // "Run the Python script".  Substring match fails; index match
+        // saves the day.
+        let mut store = WorkflowStore::default();
+        store.upsert(Workflow {
+            name: "generate_fibonacci_script".into(),
+            state: WorkflowState::Active,
+            steps: vec![
+                Step { description: "Create a Python file with the Fibonacci sequence calculation".into(), state: StepState::Pending, output: None },
+                Step { description: "Run the Python script".into(), state: StepState::Pending, output: None },
+            ],
+            ts: 0,
+        });
+        let upds = extract_status_updates(
+            "```status\nworkflow: generate_fibonacci_script\nstep: 2/2 -- Script executed\nstate: done\n```",
+        );
+        assert_eq!(upds.len(), 1);
+        assert_eq!(upds[0].step_index, Some(2));
+        assert!(store.apply_status(&upds[0]));
+        assert_eq!(store.workflows[0].steps[1].state, StepState::Done);
     }
 
     #[test]

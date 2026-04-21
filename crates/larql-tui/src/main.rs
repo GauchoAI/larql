@@ -837,6 +837,27 @@ fn should_auto_continue(
     None
 }
 
+/// The step the just-run tool likely closed: only returns a step
+/// currently marked `active` (not merely pending) so we can safely
+/// distinguish it from the NEXT step.  Returns None when nothing is
+/// explicitly active — in that case we skip the "close previous"
+/// reminder because we can't be sure which step the tool addressed.
+fn previously_active_step(state: &AppState) -> Option<String> {
+    let mut active: Vec<&Workflow> = state
+        .workflows
+        .workflows
+        .iter()
+        .filter(|w| w.state == WorkflowState::Active)
+        .collect();
+    active.sort_by_key(|w| std::cmp::Reverse(w.ts));
+    for w in active {
+        if let Some(s) = w.steps.iter().find(|s| s.state == StepState::Active) {
+            return Some(s.description.clone());
+        }
+    }
+    None
+}
+
 /// Description of the next non-done step in the most recently
 /// updated active workflow.  Used in the auto-continue prompt so
 /// the model knows what to do next.
@@ -2548,22 +2569,9 @@ async fn main() -> io::Result<()> {
                                 }
                             }
                         }
-                        if let Some(summary) = exec_result {
+                        if let Some(_summary) = exec_result {
                             tool_depth += 1;
                             continue_depth = 0; // real tool ran, reset nudge counter
-                            // Auto-advance the workflow cursor on
-                            // every successful tool so the sidebar
-                            // reflects progress even when the model
-                            // skips explicit status blocks for
-                            // intermediate steps.  Heuristic: tool
-                            // "succeeded" when the summary contains
-                            // no failure marker.
-                            let tool_failed = summary.contains("⚠ failed")
-                                || summary.contains("FileNotFoundError")
-                                || summary.contains("SyntaxError");
-                            if !tool_failed && state.workflows.advance_cursor() {
-                                let _ = state.workflows.save(&workflows_path(state.session_id.as_deref()));
-                            }
                             state.messages.push(Message::Assistant(String::new()));
                             let chat_msgs = build_chat_messages_with_system(&state);
                             spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone(), state.session_id.clone());
@@ -2583,9 +2591,18 @@ async fn main() -> io::Result<()> {
                                 ContinueReason::PendingSteps => {
                                     let next = next_pending_step(&state)
                                         .unwrap_or_else(|| "the next step".to_string());
+                                    let prev = previously_active_step(&state);
+                                    let prev_line = match prev {
+                                        Some(p) => format!(
+                                            "If your previous tool completed step \"{p}\" \
+                                             of the plan, emit a ```status``` block \
+                                             marking it done BEFORE the next tool. "
+                                        ),
+                                        None => String::new(),
+                                    };
                                     format!(
-                                        "auto-continue: previous tool succeeded. \
-                                         Continue your active plan — emit the \
+                                        "auto-continue: previous tool succeeded. {prev_line}\
+                                         Then continue your active plan — emit the \
                                          next ```tool``` block now (next step: {next})."
                                     )
                                 }

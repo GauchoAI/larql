@@ -107,44 +107,6 @@ impl WorkflowStore {
         }
     }
 
-    /// Advance the "cursor" of the most recently updated active
-    /// workflow by one step: mark the currently-active step done (or,
-    /// if none is active, the first non-done step) and promote the
-    /// next one to active.  Used after a tool runs successfully so
-    /// the sidebar reflects progress even when the model forgets to
-    /// emit explicit ```status``` blocks for every intermediate step.
-    /// Returns true when something changed.
-    pub fn advance_cursor(&mut self) -> bool {
-        let wf = self
-            .workflows
-            .iter_mut()
-            .filter(|w| w.state == WorkflowState::Active)
-            .max_by_key(|w| w.ts);
-        let wf = match wf { Some(w) => w, None => return false };
-        // Prefer closing an active step; else the first pending step.
-        let close_pos = wf
-            .steps
-            .iter()
-            .position(|s| s.state == StepState::Active)
-            .or_else(|| wf.steps.iter().position(|s| s.state == StepState::Pending));
-        let close_pos = match close_pos { Some(i) => i, None => return false };
-        wf.steps[close_pos].state = StepState::Done;
-        // Promote the next pending step to active.
-        if let Some(next) = wf
-            .steps
-            .iter_mut()
-            .skip(close_pos + 1)
-            .find(|s| s.state == StepState::Pending)
-        {
-            next.state = StepState::Active;
-        }
-        // Close the workflow if all done.
-        if wf.steps.iter().all(|s| s.state == StepState::Done) {
-            wf.state = WorkflowState::Done;
-        }
-        true
-    }
-
     /// Apply a status update.  Matches the workflow by name (case
     /// insensitive, trimmed).  Step is matched primarily by 1-based
     /// index (parsed from `step: N/M -- ...`) because the model
@@ -535,57 +497,6 @@ mod tests {
         assert_eq!(upds[0].step_index, Some(2));
         assert!(store.apply_status(&upds[0]));
         assert_eq!(store.workflows[0].steps[1].state, StepState::Done);
-    }
-
-    #[test]
-    fn advance_cursor_progresses_through_plan() {
-        let mut store = WorkflowStore::default();
-        store.upsert(Workflow {
-            name: "build".into(),
-            state: WorkflowState::Active,
-            steps: vec![
-                Step { description: "compile".into(), state: StepState::Pending, output: None },
-                Step { description: "link".into(), state: StepState::Pending, output: None },
-                Step { description: "run".into(), state: StepState::Pending, output: None },
-            ],
-            ts: 0,
-        });
-        // First advance: step 1 done, step 2 now active.
-        assert!(store.advance_cursor());
-        assert_eq!(store.workflows[0].steps[0].state, StepState::Done);
-        assert_eq!(store.workflows[0].steps[1].state, StepState::Active);
-        assert_eq!(store.workflows[0].state, WorkflowState::Active);
-        // Second: step 2 done (was active), step 3 active.
-        assert!(store.advance_cursor());
-        assert_eq!(store.workflows[0].steps[1].state, StepState::Done);
-        assert_eq!(store.workflows[0].steps[2].state, StepState::Active);
-        // Third: step 3 done, workflow closed.
-        assert!(store.advance_cursor());
-        assert_eq!(store.workflows[0].steps[2].state, StepState::Done);
-        assert_eq!(store.workflows[0].state, WorkflowState::Done);
-        // Fourth: no-op, nothing to advance.
-        assert!(!store.advance_cursor());
-    }
-
-    #[test]
-    fn advance_cursor_respects_already_done_prefix() {
-        // Model emitted explicit status for step 1, leaving step 2
-        // as the first non-done — advance should close step 2, not
-        // re-close step 1.
-        let mut store = WorkflowStore::default();
-        store.upsert(Workflow {
-            name: "x".into(),
-            state: WorkflowState::Active,
-            steps: vec![
-                Step { description: "a".into(), state: StepState::Done, output: None },
-                Step { description: "b".into(), state: StepState::Pending, output: None },
-                Step { description: "c".into(), state: StepState::Pending, output: None },
-            ],
-            ts: 0,
-        });
-        assert!(store.advance_cursor());
-        assert_eq!(store.workflows[0].steps[1].state, StepState::Done);
-        assert_eq!(store.workflows[0].steps[2].state, StepState::Active);
     }
 
     #[test]

@@ -31,3 +31,21 @@ build/
 output/
 data/
 experiments/
+
+# Model weights — never commit these (the repo hit 31 GB once because
+# *.gguf and *.safetensors snuck in).  Keep them on /tmp or HF Hub and
+# symlink into vindex dirs at run time.
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.pkl
+
+# Fine-tuning artefacts
+scripts/finetune/fused/
+scripts/finetune/adapters/
+scripts/finetune/adapters-*/
+scripts/finetune/checkpoints/

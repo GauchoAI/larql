@@ -37,6 +37,11 @@ impl Theme {
 }
 
 pub struct Palette {
+    /// Background for every panel.  Dark mode lets the terminal's
+    /// native bg show through (`Color::Reset`); Light mode forces a
+    /// near-white bg so the dark text is readable even when the
+    /// terminal itself is dark.
+    pub bg: Color,
     /// Primary text colour (user-visible prose).  Gaucho-code's dark
     /// mode uses 220/220/220 — a touch dimmer than pure white, which
     /// is what our user asked for.
@@ -74,6 +79,7 @@ pub struct Palette {
 pub fn palette(theme: Theme) -> Palette {
     match theme {
         Theme::Dark => Palette {
+            bg:             Color::Reset,   // use terminal's native dark bg
             fg:             Color::Rgb(220, 220, 220),
             fg_bold:        Color::Rgb(255, 255, 255),
             fg_dim:         Color::Rgb(110, 115, 125),
@@ -93,6 +99,7 @@ pub fn palette(theme: Theme) -> Palette {
             tab_idle_fg:    Color::Rgb(180, 185, 195),
         },
         Theme::Light => Palette {
+            bg:             Color::Rgb(248, 248, 250), // force light bg even on dark terminal
             fg:             Color::Rgb(30, 30, 40),
             fg_bold:        Color::Rgb(0, 0, 0),
             fg_dim:         Color::Rgb(140, 140, 155),

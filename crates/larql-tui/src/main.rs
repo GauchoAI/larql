@@ -1291,6 +1291,15 @@ fn compute_layout(state: &AppState, area: Rect) -> LayoutMode {
 fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &AppState) {
     terminal.draw(|f| {
         let area = f.area();
+        // Paint the full frame with the theme's background first so
+        // Light mode stays light even on a dark terminal.  Dark mode
+        // uses Color::Reset which is a no-op (keeps the terminal's
+        // own bg visible), so this is effectively light-mode-only.
+        let p = palette(state.theme);
+        if state.theme != Theme::Dark {
+            let bg = Block::default().style(Style::default().bg(p.bg));
+            f.render_widget(bg, area);
+        }
         let mode = compute_layout(state, area);
         match mode {
             LayoutMode::SideBySide { sidebar_w } => {
@@ -1536,9 +1545,10 @@ fn draw_sidebar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border))
-        .title(Span::styled(title_text, head));
+        .style(Style::default().bg(p.bg).fg(p.fg))
+        .title(Span::styled(title_text, head.bg(p.bg)));
 
-    let para = Paragraph::new(lines).block(block);
+    let para = Paragraph::new(lines).block(block).style(Style::default().bg(p.bg));
     f.render_widget(para, area);
 }
 
@@ -1682,10 +1692,13 @@ fn draw_messages(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border))
-        .title(Span::styled(title_text, Style::default().fg(p.accent).add_modifier(Modifier::BOLD)));
+        .style(Style::default().bg(p.bg).fg(p.fg))
+        .title(Span::styled(title_text, Style::default().fg(p.accent).add_modifier(Modifier::BOLD).bg(p.bg)));
 
     // No wrap: each entry already fits.  Trim=false preserves indents.
-    let para = Paragraph::new(view).block(block);
+    let para = Paragraph::new(view)
+        .block(block)
+        .style(Style::default().bg(p.bg));
     f.render_widget(para, area);
 }
 
@@ -1810,8 +1823,11 @@ fn draw_input(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if state.is_generating { p.fg_dim } else { p.accent }));
-    let para = Paragraph::new(Line::from(Span::styled(text, style))).block(block);
+        .border_style(Style::default().fg(if state.is_generating { p.fg_dim } else { p.accent }))
+        .style(Style::default().bg(p.bg));
+    let para = Paragraph::new(Line::from(Span::styled(text, style)))
+        .block(block)
+        .style(Style::default().bg(p.bg));
     f.render_widget(para, area);
 
     if !state.is_generating {

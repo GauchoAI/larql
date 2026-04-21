@@ -871,6 +871,72 @@ fn mark_skill_used(server_url: &str, name: &str, success: bool) {
     });
 }
 
+/// Hide ```fact / ```status / ```plan / ```tool fenced blocks from
+/// `text` — they're consumed by the annotation, workflow and tool
+/// pipelines respectively, and shouldn't render as raw code in the
+/// chat bubble.  Partial blocks (still streaming, no close fence
+/// yet) are also hidden so we don't flicker raw markdown while
+/// generating.
+fn strip_meta_blocks(text: &str) -> String {
+    const HIDDEN: &[&str] = &["fact", "status", "plan", "tool"];
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        // Find the earliest opening fence we want to hide.
+        let mut next: Option<(usize, usize)> = None; // (open_start, header_end)
+        for &b in HIDDEN {
+            let needle = format!("```{b}");
+            if let Some(pos) = text[cursor..].find(&needle) {
+                let abs = cursor + pos;
+                let header_end = abs + needle.len();
+                if next.map_or(true, |(p, _)| abs < p) {
+                    next = Some((abs, header_end));
+                }
+            }
+        }
+        match next {
+            None => {
+                out.push_str(&text[cursor..]);
+                break;
+            }
+            Some((open_start, header_end)) => {
+                out.push_str(&text[cursor..open_start]);
+                // Skip past the header line (```fact[\n] or trailing tag).
+                let after = &text[header_end..];
+                let nl = match after.find('\n') {
+                    Some(n) => n + 1,
+                    None => break,
+                };
+                let body_start = header_end + nl;
+                // Find the closing fence; if absent we're still
+                // streaming — hide everything from open_start onward.
+                let close = match text[body_start..].find("```") {
+                    Some(c) => c,
+                    None => break,
+                };
+                cursor = body_start + close + 3;
+                // Eat one trailing newline so we don't leave a gap.
+                if cursor < text.len() && text.as_bytes()[cursor] == b'\n' {
+                    cursor += 1;
+                }
+            }
+        }
+    }
+    // Collapse runs of blank lines to at most one.
+    let mut cleaned = String::with_capacity(out.len());
+    let mut prev_blank = false;
+    for line in out.lines() {
+        let blank = line.trim().is_empty();
+        if blank && prev_blank {
+            continue;
+        }
+        cleaned.push_str(line);
+        cleaned.push('\n');
+        prev_blank = blank;
+    }
+    cleaned.trim_end_matches('\n').to_string()
+}
+
 fn extract_block(text: &str, lang: &str) -> Option<String> {
     let open = format!("```{lang}");
     let start = text.find(&open)?;
@@ -1241,7 +1307,14 @@ fn draw_messages(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 lines.push(Line::from(""));
             }
             Message::Assistant(text) => {
-                lines.extend(gc_markdown::render_markdown(text, gc_markdown::Theme::Dark));
+                // The annotate skill teaches the model to emit
+                // ```fact```, ```status```, ```plan``` and ```tool```
+                // blocks for downstream processing; those are NOT for
+                // human reading.  Strip them before rendering so the
+                // chat bubble shows only prose.  Tool execution surfaces
+                // separately as Message::ToolUse + Message::ToolResult.
+                let cleaned = strip_meta_blocks(text);
+                lines.extend(gc_markdown::render_markdown(&cleaned, gc_markdown::Theme::Dark));
                 lines.push(Line::from(""));
             }
             Message::System(text) => {
@@ -2187,16 +2260,37 @@ async fn main() -> io::Result<()> {
                         // overwrite it (its own ToolUse push is a
                         // duplicate but the dedupe in append_turn
                         // catches it).
-                        if let Some((preview_name, preview_detail)) =
-                            preview_tool_call(&response_text)
-                        {
-                            state.messages.push(Message::ToolUse {
-                                tool: format!("{preview_name} (running…)"),
-                                detail: preview_detail,
+                        // Push a "(running…)" placeholder so slow
+                        // tools have visible feedback BEFORE the bash
+                        // call returns.  Remember its index so we can
+                        // delete it once execute_skill_tool appends
+                        // the real ToolUse line — otherwise both the
+                        // spinner and the final marker render.
+                        let placeholder_idx = preview_tool_call(&response_text)
+                            .map(|(preview_name, preview_detail)| {
+                                let idx = state.messages.len();
+                                state.messages.push(Message::ToolUse {
+                                    tool: format!("{preview_name} (running…)"),
+                                    detail: preview_detail,
+                                });
+                                draw(&mut terminal, &state);
+                                idx
                             });
-                            draw(&mut terminal, &state);
+                        let exec_result = execute_skill_tool(&response_text, &mut state.messages, &server_url_cl, sid.as_deref(), &state.skills);
+                        if let Some(idx) = placeholder_idx {
+                            // Remove the spinner row only if it's still
+                            // a "(running…)" ToolUse at that index.
+                            if idx < state.messages.len() {
+                                let is_placeholder = matches!(
+                                    &state.messages[idx],
+                                    Message::ToolUse { tool, .. } if tool.ends_with(" (running…)")
+                                );
+                                if is_placeholder {
+                                    state.messages.remove(idx);
+                                }
+                            }
                         }
-                        if let Some(_summary) = execute_skill_tool(&response_text, &mut state.messages, &server_url_cl, sid.as_deref(), &state.skills) {
+                        if let Some(_summary) = exec_result {
                             tool_depth += 1;
                             state.messages.push(Message::Assistant(String::new()));
                             let chat_msgs = build_chat_messages_with_system(&state);
@@ -2429,6 +2523,54 @@ mod layout_tests {
         assert_eq!(compute_layout(&s, rect(67)), LayoutMode::Tabs);
         // At 100 we should be side-by-side.
         assert!(matches!(compute_layout(&s, rect(100)), LayoutMode::SideBySide { .. }));
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::strip_meta_blocks;
+
+    #[test]
+    fn hides_fact_block_keeps_prose() {
+        let s = "Here is the answer.\n\n```fact\nkey: foo\nvalue: bar\n```\n\nMore prose.";
+        let out = strip_meta_blocks(s);
+        assert!(!out.contains("```fact"));
+        assert!(!out.contains("key: foo"));
+        assert!(out.contains("Here is the answer"));
+        assert!(out.contains("More prose"));
+    }
+
+    #[test]
+    fn hides_status_plan_tool_blocks() {
+        let s = "Doing it.\n\
+            ```status\ntask: x\nstate: active\n```\n\
+            ```plan\nworkflow: x\nstep: a\n```\n\
+            ```tool\nrun ls\n```\n\
+            Done.";
+        let out = strip_meta_blocks(s);
+        for needle in ["```status", "```plan", "```tool", "task: x", "workflow: x", "run ls"] {
+            assert!(!out.contains(needle), "should not contain {needle:?}\nGot: {out:?}");
+        }
+        assert!(out.contains("Doing it"));
+        assert!(out.contains("Done"));
+    }
+
+    #[test]
+    fn keeps_normal_code_blocks() {
+        let s = "Look:\n```python\nprint('hi')\n```\nDone.";
+        let out = strip_meta_blocks(s);
+        assert!(out.contains("```python"));
+        assert!(out.contains("print('hi')"));
+    }
+
+    #[test]
+    fn hides_unfinished_block_during_streaming() {
+        // Mid-stream: opening fence present, closing fence not yet.
+        let s = "Reasoning…\n```fact\nkey: foo";
+        let out = strip_meta_blocks(s);
+        assert!(out.contains("Reasoning"));
+        assert!(!out.contains("```fact"));
+        assert!(!out.contains("key: foo"));
     }
 }
 

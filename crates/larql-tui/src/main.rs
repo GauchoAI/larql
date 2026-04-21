@@ -2379,7 +2379,16 @@ async fn main() -> io::Result<()> {
     }
 
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<StreamEvent>(256);
-    let mut tool_depth: usize = 0; // prevent infinite tool execution chains
+    // Two separate caps:
+    //   * tool_depth: how many ACTUAL tool runs this user turn (cap
+    //     prevents infinite write/read loops).
+    //   * continue_depth: how many consecutive auto-continue prompts
+    //     without the model emitting a tool.  Reset to 0 every time
+    //     a tool actually runs so a long "tool → nudge → tool → nudge"
+    //     dance has room, but pure "nudge → nudge → nudge" can't
+    //     spin forever.
+    let mut tool_depth: usize = 0;
+    let mut continue_depth: usize = 0;
 
     loop {
         let mut new_output = false;
@@ -2436,12 +2445,12 @@ async fn main() -> io::Result<()> {
                     // Allow a small chain of tool calls per user turn:
                     // model emits tool → result → follow-up → maybe
                     // another tool → result → ... up to MAX_TOOL_DEPTH.
-                    // Without this the agent would emit the hint's
-                    // suggested follow-up tool but we'd refuse to run
-                    // it, leaving the user with no output.  Headless
-                    // already does this; bring interactive in line.
-                    const INTERACTIVE_MAX_TOOL_DEPTH: usize = 4;
-                    if tool_depth < INTERACTIVE_MAX_TOOL_DEPTH {
+                    // Separately cap CONSECUTIVE auto-continues so a
+                    // final prose wrap-up always has room even after
+                    // a long chain.
+                    const MAX_TOOL_DEPTH: usize = 6;
+                    const MAX_CONSEC_CONTINUES: usize = 2;
+                    if tool_depth < MAX_TOOL_DEPTH {
                         let sid = state.session_id.clone();
                         let server_url_cl = state.server_url.clone();
                         // Pre-render the "⚡ tool" marker BEFORE
@@ -2485,17 +2494,22 @@ async fn main() -> io::Result<()> {
                         }
                         if let Some(_summary) = exec_result {
                             tool_depth += 1;
+                            continue_depth = 0; // real tool ran, reset nudge counter
                             state.messages.push(Message::Assistant(String::new()));
                             let chat_msgs = build_chat_messages_with_system(&state);
                             spawn_chat(state.server_url.clone(), chat_msgs, ev_tx.clone(), state.session_id.clone());
-                        } else if let Some(reason) = should_auto_continue(&state, tool_depth, INTERACTIVE_MAX_TOOL_DEPTH) {
+                        } else if let Some(reason) = (continue_depth < MAX_CONSEC_CONTINUES)
+                            .then(|| should_auto_continue(&state, tool_depth, MAX_TOOL_DEPTH))
+                            .flatten()
+                        {
                             // Model finished without emitting a tool.
                             // Either it stalled mid-plan ("let me try X"
                             // with no tool block) — push to continue —
                             // or its whole response was meta-blocks
                             // (fact/status hidden from the user) — push
-                            // for a real prose summary.
-                            tool_depth += 1;
+                            // for a real prose summary.  Counts toward
+                            // the continue budget, not the tool budget.
+                            continue_depth += 1;
                             let prompt = match reason {
                                 ContinueReason::PendingSteps => {
                                     let next = next_pending_step(&state)
@@ -2521,10 +2535,12 @@ async fn main() -> io::Result<()> {
                         } else {
                             state.is_generating = false;
                             tool_depth = 0;
+                            continue_depth = 0;
                         }
                     } else {
                         state.is_generating = false;
                         tool_depth = 0;
+                        continue_depth = 0;
                     }
                     new_output = true;
                 }

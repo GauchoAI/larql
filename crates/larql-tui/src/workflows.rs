@@ -296,23 +296,22 @@ fn strip_list_marker(line: &str) -> Option<&str> {
 }
 
 fn parse_status_body(body: &str) -> Option<StatusUpdate> {
+    // Model is inconsistent: sometimes `workflow:`, sometimes `task:`.
+    // Either names the target — we accept whichever appears.  Step
+    // always comes from `step:`, index from its `N/M --` prefix when
+    // present.  Detail / output fold into `output`.
     let mut wf = String::new();
     let mut step = String::new();
     let mut step_index: Option<usize> = None;
     let mut state: Option<StepState> = None;
     let mut output: Option<String> = None;
-    let mut task_name: Option<String> = None;
     for line in body.lines() {
         let line = line.trim_end();
-        if let Some(v) = strip_field(line, "workflow") {
-            wf = v.to_string();
-        } else if let Some(v) = strip_field(line, "task") {
-            task_name = Some(v.to_string());
+        if let Some(v) = strip_field(line, "workflow").or_else(|| strip_field(line, "task")) {
+            if wf.is_empty() {
+                wf = v.to_string();
+            }
         } else if let Some(v) = strip_field(line, "step") {
-            // The model often writes `step: N/M -- description` where
-            // the description is a paraphrase, not the original plan
-            // text.  Pull both pieces out so apply_status can match by
-            // index (reliable) and fall back to substring (fuzzy).
             let (idx, desc) = split_step_field(v);
             step_index = idx;
             step = desc.to_string();
@@ -323,19 +322,20 @@ fn parse_status_body(body: &str) -> Option<StatusUpdate> {
         }
     }
     if wf.trim().is_empty() {
-        if let Some(t) = task_name {
-            return Some(StatusUpdate {
-                workflow: t.clone(),
-                step: t,
-                state,
-                output,
-                step_index: None,
-            });
-        }
         return None;
     }
+    // If there's no step info at all, treat it as a workflow-level
+    // update (rare — typically implies "the whole workflow is done").
+    // We synthesise a step that matches the first non-done step
+    // in apply_status via substring; index stays None.
     if step.trim().is_empty() && step_index.is_none() {
-        return None;
+        return Some(StatusUpdate {
+            workflow: wf.clone(),
+            step: wf,
+            state,
+            output,
+            step_index: None,
+        });
     }
     Some(StatusUpdate {
         workflow: wf,

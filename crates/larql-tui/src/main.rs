@@ -76,9 +76,34 @@ struct AppState {
     /// `~/.larql/workflows.json`, mutated by `plan` + `status` blocks
     /// extracted from each model response, rendered in the sidebar.
     workflows: WorkflowStore,
-    /// Whether the right-hand sidebar (workflows graph) is shown.
-    /// Toggled with Ctrl+B.  Auto-hidden in narrow terminals.
+    /// User intent: should the plans surface be available?  Toggled
+    /// with Ctrl+B.  Even when true, narrow terminals downgrade
+    /// from side-by-side to tabbed layout.
     sidebar_visible: bool,
+    /// In tabbed layout (narrow terminal), which view is foregrounded.
+    active_tab: ActiveTab,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActiveTab {
+    Chat,
+    Plans,
+}
+
+/// Layout decision recomputed on every frame from the current
+/// terminal size.  Centralising this makes the resize behaviour
+/// trivial: the next draw picks the right mode for the new size.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LayoutMode {
+    /// Wide terminal: chat on the left, sidebar of width `sidebar_w`
+    /// on the right.
+    SideBySide { sidebar_w: u16 },
+    /// Narrow terminal but plans exist: tabbed view, only one panel
+    /// rendered at a time, tab bar at the bottom.
+    Tabs,
+    /// No plans (or plans hidden via Ctrl+B and terminal narrow):
+    /// chat-only, no tab bar.
+    ChatOnly,
 }
 
 impl AppState {
@@ -98,6 +123,7 @@ impl AppState {
             last_route: None,
             workflows: WorkflowStore::load(&workflows_path()),
             sidebar_visible: true,
+            active_tab: ActiveTab::Chat,
         }
     }
 
@@ -855,49 +881,116 @@ fn extract_block(text: &str, lang: &str) -> Option<String> {
 
 // ── Drawing ──────────────────────────────────────────────────────────────
 
+/// Minimum widths for the side-by-side layout.  Below this we
+/// downgrade to tabs so neither panel is unreadable.
+const CHAT_MIN_WIDTH: u16 = 40;
+const SIDEBAR_MIN_WIDTH: u16 = 28;
+
+/// Decide the layout for the current frame purely from the current
+/// terminal area + state.  Pure function — easy to test, called on
+/// every draw so resize is automatic.
+fn compute_layout(state: &AppState, area: Rect) -> LayoutMode {
+    if state.workflows.workflows.is_empty() {
+        return LayoutMode::ChatOnly;
+    }
+    if !state.sidebar_visible {
+        // User explicitly hid the sidebar.  Stay full-screen chat.
+        return LayoutMode::ChatOnly;
+    }
+    let want_sidebar = sidebar_target_width(state, area.width);
+    if want_sidebar >= SIDEBAR_MIN_WIDTH
+        && area.width >= CHAT_MIN_WIDTH + want_sidebar
+    {
+        LayoutMode::SideBySide { sidebar_w: want_sidebar }
+    } else {
+        LayoutMode::Tabs
+    }
+}
+
 fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &AppState) {
     terminal.draw(|f| {
-        // Sidebar shows the live workflow graph.  Width is responsive:
-        // grow to fit the longest label (so steps render on one line
-        // whenever possible), clamped between 28 and 45% of the
-        // terminal so the chat panel always has at least 40 cols.
         let area = f.area();
-        let sidebar_w = if state.workflows.workflows.is_empty() {
-            0
-        } else {
-            sidebar_target_width(state, area.width)
-        };
-        let show_sidebar = state.sidebar_visible
-            && sidebar_w > 0
-            && area.width.saturating_sub(sidebar_w) >= 40;
-
-        let (chat_area, sidebar_area) = if show_sidebar {
-            let cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(40), Constraint::Length(sidebar_w)])
-                .split(area);
-            (cols[0], Some(cols[1]))
-        } else {
-            (area, None)
-        };
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(5),
-                Constraint::Length(3),
-                Constraint::Length(1),
-            ])
-            .split(chat_area);
-
-        draw_messages(f, state, chunks[0]);
-        draw_input(f, state, chunks[1]);
-        draw_status(f, state, chunks[2]);
-
-        if let Some(side) = sidebar_area {
-            draw_sidebar(f, state, side);
+        let mode = compute_layout(state, area);
+        match mode {
+            LayoutMode::SideBySide { sidebar_w } => {
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Min(CHAT_MIN_WIDTH), Constraint::Length(sidebar_w)])
+                    .split(area);
+                draw_chat_panel(f, state, cols[0], mode);
+                draw_sidebar(f, state, cols[1]);
+            }
+            LayoutMode::Tabs => match state.active_tab {
+                ActiveTab::Chat => draw_chat_panel(f, state, area, mode),
+                ActiveTab::Plans => draw_plans_panel(f, state, area),
+            },
+            LayoutMode::ChatOnly => {
+                draw_chat_panel(f, state, area, mode);
+            }
         }
     }).ok();
+}
+
+/// Draw the chat panel (messages + input + status) into `area`.
+/// In Tabs mode the status line is replaced by a tab bar.
+fn draw_chat_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect, mode: LayoutMode) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(5),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    draw_messages(f, state, chunks[0]);
+    draw_input(f, state, chunks[1]);
+    if matches!(mode, LayoutMode::Tabs) {
+        draw_tab_bar(f, state, chunks[2]);
+    } else {
+        draw_status(f, state, chunks[2]);
+    }
+}
+
+/// Plans-as-full-panel: same content as the sidebar but rendered in
+/// the whole window.  Used in Tabs mode when the user presses `2`.
+fn draw_plans_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(area);
+    draw_sidebar(f, state, chunks[0]);
+    draw_tab_bar(f, state, chunks[1]);
+}
+
+/// Render the bottom tab bar shown only in Tabs (narrow) layout.
+/// Number keys 1/2 switch tabs.  The active tab is highlighted.
+fn draw_tab_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    let active = state.active_tab;
+    let make = |label: &str, this: ActiveTab| {
+        let is_active = this == active;
+        let style = if is_active {
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White).bg(Color::DarkGray)
+        };
+        Span::styled(format!(" {label} "), style)
+    };
+    let plan_count = state.workflows.workflows.len();
+    let plans_label = if plan_count > 0 {
+        format!("2 plans [{plan_count}]")
+    } else {
+        "2 plans".to_string()
+    };
+    let line = Line::from(vec![
+        make("1 chat", ActiveTab::Chat),
+        Span::raw(" "),
+        make(&plans_label, ActiveTab::Plans),
+        Span::styled("  ·  press 1 / 2 to switch  ·  Ctrl-C to quit",
+            Style::default().fg(Color::DarkGray)),
+    ]);
+    let para = Paragraph::new(line).style(Style::default().bg(Color::Reset));
+    f.render_widget(para, area);
 }
 
 /// Pick a sidebar width that fits the longest label without wrapping
@@ -1338,8 +1431,14 @@ fn draw_input(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_status(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
-    let toggle = if state.sidebar_visible { "Ctrl-B: hide plans" } else { "Ctrl-B: show plans" };
-    let status = format!(" {}   ·   {}  ", state.status, toggle);
+    let toggle = if state.workflows.workflows.is_empty() {
+        ""
+    } else if state.sidebar_visible {
+        "  ·  Ctrl-B: hide plans"
+    } else {
+        "  ·  Ctrl-B: show plans"
+    };
+    let status = format!(" {}{}  ", state.status, toggle);
     let para = Paragraph::new(Line::from(Span::styled(
         status, Style::default().fg(Color::White).bg(Color::DarkGray),
     )));
@@ -2126,6 +2225,12 @@ async fn main() -> io::Result<()> {
 
         if event::poll(std::time::Duration::from_millis(30))? {
             let evt = event::read()?;
+            // ── Resize ── recompute layout immediately so the
+            // sidebar re-flows and chat re-wraps for the new size.
+            if let CEvent::Resize(_, _) = evt {
+                draw(&mut terminal, &state);
+                continue;
+            }
             // ── Mouse wheel scroll ──
             if let CEvent::Mouse(m) = evt {
                 let msg_h = terminal.size().map(|s| s.height.saturating_sub(4)).unwrap_or(20);
@@ -2150,7 +2255,39 @@ async fn main() -> io::Result<()> {
                     KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         state.sidebar_visible = !state.sidebar_visible;
+                        // If the user re-shows the sidebar in narrow
+                        // mode, default-foreground the plans tab so
+                        // they actually see something.
+                        if state.sidebar_visible {
+                            let area = terminal.size().unwrap_or(ratatui::layout::Size::new(80, 24));
+                            let r = Rect { x: 0, y: 0, width: area.width, height: area.height };
+                            if matches!(compute_layout(&state, r), LayoutMode::Tabs) {
+                                state.active_tab = ActiveTab::Plans;
+                            }
+                        }
                         draw(&mut terminal, &state);
+                    }
+                    // Number keys switch tabs when (a) we're in tabs
+                    // layout and (b) input is empty so we don't steal
+                    // a literal "1" the user is typing.
+                    KeyCode::Char('1') | KeyCode::Char('2')
+                        if !state.is_generating && state.input.is_empty() =>
+                    {
+                        let area = terminal.size().unwrap_or(ratatui::layout::Size::new(80, 24));
+                        let r = Rect { x: 0, y: 0, width: area.width, height: area.height };
+                        if matches!(compute_layout(&state, r), LayoutMode::Tabs) {
+                            state.active_tab = if matches!(key.code, KeyCode::Char('1')) {
+                                ActiveTab::Chat
+                            } else {
+                                ActiveTab::Plans
+                            };
+                            draw(&mut terminal, &state);
+                        } else if let KeyCode::Char(c) = key.code {
+                            // Wide layout: treat as ordinary text.
+                            state.input.insert(state.cursor, c);
+                            state.cursor += 1;
+                            draw(&mut terminal, &state);
+                        }
                     }
                     KeyCode::Enter if !state.is_generating => {
                         let input = state.input.trim().to_string();
@@ -2226,6 +2363,73 @@ async fn main() -> io::Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn state_with_workflows(n: usize) -> AppState {
+        let mut s = AppState::new("http://localhost:0");
+        // AppState::new loads ~/.larql/workflows.json from disk; clear
+        // it so tests don't depend on dev fixtures.
+        s.workflows.workflows.clear();
+        for i in 0..n {
+            s.workflows.workflows.push(Workflow {
+                name: format!("flow {i}"),
+                state: WorkflowState::Active,
+                steps: vec![workflows::Step {
+                    description: "step".into(),
+                    state: StepState::Pending,
+                    output: None,
+                }],
+                ts: 0,
+            });
+        }
+        s
+    }
+
+    fn rect(w: u16) -> Rect {
+        Rect { x: 0, y: 0, width: w, height: 30 }
+    }
+
+    #[test]
+    fn no_workflows_means_chat_only() {
+        let s = state_with_workflows(0);
+        assert_eq!(compute_layout(&s, rect(200)), LayoutMode::ChatOnly);
+        assert_eq!(compute_layout(&s, rect(40)), LayoutMode::ChatOnly);
+    }
+
+    #[test]
+    fn user_hidden_means_chat_only_even_when_wide() {
+        let mut s = state_with_workflows(2);
+        s.sidebar_visible = false;
+        assert_eq!(compute_layout(&s, rect(200)), LayoutMode::ChatOnly);
+    }
+
+    #[test]
+    fn wide_terminal_picks_side_by_side() {
+        let s = state_with_workflows(2);
+        let m = compute_layout(&s, rect(200));
+        assert!(matches!(m, LayoutMode::SideBySide { .. }));
+    }
+
+    #[test]
+    fn narrow_terminal_falls_back_to_tabs() {
+        let s = state_with_workflows(2);
+        // 60 cols: chat_min(40) + sidebar_min(28) = 68 > 60.
+        assert_eq!(compute_layout(&s, rect(60)), LayoutMode::Tabs);
+    }
+
+    #[test]
+    fn boundary_precisely_at_threshold() {
+        let s = state_with_workflows(2);
+        // Need chat_min(40) + at least sidebar_min(28) → 68.
+        // At 67 we should still be in tabs.
+        assert_eq!(compute_layout(&s, rect(67)), LayoutMode::Tabs);
+        // At 100 we should be side-by-side.
+        assert!(matches!(compute_layout(&s, rect(100)), LayoutMode::SideBySide { .. }));
+    }
 }
 
 #[cfg(test)]

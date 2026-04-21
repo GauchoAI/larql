@@ -1,0 +1,21 @@
+[package]
+name = "larql-llamacpp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+llama-cpp-sys-2 = "0.1.144"
+rand = "0.9"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+larql-vindex = { path = "../larql-vindex" }
+serde_json = { workspace = true }
+ureq = { version = "2", features = ["json"] }
+
+[features]
+default = ["metal"]
+metal = ["llama-cpp-sys-2/metal"]

@@ -1,20 +1,22 @@
 //! AppState: loaded vindex + GGUF, shared across all handlers.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use larql_inference::ComputeBackend;
+use larql_llamacpp::LlamaPipeline;
 use larql_vindex::{PatchedVindex, VindexConfig, tokenizers};
 use tokio::sync::RwLock;
 
 use crate::cache::DescribeCache;
+use crate::llama_probe::ServerProbeState;
 use crate::session::SessionManager;
 
 /// A single loaded model.
 ///
-/// The vindex side supplies KNN store, patches, graph indices, tokenizer,
-/// probe labels. Inference always runs through `gguf` — the only weight
-/// source — using the Metal `decode_token` path.
+/// The vindex side supplies KNN store, patches, graph indices,
+/// tokenizer, probe labels.  Inference always runs through `llama` —
+/// the only weight source — with a `cb_eval` probe wired up to the
+/// shared `probe_state` for KNN overlay.
 pub struct LoadedModel {
     /// Model ID derived from config (e.g., "gemma-3-4b-it").
     pub id: String,
@@ -23,34 +25,19 @@ pub struct LoadedModel {
     /// Base index with patch overlay (starts with no patches).
     pub patched: RwLock<PatchedVindex>,
     /// Embedding matrix from the vindex — used by /v1/describe and
-    /// /v1/patches to convert entity strings to query vectors. NOT used
-    /// by inference (GGUF supplies its own quantized embeddings).
+    /// /v1/patches to convert entity strings to query vectors.
     pub embeddings: larql_models::WeightArray,
     pub embed_scale: f32,
     /// Tokenizer for embedding lookups.
     pub tokenizer: tokenizers::Tokenizer,
-    /// ComputeBackend for the Metal GGUF path.
-    /// Lazy-initialized on first use; serializes inference requests via
-    /// `inference_lock` because the KV cache inside is shared mutable state.
-    pub backend: std::sync::OnceLock<std::sync::Arc<dyn ComputeBackend>>,
-    /// Serializes access to the Metal backend's KV cache. Held around any
-    /// `predict_top_k_with_knn` / `capture_residual_at_layer` call.
-    pub inference_lock: std::sync::Mutex<()>,
     /// Probe-confirmed feature labels: (layer, feature) → relation name.
-    /// Loaded from feature_labels.json if present.
     pub probe_labels: HashMap<(usize, usize), String>,
-    /// GGUF weight source — the only inference path. Required for the
-    /// /v1/infer, /v1/insert, /v1/generate endpoints.
-    pub gguf: Option<Arc<larql_inference::gguf_pipeline::GgufPipeline>>,
-}
-
-impl LoadedModel {
-    /// Get or lazy-init the shared ComputeBackend (Metal when available).
-    pub fn get_or_init_backend(&self) -> &std::sync::Arc<dyn ComputeBackend> {
-        self.backend.get_or_init(|| {
-            std::sync::Arc::from(larql_inference::default_backend())
-        })
-    }
+    /// llama.cpp pipeline — the only inference path.  Required for
+    /// /v1/infer, /v1/insert, /v1/generate, /v1/probe.
+    pub llama: Option<Mutex<LlamaPipeline>>,
+    /// Shared state for the llama pipeline's probe — mutate before each
+    /// request to configure Capture / KnnQuery mode.
+    pub probe_state: Arc<Mutex<ServerProbeState>>,
 }
 
 /// Shared application state.

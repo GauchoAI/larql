@@ -5,6 +5,7 @@
 //! GgufPipeline (Metal q8_0_gguf decode + Q8_0Gguf lm_head matvec +
 //! KNN overlay at the configured probe layer).
 
+pub mod chat_completions;
 pub mod describe;
 pub mod generate_stream;
 pub mod health;
@@ -14,6 +15,8 @@ pub mod models;
 pub mod patches;
 pub mod probe;
 pub mod relations;
+pub mod reset;
+pub mod sessions;
 pub mod select;
 pub mod stats;
 
@@ -31,6 +34,7 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/infer", post(infer::handle_infer))
         .route("/v1/insert", post(insert::handle_insert))
         .route("/v1/generate", post(generate_stream::handle_generate_stream))
+        .route("/v1/chat/completions", post(chat_completions::handle_chat_completions))
         // Vindex graph browsing (no inference)
         .route("/v1/describe", get(describe::handle_describe))
         .route("/v1/select", post(select::handle_select))
@@ -44,6 +48,12 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/health", get(health::handle_health))
         .route("/v1/models", get(models::handle_models))
         .route("/v1/stats", get(stats::handle_stats))
+        .route("/v1/reset", post(reset::handle_reset))
+        // Conversation persistence + resume
+        .route("/v1/sessions", get(sessions::handle_list_sessions))
+        .route("/v1/sessions/{id}", get(sessions::handle_get_session))
+        .route("/v1/sessions/{id}", delete(sessions::handle_delete_session))
+        .route("/v1/sessions/{id}/log", post(sessions::handle_append_turn))
         .with_state(state)
 }
 

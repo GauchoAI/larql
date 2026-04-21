@@ -1,0 +1,7 @@
+========= transcript =========
+Rome (KNN override, cos=0.76, L26)
+========= tui markers =========
+[headless] connected · http://localhost:3000
+[headless] type a prompt; Ctrl-D or /quit to exit; /reset to clear history
+
+you ❯ bot ❯ you ❯ [headless] bye

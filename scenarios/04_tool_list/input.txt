@@ -1,0 +1,2 @@
+Use your `list` tool on /tmp/larql_scenario_04 then tell me how many files you see.
+/quit

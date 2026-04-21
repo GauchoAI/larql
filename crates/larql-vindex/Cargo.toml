@@ -10,12 +10,11 @@ categories = ["science"]
 
 [dependencies]
 larql-models = { path = "../larql-models" }
-larql-compute = { path = "../larql-compute" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
-# Matrix types (all compute via larql-compute)
+# Matrix types
 ndarray = "0.16"
 
 # Tokenizer (for embeddings loading + token resolution)
@@ -38,7 +37,6 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 
 [features]
 default = []
-metal = ["larql-compute/metal"]
 
 [dev-dependencies]
 criterion = "0.5"

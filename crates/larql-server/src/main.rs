@@ -2,8 +2,10 @@
 
 mod auth;
 mod cache;
+mod chat_log;
 mod error;
 mod etag;
+mod llama_probe;
 mod ratelimit;
 mod routes;
 mod session;
@@ -119,28 +121,31 @@ fn load_single_vindex(path_str: &str) -> Result<LoadedModel, BoxError> {
         info!("  Labels: {} probe-confirmed", probe_labels.len());
     }
 
-    // GGUF is the only inference weight source. Required for /v1/infer,
-    // /v1/insert, /v1/generate. Without it the vindex still serves graph
-    // browsing endpoints (DESCRIBE, SELECT, RELATIONS, PROBE, EXPLAIN).
-    let gguf = {
-        let p = path.join("weights.gguf");
-        if p.exists() {
-            match larql_inference::gguf_pipeline::GgufPipeline::open(&p) {
-                Ok(g) => {
-                    info!("  GGUF: loaded weights.gguf ({} layers, vocab={})",
-                        g.num_layers(), g.lm_head_vocab);
-                    Some(Arc::new(g))
-                }
-                Err(e) => {
-                    warn!("  GGUF: failed to load weights.gguf: {e}");
-                    None
-                }
+    // llama.cpp is the only inference path.  Without weights.gguf the
+    // vindex still serves graph browsing endpoints (DESCRIBE, SELECT,
+    // RELATIONS, EXPLAIN).
+    let gguf_path = path.join("weights.gguf");
+    let probe_state: Arc<std::sync::Mutex<llama_probe::ServerProbeState>> =
+        Arc::new(std::sync::Mutex::new(llama_probe::ServerProbeState::default()));
+    let llama = if gguf_path.exists() {
+        let probe = Box::new(llama_probe::ServerProbe::new(Arc::clone(&probe_state)));
+        match larql_llamacpp::LlamaPipeline::load_with_probe(&gguf_path, 8192, probe) {
+            Ok(p) => {
+                info!(
+                    "  llama.cpp: loaded ({} layers, n_embd={}, probe armed)",
+                    p.n_layer(),
+                    p.n_embd()
+                );
+                Some(std::sync::Mutex::new(p))
             }
-        } else {
-            warn!("  GGUF: no weights.gguf in vindex dir — inference endpoints \
-                  will return 503. Drop a GGUF in to enable inference.");
-            None
+            Err(e) => {
+                warn!("  llama.cpp: failed to load: {e}");
+                None
+            }
         }
+    } else {
+        warn!("  no weights.gguf — inference endpoints will return 503");
+        None
     };
 
     Ok(LoadedModel {
@@ -150,10 +155,9 @@ fn load_single_vindex(path_str: &str) -> Result<LoadedModel, BoxError> {
         embeddings,
         embed_scale,
         tokenizer,
-        backend: std::sync::OnceLock::new(),
-        inference_lock: std::sync::Mutex::new(()),
         probe_labels,
-        gguf,
+        llama,
+        probe_state,
     })
 }
 

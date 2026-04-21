@@ -12,7 +12,14 @@ use axum::http::HeaderMap;
 use serde::Deserialize;
 
 use crate::error::ServerError;
+use crate::llama_probe::Mode;
 use crate::state::{AppState, LoadedModel};
+
+const KNN_PROBE_TENSOR_PREFIX: &str = "attn_post_norm-";
+
+fn probe_tensor_for(layer: usize) -> String {
+    format!("{KNN_PROBE_TENSOR_PREFIX}{layer}")
+}
 
 
 #[derive(Deserialize)]
@@ -51,109 +58,6 @@ fn session_id(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-
-/// Architecture-B KNN-overlay insert via Metal f32 residual capture.
-///
-/// Runs `capture_residual_post_attn_norm` on the canonical prompt
-/// `"The {relation words} of {entity} is"`, adds a single entry to
-/// `patched.knn_store` at the install layer, returns timing + totals.
-fn run_insert_knn(
-    state: &AppState,
-    model: &LoadedModel,
-    req: &InsertRequest,
-    session_id: Option<&str>,
-    start: std::time::Instant,
-) -> Result<serde_json::Value, ServerError> {
-    let gguf = model.gguf.as_ref().ok_or_else(|| ServerError::InferenceUnavailable(
-        "KNN insert requires weights.gguf in vindex dir".into(),
-    ))?;
-
-    // Default install layer matches LQL and bench_interactive:
-    //   num_layers - 8 (L26 for Gemma 3 4B).
-    let install_layer: usize = req.layer.unwrap_or_else(||
-        model.config.num_layers.saturating_sub(8));
-
-    // Prompt: use custom prompt if provided (e.g. chat-formatted),
-    // otherwise the canonical "The {relation} of {entity} is" template.
-    let prompt = match &req.prompt {
-        Some(p) => p.clone(),
-        None => {
-            let rel_words = req.relation.replace(['-', '_'], " ");
-            format!("The {rel_words} of {} is", req.entity)
-        }
-    };
-    let prompt_enc = model.tokenizer.encode(prompt.as_str(), true)
-        .map_err(|e| ServerError::Internal(format!("tokenize error: {e}")))?;
-    let token_ids: Vec<u32> = prompt_enc.get_ids().to_vec();
-
-    // Target token id — tokenize " {target}" and take first id.
-    let spaced_target = format!(" {}", req.target);
-    let tgt_enc = model.tokenizer.encode(spaced_target.as_str(), false)
-        .map_err(|e| ServerError::Internal(format!("tokenize target: {e}")))?;
-    let target_id: u32 = tgt_enc.get_ids().first().copied().unwrap_or(0);
-
-    // Capture residual(s) via the GGUF pipeline — matches the infer path.
-    let (query_key, value_vec) = {
-        let backend = model.get_or_init_backend();
-        let _guard = match model.inference_lock.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        backend.reset_kv_cache();
-        let qk = gguf.capture_residual_at_layer(&token_ids, install_layer, &**backend);
-        let vv = if let Some(vl) = req.value_layer {
-            backend.reset_kv_cache();
-            gguf.capture_residual_at_layer(&token_ids, vl, &**backend)
-        } else { None };
-        backend.reset_kv_cache();
-        (qk, vv)
-    };
-    let query_key = query_key.ok_or_else(|| ServerError::Internal(
-        "query residual capture failed".into(),
-    ))?;
-
-    // Store: value injection mode if value_layer set, else token override
-    if let (Some(vv), Some(vl)) = (value_vec, req.value_layer) {
-        if let Some(sid) = session_id {
-            let mut sessions = state.sessions.sessions_blocking_write();
-            let now = std::time::Instant::now();
-            let session = sessions.entry(sid.to_string()).or_insert_with(|| {
-                let base = model.patched.blocking_read();
-                crate::session::SessionState::new(base.base().clone(), now)
-            });
-            session.touch(now);
-            session.patched.knn_store.add_value_injection(
-                install_layer, query_key, vv, vl,
-                req.target.clone(), req.entity.clone(), req.relation.clone(),
-                req.confidence,
-            );
-        } else {
-            let mut patched = model.patched.blocking_write();
-            patched.knn_store.add_value_injection(
-                install_layer, query_key, vv, vl,
-                req.target.clone(), req.entity.clone(), req.relation.clone(),
-                req.confidence,
-            );
-        }
-        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-        return Ok(serde_json::json!({
-            "entity": req.entity,
-            "relation": req.relation,
-            "target": req.target,
-            "query_layer": install_layer,
-            "value_layer": vl,
-            "mode": "knn-inject",
-            "session": session_id,
-            "latency_ms": (latency_ms * 10.0).round() / 10.0,
-        }));
-    }
-
-    // Token override mode (existing behavior)
-    return Ok(store_knn_key(
-        state, model, req, session_id, install_layer,
-        query_key, target_id, start,
-    ));
-}
 
 /// Store a KNN key in the session or global KNN store.
 fn store_knn_key(
@@ -208,10 +112,92 @@ fn run_insert(
     session_id: Option<&str>,
 ) -> Result<serde_json::Value, ServerError> {
     let start = std::time::Instant::now();
-    // Only KNN insert is supported. The legacy "constellation" walk-FFN
-    // capture (~75 s, vindex weights) was deleted along with the rest of
-    // the vindex inference path. Force-route everything through KNN.
-    run_insert_knn(state, model, req, session_id, start)
+    if model.llama.is_none() {
+        return Err(ServerError::InferenceUnavailable(
+            "no weights.gguf in vindex dir — drop one in to enable inference".into(),
+        ));
+    }
+    run_insert_llama(state, model, req, session_id, start)
+}
+
+/// Capture residual via llama.cpp's `cb_eval` probe, store as a KNN
+/// entry.  Keys captured here are in the same numerical space as the
+/// /v1/infer probe reads, so cosine hits 1.0 at query time.
+fn run_insert_llama(
+    state: &AppState,
+    model: &LoadedModel,
+    req: &InsertRequest,
+    session_id: Option<&str>,
+    start: std::time::Instant,
+) -> Result<serde_json::Value, ServerError> {
+    let pipe_mu = model.llama.as_ref().expect("llama present");
+
+    let install_layer: usize = req
+        .layer
+        .unwrap_or_else(|| model.config.num_layers.saturating_sub(8));
+
+    let prompt = match &req.prompt {
+        Some(p) => p.clone(),
+        None => {
+            let rel_words = req.relation.replace(['-', '_'], " ");
+            format!("The {rel_words} of {} is", req.entity)
+        }
+    };
+
+    // Target token id via llama.cpp's tokenizer (same vocab as probe).
+    let spaced_target = format!(" {}", req.target);
+    let target_id: u32 = {
+        let pipe = pipe_mu.lock().map_err(|e| {
+            ServerError::Internal(format!("llama pipeline lock poisoned: {e}"))
+        })?;
+        pipe.token_id_of(&spaced_target).ok_or_else(|| {
+            ServerError::Internal("failed to tokenize target".into())
+        })? as u32
+    };
+
+    // Configure probe to capture, then prefill.
+    {
+        let mut s = model.probe_state.lock().unwrap();
+        s.mode = Mode::Capture {
+            layer: install_layer as u32,
+            tensor_name: probe_tensor_for(install_layer),
+            captured: None,
+        };
+    }
+
+    let query_key = {
+        let mut pipe = pipe_mu.lock().map_err(|e| {
+            ServerError::Internal(format!("llama pipeline lock poisoned: {e}"))
+        })?;
+        pipe.reset_kv();
+        pipe.prefill_and_top_k(&prompt, 1)
+            .map_err(|e| ServerError::Internal(format!("llama prefill: {e}")))?;
+
+        let mut s = model.probe_state.lock().unwrap();
+        let capt = if let Mode::Capture { captured, .. } = &mut s.mode {
+            captured.take()
+        } else {
+            None
+        };
+        s.mode = Mode::Idle;
+        capt
+    };
+    let query_key = query_key.ok_or_else(|| {
+        ServerError::Internal("residual not captured — tensor name mismatch?".into())
+    })?;
+
+    // Note: value-injection mode is not yet ported to the llama path.
+    // Token-override insert only, matching the default old flow.
+    if req.value_layer.is_some() {
+        return Err(ServerError::BadRequest(
+            "value_layer not yet supported on llama.cpp pipeline".into(),
+        ));
+    }
+
+    Ok(store_knn_key(
+        state, model, req, session_id, install_layer,
+        query_key, target_id, start,
+    ))
 }
 
 pub async fn handle_insert(

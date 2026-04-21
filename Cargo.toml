@@ -2,10 +2,10 @@
 resolver = "2"
 members = [
     "crates/larql-models",
-    "crates/larql-compute",
     "crates/larql-vindex",
-    "crates/larql-inference",
+    "crates/larql-llamacpp",
     "crates/larql-server",
+    "crates/spike",
 ]
 
 [workspace.package]

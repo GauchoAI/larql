@@ -1,17 +1,10 @@
 //! POST /v1/generate — Server-Sent Events token streaming.
 //!
-//! Client POSTs JSON:
-//!   {"prompt": "...", "n_tokens": 100, "mode": "fast",
-//!    "temperature": 0.8, "top_p": 0.9, "top_k": 0, "seed": 42}
-//!
-//! Server streams:
-//!   event: token
-//!   data: {"token": "Hello", "tid": 9876, "step": 0}
-//!   ...
-//!   event: done
-//!   data: {"stopped_on": "eos", "decoded_tokens": 12, "prefill_ms": 180.3, "avg_decode_ms": 95.2}
-//!
-//! Client can abort the HTTP connection to stop generation mid-stream.
+//! Routes through the llama.cpp pipeline when available, falling back
+//! to the legacy GGUF pipeline otherwise.  KNN overlay short-circuits
+//! the response before sampling begins: if the probe matches the last
+//! prompt residual with cosine above threshold, the server emits the
+//! override token and closes the stream.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,6 +18,7 @@ use futures::stream::{self, Stream};
 use serde::Deserialize;
 
 use crate::error::ServerError;
+use crate::llama_probe::{snapshot_layer, Mode};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -61,8 +55,7 @@ pub async fn handle_generate_stream(
         .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
     let model = Arc::clone(model);
 
-    // Require GGUF — the only weight source.
-    if model.gguf.is_none() {
+    if model.llama.is_none() {
         return Err(ServerError::InferenceUnavailable(
             "no weights.gguf in vindex dir — drop one in to enable inference".into(),
         ));
@@ -70,15 +63,12 @@ pub async fn handle_generate_stream(
 
     let stop_ids: Vec<u32> = req.stop_ids.clone().unwrap_or_else(|| vec![1u32, 106]);
 
-    // Produce tokens in a blocking task, forward each one as an SSE event.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
-
     let model_cl = Arc::clone(&model);
     tokio::task::spawn_blocking(move || {
-        run_gguf_generate(&model_cl, &req, &stop_ids, &tx);
+        run_llama_generate(&model_cl, &req, &stop_ids, &tx);
     });
 
-    // Consume the channel into an SSE stream.
     let stream = stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|msg| (msg, rx))
     });
@@ -86,116 +76,138 @@ pub async fn handle_generate_stream(
     Ok(sse)
 }
 
-/// SSE generate loop driven by GgufPipeline. Bypasses vindex weights
-/// entirely; consults vindex KNN store for fact overlay only.
-fn run_gguf_generate(
+/// New hot path: generate via larql-llamacpp, one-shot KNN override at
+/// prefill, stream tokens via SSE.
+fn run_llama_generate(
     model: &Arc<crate::state::LoadedModel>,
     req: &GenerateRequest,
     stop_ids: &[u32],
     tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
 ) {
-    use larql_inference::gguf_pipeline::DecodeSession;
+    let pipe_mu = model.llama.as_ref().expect("llama present");
 
-    let gguf = match model.gguf.as_ref() {
-        Some(g) => g,
-        None => {
-            let _ = tx.blocking_send(Ok(sse_err("no GGUF source")));
-            return;
-        }
-    };
+    // Snapshot KNN entries at the install layer for this request.
+    let install_layer = model.config.num_layers.saturating_sub(8);
+    let tensor = format!("attn_post_norm-{install_layer}");
+    const THRESHOLD: f32 = 0.75;
 
-    let encoding = match model.tokenizer.encode(req.prompt.as_str(), true) {
-        Ok(e) => e,
+    let patched = model.patched.blocking_read();
+    let entries = snapshot_layer(&patched.knn_store, install_layer);
+    drop(patched);
+
+    // Configure probe: KnnQuery, one-shot at the probe layer.
+    {
+        let mut s = model.probe_state.lock().unwrap();
+        s.mode = Mode::KnnQuery {
+            layer: install_layer as u32,
+            tensor_name: tensor,
+            threshold: THRESHOLD,
+            entries,
+            fired: false,
+            forced: None,
+            result: None,
+            best_cosine: None,
+        };
+    }
+
+    let mut pipe = match pipe_mu.lock() {
+        Ok(p) => p,
         Err(e) => {
-            let _ = tx.blocking_send(Ok(sse_err(&format!("tokenize: {e}"))));
+            let _ = tx.blocking_send(Ok(sse_err(&format!("pipeline lock poisoned: {e}"))));
             return;
         }
     };
-    let mut ids: Vec<u32> = encoding.get_ids().to_vec();
-    if ids.is_empty() {
+    pipe.reset_kv();
+
+    // Prefill.
+    let prefill_start = Instant::now();
+    let n_prefill = match pipe.prefill(&req.prompt) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = tx.blocking_send(Ok(sse_err(&format!("prefill: {e}"))));
+            return;
+        }
+    };
+    if n_prefill == 0 {
         let _ = tx.blocking_send(Ok(sse_err("empty prompt")));
         return;
     }
-
-    let backend = model.get_or_init_backend();
-    let _guard = match model.inference_lock.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    backend.reset_kv_cache();
-
-    let patched = model.patched.blocking_read();
-    let knn_store_opt = if patched.knn_store.is_empty() { None } else { Some(&patched.knn_store) };
-    let knn_probe_layer: Option<usize> = knn_store_opt
-        .and_then(|s| s.layers().into_iter().next());
-    const KNN_COSINE_THRESHOLD: f32 = 0.75;
-
-    let mut sampler = larql_inference::sampling::Sampler::new(
-        larql_inference::sampling::SamplingConfig {
-            temperature: req.temperature,
-            top_p: req.top_p,
-            top_k: req.top_k,
-            seed: req.seed,
-        },
-    );
-
-    let session = DecodeSession::new(gguf);
-
-    // Prefill: decode each prompt token. Probe KNN at the LAST prompt token.
-    let prefill_start = Instant::now();
-    let last_idx = ids.len() - 1;
-    let mut last_h: Option<Vec<f32>> = None;
-    let mut last_probe: Option<Vec<f32>> = None;
-    for (i, &tid) in ids.iter().enumerate() {
-        let probe_for = if i == last_idx { knn_probe_layer } else { None };
-        let (h, probe) = session.step(tid, probe_for, &**backend);
-        last_h = Some(h);
-        if i == last_idx { last_probe = probe; }
-    }
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
-    // KNN override short-circuit.
-    if let (Some(probe), Some(store), Some(pl)) = (last_probe.as_ref(), knn_store_opt, knn_probe_layer) {
-        let normed = gguf.apply_pre_ffn_norm_for_layer(probe, pl);
-        if let Some((entry, cos)) = store.query_top1(pl, &normed) {
-            if cos > KNN_COSINE_THRESHOLD {
-                let label = format!("{} (KNN override, cos={:.2}, L{})", entry.target_token, cos, pl);
-                let _ = tx.blocking_send(Ok(sse_token(&label, 0, 0)));
-                let _ = tx.blocking_send(Ok(sse_done("knn_override", 0, prefill_ms, 0.0)));
-                return;
-            }
-        }
+    // Check for KNN override from probe.
+    let knn_hit = {
+        let mut s = model.probe_state.lock().unwrap();
+        let hit = if let Mode::KnnQuery { result, .. } = &mut s.mode {
+            result.take()
+        } else {
+            None
+        };
+        s.mode = Mode::Idle;
+        hit
+    };
+    if let Some(m) = knn_hit {
+        let label = format!(
+            "{} (KNN override, cos={:.2}, L{install_layer})",
+            m.target_token, m.cosine
+        );
+        let _ = tx.blocking_send(Ok(sse_token(&label, 0, 0)));
+        let _ = tx.blocking_send(Ok(sse_done("knn_override", 0, prefill_ms, 0.0)));
+        return;
     }
 
-    // First sampled token from prefill state.
-    let raw = session.finalize_for_sampler(last_h.as_ref().unwrap(), 64, &**backend);
-    let mut next = match sampler.sample(&raw) {
-        Some(t) => t,
+    // Sampling setup — share larql-inference's Sampler.
+    let mut sampler = larql_llamacpp::Sampler::new(larql_llamacpp::SamplingConfig {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        seed: req.seed,
+    });
+
+    // First sample from the last prefill position.
+    let first_preds = pipe.top_k_at((n_prefill - 1) as i32, 64);
+    let mut next: i32 = match sampler.sample(&first_preds) {
+        Some(t) => t as i32,
         None => {
             let _ = tx.blocking_send(Ok(sse_done("empty_predictions", 0, prefill_ms, 0.0)));
             return;
         }
     };
-    let first_tok = model.tokenizer.decode(&[next], true).unwrap_or_default();
-    if tx.blocking_send(Ok(sse_token(&first_tok, next, 0))).is_err() { return; }
-    ids.push(next);
+    let first_tok = pipe.decode_token(next);
+    if tx.blocking_send(Ok(sse_token(&first_tok, next as u32, 0))).is_err() {
+        return;
+    }
 
-    // Decode loop: one token per step, emit SSE.
+    // Decode loop.
     let mut per: Vec<f64> = Vec::with_capacity(req.n_tokens);
     let mut stopped_on = "n_tokens_reached";
     for step in 1..req.n_tokens {
         let t = Instant::now();
-        let (h, _) = session.step(next, None, &**backend);
-        let raw = session.finalize_for_sampler(&h, 64, &**backend);
+        if let Err(e) = pipe.feed(next) {
+            let _ = tx.blocking_send(Ok(sse_err(&format!("decode: {e}"))));
+            return;
+        }
+        let preds = pipe.top_k_at(0, 64);
         per.push(t.elapsed().as_secs_f64() * 1000.0);
-        match sampler.sample(&raw) {
-            Some(tid) if stop_ids.contains(&tid) => { stopped_on = "eos"; break; }
-            Some(tid) => {
-                let tok = model.tokenizer.decode(&[tid], true).unwrap_or_default();
-                if tx.blocking_send(Ok(sse_token(&tok, tid, step))).is_err() { return; }
-                next = tid;
+
+        match sampler.sample(&preds) {
+            Some(tid) if stop_ids.contains(&tid) => {
+                stopped_on = "eos";
+                break;
             }
-            None => { stopped_on = "empty"; break; }
+            Some(tid) => {
+                let tok = pipe.decode_token(tid as i32);
+                if tx
+                    .blocking_send(Ok(sse_token(&tok, tid, step)))
+                    .is_err()
+                {
+                    return;
+                }
+                next = tid as i32;
+            }
+            None => {
+                stopped_on = "empty";
+                break;
+            }
         }
     }
     let avg = if !per.is_empty() { per.iter().sum::<f64>() / per.len() as f64 } else { 0.0 };
@@ -222,7 +234,5 @@ fn sse_err(msg: &str) -> Event {
         .unwrap_or_else(|_| Event::default().data(msg))
 }
 
-/// Ensure the `Stream<Item = Result<Event, Infallible>>` we assemble typechecks
-/// against the trait bounds axum expects.
 #[allow(dead_code)]
 fn _sse_type_check<S: Stream<Item = Result<Event, Infallible>>>() {}

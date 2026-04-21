@@ -1,0 +1,12 @@
+[package]
+name = "spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+llama-cpp-sys-2 = "0.1.144"
+
+[features]
+default = ["metal"]
+metal = ["llama-cpp-sys-2/metal"]

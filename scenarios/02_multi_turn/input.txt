@@ -1,0 +1,4 @@
+My name is Miguel and my favourite colour is teal.
+What is my name and what is my favourite colour?
+What was the first thing I told you about myself?
+/quit

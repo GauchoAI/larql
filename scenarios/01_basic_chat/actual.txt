@@ -1,0 +1,13 @@
+========= transcript =========
+The capital of Australia is Canberra.
+
+```fact
+key: capital of Australia
+value: Canberra
+source: user
+```
+========= tui markers =========
+[headless] connected · http://localhost:3000
+[headless] type a prompt; Ctrl-D or /quit to exit; /reset to clear history
+
+you ❯ bot ❯ you ❯ [headless] bye

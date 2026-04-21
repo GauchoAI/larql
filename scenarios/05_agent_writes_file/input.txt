@@ -1,0 +1,2 @@
+Use your `run` tool to write the line 'hello from larql agent' to /tmp/larql_scenario_05.txt. The exact tool call should be: tee /tmp/larql_scenario_05.txt <<< "hello from larql agent"
+/quit

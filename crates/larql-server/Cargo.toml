@@ -12,9 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 larql-vindex = { path = "../larql-vindex" }
-larql-inference = { path = "../larql-inference" }
-larql-compute = { path = "../larql-compute" }
 larql-models = { path = "../larql-models" }
+larql-llamacpp = { path = "../larql-llamacpp" }
 
 axum = { version = "0.8" }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
@@ -33,4 +32,4 @@ thiserror = { workspace = true }
 
 [features]
 default = ["metal"]
-metal = ["larql-inference/metal"]
+metal = ["larql-llamacpp/metal"]

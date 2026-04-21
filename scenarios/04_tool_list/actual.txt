@@ -1,0 +1,25 @@
+========= transcript =========
+Okay, let's start by listing the contents of the `/tmp/larql_scenario_04` directory.
+
+```tool
+list /tmp/larql_scenario_04
+```
+Okay, the `/tmp/larql_scenario_04` directory contains three text files: alpha.txt, beta.txt, and gamma.txt, all of which are empty.
+
+```fact
+key: larql_scenario_04 contents
+value: The directory contains three empty text files: alpha.txt, beta.txt, and gamma.txt
+source: tool
+```
+========= tui markers =========
+[headless] connected · http://localhost:3000
+[headless] type a prompt; Ctrl-D or /quit to exit; /reset to clear history
+
+you ❯ bot ❯ [tool] list /tmp/larql_scenario_04
+[tool result]
+  📄 alpha.txt  (0B)
+    📄 beta.txt  (0B)
+    📄 gamma.txt  (0B)
+  
+  Total: 3 items (0 dirs, 3 files,   0B)
+bot ❯ you ❯ [headless] bye

@@ -1,12 +1,14 @@
-//! POST /v1/probe — capture the pre-FFN-normalized residual at a layer
-//! for a prompt, return as JSON. Used for offline cosine experiments
-//! and KNN-store debugging without storing anything.
+//! POST /v1/probe — capture the residual at a layer via llama.cpp's
+//! `cb_eval`, return as JSON.  Used for offline cosine experiments and
+//! KNN-store debugging without storing anything.
 
 use std::sync::Arc;
 use axum::Json;
 use axum::extract::State;
 use serde::Deserialize;
+
 use crate::error::ServerError;
+use crate::llama_probe::Mode;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -28,32 +30,50 @@ pub async fn handle_probe(
     let model = Arc::clone(model);
 
     let result = tokio::task::spawn_blocking(move || {
-        let gguf = model.gguf.as_ref().ok_or_else(|| ServerError::InferenceUnavailable(
-            "probe requires weights.gguf in vindex dir".into(),
-        ))?;
-        let backend = model.get_or_init_backend();
-        let _guard = match model.inference_lock.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        backend.reset_kv_cache();
+        let pipe_mu = model.llama.as_ref().ok_or_else(|| {
+            ServerError::InferenceUnavailable(
+                "probe requires weights.gguf in vindex dir (llama path)".into(),
+            )
+        })?;
 
-        let token_ids: Vec<u32> = model.tokenizer.encode(req.prompt.as_str(), true)
-            .map_err(|e| ServerError::Internal(format!("tokenize: {e}")))?
-            .get_ids().to_vec();
-
-        let key = gguf.capture_residual_at_layer(&token_ids, req.layer, &**backend);
-        backend.reset_kv_cache();
-
-        match key {
-            Some(vec) => Ok(serde_json::json!({
-                "layer": req.layer,
-                "prompt_tokens": token_ids.len(),
-                "dim": vec.len(),
-                "vector": vec,
-            })),
-            None => Err(ServerError::Internal("probe failed".into())),
+        {
+            let mut s = model.probe_state.lock().unwrap();
+            s.mode = Mode::Capture {
+                layer: req.layer as u32,
+                tensor_name: format!("attn_post_norm-{}", req.layer),
+                captured: None,
+            };
         }
+
+        let vec = {
+            let mut pipe = pipe_mu.lock().map_err(|e| {
+                ServerError::Internal(format!("llama pipeline lock poisoned: {e}"))
+            })?;
+            pipe.reset_kv();
+            let _ = pipe.prefill_and_top_k(&req.prompt, 1).map_err(|e| {
+                ServerError::Internal(format!("llama prefill: {e}"))
+            })?;
+
+            let mut s = model.probe_state.lock().unwrap();
+            let captured = if let Mode::Capture { captured, .. } = &mut s.mode {
+                captured.take()
+            } else {
+                None
+            };
+            s.mode = Mode::Idle;
+            captured
+        };
+
+        let vec = vec.ok_or_else(|| {
+            ServerError::Internal("probe failed: residual not captured".into())
+        })?;
+        let len = vec.len();
+
+        Ok(serde_json::json!({
+            "layer": req.layer,
+            "dim": len,
+            "vector": vec,
+        }))
     })
     .await
     .map_err(|e| ServerError::Internal(e.to_string()))??;

@@ -38,7 +38,7 @@ fn build_stats(model: &LoadedModel) -> serde_json::Value {
         "layer_bands": layer_bands,
         "loaded": {
             "browse": true,
-            "inference": model.gguf.is_some(),
+            "inference": model.llama.is_some(),
         },
     })
 }

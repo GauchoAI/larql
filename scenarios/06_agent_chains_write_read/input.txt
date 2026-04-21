@@ -1,0 +1,3 @@
+Use your `run` tool to write 'chain step one' to /tmp/larql_scenario_06.txt. Exact command: tee /tmp/larql_scenario_06.txt <<< "chain step one"
+Now use your `run` tool to read it back: cat /tmp/larql_scenario_06.txt
+/quit

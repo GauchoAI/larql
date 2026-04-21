@@ -1,0 +1,41 @@
+========= transcript =========
+Okay, let's start by understanding the current state.
+
+```fact
+key: my name
+value: Miguel
+source: derived
+```
+
+```fact
+key: my favourite colour
+value: teal
+source: derived
+```
+
+I'm ready for your questions or tasks.
+```fact
+key: my name
+value: Miguel
+source: facts
+```
+
+```fact
+key: my favourite colour
+value: teal
+source: facts
+```
+
+I retrieved that information from the `facts` tool. Is there anything else you’d like to know?
+```fact
+key: first self-disclosure
+value: My name is Miguel.
+source: derived
+```
+
+You first told me that your name was Miguel.
+========= tui markers =========
+[headless] connected · http://localhost:3000
+[headless] type a prompt; Ctrl-D or /quit to exit; /reset to clear history
+
+you ❯ bot ❯ you ❯ bot ❯ you ❯ bot ❯ you ❯ [headless] bye

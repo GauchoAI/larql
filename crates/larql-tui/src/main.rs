@@ -2454,11 +2454,13 @@ async fn main() -> io::Result<()> {
             .send()
             .await;
         // `--new` on the cwd-derived session still resolves to the
-        // SAME session_id as prior runs (cwd is unchanged), so the
-        // per-session workflows file needs to be wiped to match the
-        // user's "fresh slate" intent.  Other sessions' workflow
-        // files are untouched — namespacing still applies.
+        // SAME session_id as prior runs (cwd is unchanged), so any
+        // per-session artefact that persists between runs needs to
+        // be wiped to match the user's "fresh slate" intent.
+        // Namespacing still applies — only THIS session's files
+        // disappear; other sessions are untouched.
         let _ = std::fs::remove_file(workflows_path(Some(&session_id)));
+        let _ = std::fs::remove_file(session_summary_path(&session_id));
     }
 
     if headless {
